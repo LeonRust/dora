@@ -8,6 +8,7 @@ mod doctor;
 mod down;
 mod expand;
 mod graph;
+mod hub;
 pub mod inspect;
 mod list;
 mod logs;
@@ -43,6 +44,7 @@ use down::Down;
 use expand::Expand;
 use eyre::Context;
 use graph::Graph;
+use hub::Hub;
 use inspect::Inspect;
 use list::ListArgs;
 use logs::LogsArgs;
@@ -145,6 +147,9 @@ pub enum Command {
     /// System management commands
     #[clap(subcommand, display_order = 25)]
     System(System),
+    /// Package, discover, and use dora nodes (unstable)
+    #[clap(subcommand, display_order = 26)]
+    Hub(Hub),
 
     // -- Utility --
     /// Generate shell completions
@@ -214,6 +219,7 @@ impl Executable for Command {
             Command::Expand(args) => args.execute(),
             Command::Validate(args) => args.execute(),
             Command::System(args) => args.execute(),
+            Command::Hub(args) => args.execute(),
             Command::Completion(args) => args.execute(),
             Command::Self_ { command } => command.execute(),
             Command::Daemon(args) => args.execute(),
@@ -388,8 +394,53 @@ mod tests {
     }
 
     #[test]
+    fn parse_validate_node_manifest() {
+        parse_ok(&["dora", "validate", "--node-manifest", "dora-node.yml"]);
+        // a dataflow and --node-manifest are mutually exclusive
+        parse_err(&[
+            "dora",
+            "validate",
+            "dataflow.yml",
+            "--node-manifest",
+            "dora-node.yml",
+        ]);
+        // one of the two is required
+        parse_err(&["dora", "validate"]);
+        // --strict-types is dataflow-only
+        parse_err(&[
+            "dora",
+            "validate",
+            "--node-manifest",
+            "dora-node.yml",
+            "--strict-types",
+        ]);
+    }
+
+    #[test]
     fn parse_new() {
         parse_ok(&["dora", "new", "test"]);
+    }
+
+    #[test]
+    fn parse_offline() {
+        parse_ok(&["dora", "build", "dataflow.yml", "--offline"]);
+        parse_ok(&["dora", "validate", "dataflow.yml", "--offline"]);
+        // --offline is meaningless for standalone manifest validation
+        parse_err(&["dora", "validate", "--node-manifest", "x.yml", "--offline"]);
+    }
+
+    #[test]
+    fn parse_hub() {
+        parse_ok(&["dora", "hub", "init"]);
+        parse_ok(&["dora", "hub", "init", "path/to/node"]);
+        parse_ok(&["dora", "hub", "install", "dora-yolo"]);
+        parse_ok(&["dora", "hub", "search", "camera", "--category", "sensor"]);
+        parse_ok(&["dora", "hub", "search", "--offline"]);
+        parse_ok(&["dora", "hub", "info", "dora-yolo@^0.5"]);
+        parse_ok(&["dora", "hub", "list", "dataflow.yml"]);
+        parse_ok(&["dora", "hub", "fetch", "dataflow.yml", "--target-dir", "c"]);
+        parse_err(&["dora", "hub"]);
+        parse_err(&["dora", "hub", "info"]);
     }
 
     #[test]

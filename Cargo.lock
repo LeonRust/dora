@@ -1708,6 +1708,7 @@ dependencies = [
  "dora-core",
  "dora-daemon",
  "dora-download",
+ "dora-hub-client",
  "dora-message",
  "dora-node-api-c",
  "dora-operator-api-c",
@@ -1732,6 +1733,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2",
  "sysinfo 0.36.1",
  "tabwriter",
  "tempfile",
@@ -1739,6 +1741,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tokio-tungstenite 0.28.0",
+ "toml",
  "tracing",
  "tracing-log",
  "uuid",
@@ -1821,7 +1824,9 @@ dependencies = [
  "git2",
  "itertools 0.14.0",
  "log",
+ "proptest",
  "schemars 1.2.1",
+ "semver",
  "serde",
  "serde-with-expand-env",
  "serde_json",
@@ -1853,6 +1858,7 @@ dependencies = [
  "dora-arrow-convert",
  "dora-core",
  "dora-download",
+ "dora-memory-pool",
  "dora-message",
  "dora-node-api",
  "dora-tracing",
@@ -1926,6 +1932,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "dora-hub-client"
+version = "1.0.0-rc1"
+dependencies = [
+ "dirs 6.0.0",
+ "dora-core",
+ "eyre",
+ "semver",
+ "serde",
+ "serde_yaml",
+ "tempfile",
+ "toml",
+]
+
+[[package]]
 name = "dora-log-utils"
 version = "1.0.0-rc1"
 dependencies = [
@@ -1967,6 +1987,13 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+]
+
+[[package]]
+name = "dora-memory-pool"
+version = "1.0.0-rc1"
+dependencies = [
+ "tracing",
 ]
 
 [[package]]
@@ -2078,6 +2105,7 @@ dependencies = [
  "arrow",
  "chrono",
  "dora-cli",
+ "dora-download",
  "dora-message",
  "dora-node-api",
  "dora-operator-api-python",
@@ -2091,6 +2119,7 @@ dependencies = [
  "pythonize",
  "serde_json",
  "serde_yaml",
+ "shared_memory_extended",
  "tokio",
  "tracing",
 ]
@@ -2391,6 +2420,14 @@ name = "either"
 version = "1.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "91622ff5e7162018101f2fea40d6ebf4a78bbe5a49736a2020649edf9693679e"
+
+[[package]]
+name = "emit-then-exit-source-node"
+version = "1.0.0-rc1"
+dependencies = [
+ "dora-node-api",
+ "eyre",
+]
 
 [[package]]
 name = "encode_unicode"
@@ -2973,9 +3010,9 @@ dependencies = [
 
 [[package]]
 name = "git2"
-version = "0.20.4"
+version = "0.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7b88256088d75a56f8ecfa070513a775dd9107f6530ef14919dac831af9cfe2b"
+checksum = "ddddbf932745a6be37109b6112d3ee09696106f848449069d3a57bba937ab82e"
 dependencies = [
  "bitflags 2.13.0",
  "libc",

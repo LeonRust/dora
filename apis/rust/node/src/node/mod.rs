@@ -1376,7 +1376,7 @@ impl DoraNode {
     /// Allocates a [`DataSample`] of the specified size.
     ///
     /// Zero-copy transport for large messages is handled by the zenoh SHM
-    /// provider inside [`send_output`]; this allocation itself is a heap
+    /// provider inside [`send_output`](Self::send_output); this allocation itself is a heap
     /// buffer.
     pub fn allocate_data_sample(&mut self, data_len: usize) -> NodeResult<DataSample> {
         let avec: AVec<u8, ConstAlign<128>> = AVec::__from_elem(128, 0, data_len);
@@ -1395,6 +1395,36 @@ impl DoraNode {
                     daemon and the dora node API"
             ))),
         }
+    }
+
+    /// Register a pinned memory pool with the daemon for lifecycle tracking.
+    ///
+    /// Send the memory pool metadata to the daemon so it can track the pool
+    /// and provide it to other nodes for zero-copy access.
+    pub fn register_pinned_memory(
+        &mut self,
+        shared_memory_id: String,
+        metadata: Metadata,
+    ) -> Result<(), eyre::Error> {
+        self.control_channel
+            .register_pinned_memory(shared_memory_id, metadata)
+    }
+
+    /// Read pinned memory metadata from the daemon.
+    ///
+    /// When `free` is true, the daemon also frees the pool after reading.
+    pub fn read_pinned_memory(
+        &mut self,
+        shared_memory_id: String,
+        free: bool,
+    ) -> Result<Metadata, eyre::Error> {
+        self.control_channel
+            .read_pinned_memory(shared_memory_id, free)
+    }
+
+    /// Free a pinned memory pool via the daemon.
+    pub fn free_pinned_memory(&mut self, shared_memory_id: String) -> Result<(), eyre::Error> {
+        self.control_channel.free_pinned_memory(shared_memory_id)
     }
 }
 

@@ -1,11 +1,12 @@
 use arrow_schema::{DataType, Field, Fields, Schema};
-use serde::Deserialize;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
 /// A field definition within a struct type.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct FieldDef {
     /// Field name
     pub name: String,
@@ -21,7 +22,7 @@ fn default_true() -> bool {
 }
 
 /// A type parameter declaration (e.g. `sample_type` on AudioFrame).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct TypeParam {
     /// Parameter name
     pub name: String,
@@ -31,7 +32,7 @@ pub struct TypeParam {
 }
 
 /// Metadata key required on outputs of a given type.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct MetadataDef {
     /// Key name that must be present in message metadata
     pub key: String,
@@ -41,21 +42,21 @@ pub struct MetadataDef {
 }
 
 /// A single type definition from the standard type library.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct TypeDef {
     /// Arrow data type name (e.g. "Float32", "Struct", "LargeBinary")
     pub arrow: String,
     /// Human-readable description
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// Type parameters (e.g. sample_type for AudioFrame)
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub params: Vec<TypeParam>,
     /// Struct field definitions (only for Struct arrow types)
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fields: Vec<FieldDef>,
     /// Required metadata keys
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub metadata: Vec<MetadataDef>,
 }
 
@@ -98,9 +99,12 @@ fn arrow_type_from_name(name: &str) -> Option<DataType> {
     match name {
         "Float32" => Some(DataType::Float32),
         "Float64" => Some(DataType::Float64),
+        "Int8" => Some(DataType::Int8),
+        "Int16" => Some(DataType::Int16),
         "Int32" => Some(DataType::Int32),
         "Int64" => Some(DataType::Int64),
         "UInt8" => Some(DataType::UInt8),
+        "UInt16" => Some(DataType::UInt16),
         "UInt32" => Some(DataType::UInt32),
         "UInt64" => Some(DataType::UInt64),
         "Utf8" => Some(DataType::Utf8),
@@ -108,6 +112,14 @@ fn arrow_type_from_name(name: &str) -> Option<DataType> {
         "Boolean" => Some(DataType::Boolean),
         _ => None, // Struct, FixedSizeBinary, etc. — skip runtime validation
     }
+}
+
+/// Whether `name` is an arrow discriminant dora recognizes for a shipped type's
+/// `arrow:` field: a known primitive, or `Struct` (whose shape is its fields).
+/// Anything else cannot be materialized into a schema, so it must be rejected
+/// at manifest validation rather than silently failing later at build time.
+pub fn is_known_arrow_type(name: &str) -> bool {
+    arrow_type_from_name(name).is_some() || name == "Struct"
 }
 
 const MAX_TYPE_DEPTH: u8 = 8;
@@ -443,6 +455,7 @@ pub fn pattern_metadata_keys(pattern: &str) -> Option<&'static [&'static str]> {
 /// Registry of known type URNs, loaded from embedded YAML files.
 ///
 /// URN format: `std/<category>/v<version>/<TypeName>`
+#[derive(Clone)]
 pub struct TypeRegistry {
     types: BTreeMap<String, TypeDef>,
 }
@@ -483,6 +496,38 @@ impl TypeRegistry {
             }
         }
         Self { types }
+    }
+
+    /// Register a single type definition at the given URN, overwriting any
+    /// existing entry. Used to load manifest-shipped types for validation.
+    pub fn insert_type(&mut self, urn: impl Into<String>, def: TypeDef) {
+        self.types.insert(urn.into(), def);
+    }
+
+    /// Whether a struct field's type string is known: a primitive Arrow type,
+    /// `List<T>` of a known type, or any type (URN or short name) registered
+    /// here. Lenient by design — it accepts primitive-backed std types (e.g.
+    /// `std/core/v1/Bytes`) and only rejects genuinely-unknown names.
+    pub fn field_type_resolves(&self, type_str: &str) -> bool {
+        self.field_type_resolves_depth(type_str, 0)
+    }
+
+    fn field_type_resolves_depth(&self, type_str: &str, depth: u8) -> bool {
+        // bound the `List<…>` recursion: this runs on untrusted shipped-type
+        // field bodies (only the URN key is charset-checked), and a 1 MiB
+        // manifest can nest `List<` deep enough to overflow the stack. Match
+        // the cap `resolve_field_type` uses — anything deeper doesn't resolve.
+        if depth > MAX_TYPE_DEPTH {
+            return false;
+        }
+        let t = type_str.trim();
+        if arrow_type_from_name(t).is_some() {
+            return true;
+        }
+        if let Some(inner) = t.strip_prefix("List<").and_then(|s| s.strip_suffix('>')) {
+            return self.field_type_resolves_depth(inner, depth + 1);
+        }
+        self.resolve(t).is_some() || self.resolve_short_name(t).is_some()
     }
 
     /// Resolve a type URN to its definition.
@@ -571,6 +616,26 @@ impl TypeRegistry {
         Ok(count)
     }
 
+    /// Register a single user-defined type at the given URN (e.g. one shipped
+    /// in a node manifest, spec §6.3). The `std/` prefix is reserved.
+    pub fn add_user_type(&mut self, urn: &str, def: TypeDef) -> Result<(), String> {
+        if urn.starts_with("std/") || urn == "std" {
+            return Err(format!("user types cannot use the \"std/\" prefix: {urn}"));
+        }
+        // reject control characters and other unexpected bytes so a registered
+        // URN can be safely echoed and used as a map key (namespace ownership
+        // remains the caller's responsibility — the registry has no namespace)
+        let valid_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/');
+        if urn.is_empty() || !urn.chars().all(valid_char) {
+            return Err(format!(
+                "invalid type URN `{}`",
+                urn.chars().filter(|c| !c.is_control()).collect::<String>()
+            ));
+        }
+        self.types.insert(urn.to_string(), def);
+        Ok(())
+    }
+
     /// Suggest the closest URN for a typo. Returns `None` if no close match.
     /// Prefers matches in the same package prefix (e.g. `std/media/v1`).
     pub fn suggest(&self, urn: &str) -> Option<&str> {
@@ -630,7 +695,7 @@ impl Default for TypeRegistry {
 
 /// Simple edit distance (Levenshtein) for typo suggestions.
 /// Returns `usize::MAX` for inputs longer than 256 characters to prevent DoS.
-fn edit_distance(a: &str, b: &str) -> usize {
+pub fn edit_distance(a: &str, b: &str) -> usize {
     if a.len() > 256 || b.len() > 256 {
         return usize::MAX;
     }
@@ -1299,5 +1364,16 @@ mod tests {
             .unwrap();
         let schema = def.to_arrow_schema_with_registry(&reg).unwrap();
         assert_eq!(schema.fields().len(), 3); // sample_rate, channels, data
+    }
+
+    #[test]
+    fn field_type_resolves_bounds_list_nesting() {
+        let reg = TypeRegistry::new();
+        // shallow nesting still resolves
+        assert!(reg.field_type_resolves("List<List<Float32>>"));
+        // a pathologically deep `List<…>` from an untrusted manifest must be
+        // rejected (return false), not overflow the stack
+        let deep = format!("{}Float32{}", "List<".repeat(100_000), ">".repeat(100_000));
+        assert!(!reg.field_type_resolves(&deep));
     }
 }

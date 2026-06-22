@@ -308,7 +308,7 @@ impl DaemonId {
         self.machine_id.as_deref()
     }
 
-    /// Reverse of [`Display`]: parse `"{machine_id}-{uuid}"`, or a bare
+    /// Reverse of [`Display`](std::fmt::Display): parse `"{machine_id}-{uuid}"`, or a bare
     /// `"{uuid}"` when there is no machine id.
     ///
     /// Both the machine id (hostnames) and the canonical UUID contain `-`, so
@@ -354,6 +354,49 @@ impl std::fmt::Display for DaemonId {
 pub struct GitSource {
     pub repo: String,
     pub commit_hash: String,
+    /// Subdirectory of the repository the node lives in (monorepo support).
+    /// Build, env preparation, and spawn are rooted at `<clone>/<subdir>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subdir: Option<String>,
+    /// Hub provenance marker. Set when this git source was desugared from a
+    /// `hub:` reference — it tells the daemon to use confined path
+    /// resolution (no ambient `$PATH` fallback) for the node, and feeds the
+    /// lockfile and `dora hub` commands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hub: Option<HubProvenance>,
+}
+
+/// Identity of the hub package a git source was resolved from.
+#[derive(Debug, serde::Deserialize, serde::Serialize, Clone, PartialEq, Eq)]
+pub struct HubProvenance {
+    /// Index key (`namespace/name`).
+    pub name: String,
+    /// Resolved version.
+    pub version: String,
+    /// Digest of the index entry's manifest at lock time. The commit hash pins
+    /// the *source tree*, but the entrypoint, build command, and typed contract
+    /// (inputs/outputs/types) all live in the (mutable) index entry — so a
+    /// rewritten entry could change any of them for an already-pinned version.
+    /// `--locked` hard-errors if this digest no longer matches. `Option` for
+    /// back-compat with lockfiles written before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_digest: Option<String>,
+}
+
+/// Lockfile pin for a `hub:` node resolved to a prebuilt binary artifact
+/// (spec §8.2). Mirrors [`GitSource`] for the binary source form: the
+/// `url`+`sha256` pin the bytes (re-verified on download), and `hub` records
+/// the package/version/manifest provenance for `--locked` tamper detection.
+#[derive(Debug, serde::Deserialize, serde::Serialize, Clone, PartialEq, Eq)]
+pub struct BinaryPin {
+    /// Platform the artifact was selected for at lock time (`<os>-<arch>`).
+    pub platform: String,
+    /// Download URL of the prebuilt artifact.
+    pub url: String,
+    /// SHA-256 the download must match.
+    pub sha256: String,
+    /// Hub provenance (index key, version, manifest digest).
+    pub hub: HubProvenance,
 }
 
 // Test roundtrip serialization of LogMessage

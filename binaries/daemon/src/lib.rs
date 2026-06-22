@@ -14,6 +14,7 @@ use dora_core::{
     },
     uhlc::{self, HLC},
 };
+use dora_memory_pool::{MemoryPoolId, MemoryPoolManager, MemoryPoolMetadata};
 use dora_message::{
     BuildId, DataflowId, SessionId,
     common::{
@@ -29,7 +30,7 @@ use dora_message::{
     },
     daemon_to_node::{DaemonReply, NodeConfig, NodeEvent},
     descriptor::{NodeSource, RestartPolicy},
-    metadata::{self, ArrowTypeInfo},
+    metadata::{self, ArrowTypeInfo, MetadataParameters},
     node_to_daemon::{DynamicNodeEvent, Timestamped},
 };
 use dora_node_api::arrow::datatypes::DataType;
@@ -300,6 +301,7 @@ pub struct Daemon {
     pub(crate) builds: BTreeMap<BuildId, BuildInfo>,
     pub(crate) git_manager: GitManager,
     pub(crate) metrics_system: Arc<std::sync::Mutex<sysinfo::System>>,
+    pub(crate) memory_pool: MemoryPoolManager,
 }
 
 type DaemonRunResult = BTreeMap<Uuid, BTreeMap<NodeId, Result<(), NodeError>>>;
@@ -519,6 +521,79 @@ async fn collect_and_send_metrics_bg(
     }
 
     Ok(())
+}
+
+/// Convert MemoryPoolMetadata into daemon-protocol MetadataParameters.
+fn pool_metadata_to_params(meta: &MemoryPoolMetadata) -> MetadataParameters {
+    use dora_message::metadata::Parameter;
+    let mut p = MetadataParameters::new();
+    p.insert("ptr".into(), Parameter::Integer(meta.ptr as i64));
+    p.insert("size".into(), Parameter::Integer(meta.size as i64));
+    p.insert("dtype".into(), Parameter::String(meta.dtype.clone()));
+    let shape: Vec<i64> = meta.shape.iter().map(|&x| x as i64).collect();
+    p.insert("shape".into(), Parameter::ListInt(shape));
+    p.insert("is_pinned".into(), Parameter::Bool(meta.is_pinned));
+    if let Some(ref t) = meta.pinned_type {
+        p.insert("pinned_type".into(), Parameter::String(t.clone()));
+    }
+    if let Some(ref n) = meta.shared_memory_name {
+        p.insert("shared_memory_name".into(), Parameter::String(n.clone()));
+    }
+    if let Some(ref b) = meta.buffer_id {
+        p.insert("buffer_id".into(), Parameter::String(b.clone()));
+    }
+    p
+}
+
+/// Reconstruct MemoryPoolMetadata from MetadataParameters (best-effort).
+fn pool_metadata_from_params(params: &MetadataParameters) -> MemoryPoolMetadata {
+    use dora_message::metadata::Parameter;
+    let get_int = |k: &str| -> Option<i64> {
+        params.get(k).and_then(|p| {
+            if let Parameter::Integer(v) = p {
+                Some(*v)
+            } else {
+                None
+            }
+        })
+    };
+    let get_str = |k: &str| -> Option<String> {
+        params.get(k).and_then(|p| {
+            if let Parameter::String(s) = p {
+                Some(s.clone())
+            } else {
+                None
+            }
+        })
+    };
+    let get_bool = |k: &str| -> Option<bool> {
+        params.get(k).and_then(|p| {
+            if let Parameter::Bool(v) = p {
+                Some(*v)
+            } else {
+                None
+            }
+        })
+    };
+    MemoryPoolMetadata {
+        ptr: get_int("ptr").unwrap_or(0) as u64,
+        size: get_int("size").unwrap_or(0) as usize,
+        dtype: get_str("dtype").unwrap_or_default(),
+        shape: params
+            .get("shape")
+            .and_then(|p| {
+                if let Parameter::ListInt(v) = p {
+                    Some(v.iter().map(|&x| x as usize).collect())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_default(),
+        is_pinned: get_bool("is_pinned").unwrap_or(false),
+        shared_memory_name: get_str("shared_memory_name"),
+        buffer_id: get_str("buffer_id"),
+        pinned_type: get_str("pinned_type"),
+    }
 }
 
 impl Daemon {
@@ -759,6 +834,7 @@ impl Daemon {
         stop_after: Option<Duration>,
         debug: bool,
         working_dir_override: Option<PathBuf>,
+        descriptor_override: Option<Descriptor>,
     ) -> eyre::Result<DataflowResult> {
         let working_dir = match working_dir_override {
             Some(p) => p
@@ -772,7 +848,13 @@ impl Daemon {
                 .to_owned(),
         };
 
-        let raw_descriptor = read_as_descriptor(dataflow_path).await?;
+        // `hub:` dataflows are desugared in memory by `dora build` — the
+        // on-disk YAML still contains unresolved references, so the caller
+        // passes the resolved descriptor from the dataflow session instead
+        let raw_descriptor = match descriptor_override {
+            Some(descriptor) => descriptor,
+            None => read_as_descriptor(dataflow_path).await?,
+        };
         // Expand module composition (must run before resolution; module
         // nodes cause `resolve_aliases_and_set_defaults` to fail otherwise).
         let mut descriptor = raw_descriptor
@@ -1070,6 +1152,7 @@ impl Daemon {
             zenoh_publish_tx,
             remote_daemon_events_tx,
             git_manager: Default::default(),
+            memory_pool: MemoryPoolManager::new(),
             builds,
             sessions: Default::default(),
             metrics_system: Arc::new(std::sync::Mutex::new(sysinfo::System::new())),
@@ -1396,6 +1479,13 @@ impl Daemon {
             // a Destroy command), so a closed channel is not an error.
             if let Err(e) = sender.send_event(&msg).await {
                 tracing::debug!("could not send Exit to coordinator (already gone?): {e}");
+            }
+        }
+
+        // Clean up any unfreed memory pool entries on daemon exit
+        if let Err(errors) = self.memory_pool.cleanup_all() {
+            for error in errors {
+                tracing::warn!("{error}");
             }
         }
 
@@ -1880,6 +1970,7 @@ impl Daemon {
                             node.clone(),
                             base_working_dir,
                             python_env_dir,
+                            false,
                             node_stderr,
                             None,
                             &mut logger,
@@ -1965,6 +2056,7 @@ impl Daemon {
                             name: None,
                             description: None,
                             path: None,
+                            path_sha256: None,
                             args: None,
                             env: None,
                             operators: None,
@@ -1986,6 +2078,7 @@ impl Daemon {
                             max_rotated_files: None,
                             build: None,
                             git: None,
+                            hub: None,
                             branch: None,
                             tag: None,
                             rev: None,
@@ -2056,6 +2149,16 @@ impl Daemon {
                     for receivers in dataflow.mappings.values_mut() {
                         receivers.retain(|(nid, _)| nid != &node_id);
                     }
+                    // Drop this node's timer/log virtual-input subscriptions —
+                    // both to stop delivering to a removed node and so a re-added
+                    // ID is classified by its own inputs, not stale timer/log
+                    // state (which would mark it never-finishing forever, #2270).
+                    for receivers in dataflow.timers.values_mut() {
+                        receivers.retain(|(nid, _)| nid != &node_id);
+                    }
+                    dataflow
+                        .log_subscribers
+                        .retain(|sub| sub.node_id != node_id);
 
                     // Clean up remaining state for this node.
                     dataflow.running_nodes.remove(&node_id);
@@ -2063,6 +2166,10 @@ impl Daemon {
                     dataflow.subscribe_channels.remove(&node_id);
                     dataflow.pending_messages.remove(&node_id);
                     dataflow.all_inputs_closed_at.remove(&node_id);
+                    // clear the connected marker too, else a re-added node ID
+                    // would look already-connected before its new incarnation
+                    // subscribes and could be selected mid-startup (dora#2270).
+                    dataflow.connected_nodes.remove(&node_id);
                     dataflow.finish_escalated.remove(&node_id);
 
                     // Remove from stored descriptor (inverse of AddNode
@@ -2101,6 +2208,10 @@ impl Daemon {
                         .entry(output_id)
                         .or_default()
                         .insert((target_node.clone(), target_input.clone()));
+                    // Reopening an input ends any drain: clear the stale clock so
+                    // the selector does not treat the node as drained-and-eligible
+                    // on a timestamp from before the mapping was re-added (#2270).
+                    dataflow.all_inputs_closed_at.remove(&target_node);
                     dataflow
                         .open_inputs
                         .entry(target_node)
@@ -2252,9 +2363,14 @@ impl Daemon {
     /// ladder used by explicit stops — after capturing a stack sample of
     /// the stuck process so the hang itself stays diagnosable.
     fn check_finish_stragglers(&mut self) {
-        let grace = finish_drain_grace();
+        // On by default; only DORA_FINISH_DRAIN_GRACE_SECS=off/disabled turns
+        // escalation off entirely (see `finish_drain_grace`).
+        let Some(grace) = finish_drain_grace() else {
+            return;
+        };
+        let now_millis = node_communication::current_millis();
         for (dataflow_id, dataflow) in self.running.iter_mut() {
-            for node_id in dataflow.finish_stragglers(grace) {
+            for node_id in dataflow.finish_stragglers(grace, now_millis) {
                 let drained_for_secs = dataflow
                     .all_inputs_closed_at
                     .get(&node_id)
@@ -2573,7 +2689,11 @@ impl Daemon {
             let git_source = git_sources.get(&node_id).cloned();
             let prev_git_source = prev_git_sources.get(&node_id).cloned();
             let prev_git = prev_git_source.map(|prev_source| PrevGitSource {
-                still_needed_for_this_build: git_sources.values().any(|s| s == &prev_source),
+                // compare clone identity (repo + commit) only: hub provenance
+                // and subdir don't change which directory the clone occupies
+                still_needed_for_this_build: git_sources.values().any(|s| {
+                    s.repo == prev_source.repo && s.commit_hash == prev_source.commit_hash
+                }),
                 git_source: prev_source,
             });
 
@@ -2614,10 +2734,18 @@ impl Daemon {
             }
         }
 
+        // hub-sourced nodes (recognized by the provenance marker on their
+        // git source) are spawned with confined path resolution (spec §11)
+        let confined_nodes: BTreeSet<NodeId> = git_sources
+            .iter()
+            .filter(|(_, source)| source.hub.is_some())
+            .map(|(node_id, _)| node_id.clone())
+            .collect();
         let task = async move {
             let mut info = BuildInfo {
                 node_working_dirs: Default::default(),
                 python_env_dirs: Default::default(),
+                confined_nodes,
             };
             for task in tasks {
                 let NodeBuildTask {
@@ -2652,6 +2780,11 @@ impl Daemon {
         uv: bool,
         write_events_to: Option<PathBuf>,
     ) -> eyre::Result<impl Future<Output = eyre::Result<()>> + use<>> {
+        // Sweep orphaned /dev/shm segments from a previous crash of the
+        // same dataflow (keyed by dataflow_id, a UUID — safe in multi-
+        // daemon setups).
+        MemoryPoolManager::cleanup_orphans(&dataflow_id.to_string());
+
         let mut logger = self
             .logger
             .for_dataflow(dataflow_id)
@@ -2694,8 +2827,14 @@ impl Daemon {
         }
         // Reuse build-time metadata so runtime spawn can follow the same
         // working-directory and managed-env decisions.
-        let (node_working_dirs, python_env_dirs) = build_info
-            .map(|info| (info.node_working_dirs.clone(), info.python_env_dirs.clone()))
+        let (node_working_dirs, python_env_dirs, confined_nodes) = build_info
+            .map(|info| {
+                (
+                    info.node_working_dirs.clone(),
+                    info.python_env_dirs.clone(),
+                    info.confined_nodes.clone(),
+                )
+            })
             .unwrap_or_default();
 
         // calculate info about mappings
@@ -2910,6 +3049,7 @@ impl Daemon {
                         node,
                         node_working_dir,
                         configured_python_env_dir,
+                        confined_nodes.contains(&node_id),
                         node_stderr_most_recent,
                         node_write_events_to,
                         &mut logger,
@@ -3351,6 +3491,140 @@ impl Daemon {
                 let reply = inner.await.map_err(|err| format!("{err:?}"));
                 let _ = reply_sender.send(DaemonReply::Result(reply));
             }
+            DaemonNodeEvent::RegisterPinnedMemory {
+                shared_memory_id,
+                metadata,
+                reply_sender,
+            } => {
+                let result = (|| -> Result<(), String> {
+                    let pool_metadata = pool_metadata_from_params(&metadata.parameters);
+                    // Validate required fields that the helper fills with defaults
+                    if pool_metadata.ptr == 0 {
+                        return Err("missing or invalid ptr".to_string());
+                    }
+                    if pool_metadata.size == 0 {
+                        return Err("missing or invalid size".to_string());
+                    }
+                    if pool_metadata.dtype.is_empty() {
+                        return Err("missing or invalid dtype".to_string());
+                    }
+                    if pool_metadata.shape.is_empty() {
+                        return Err("missing shape".to_string());
+                    }
+                    // Mirror the Python-side size cap.
+                    if pool_metadata.size > 1024 * 1024 * 1024 {
+                        return Err(format!("size {} exceeds 1 GiB cap", pool_metadata.size));
+                    }
+                    // Require a shared memory name for cleanup.
+                    let shm_name = pool_metadata
+                        .shared_memory_name
+                        .as_ref()
+                        .filter(|n| !n.is_empty())
+                        .ok_or_else(|| "missing shared_memory_name".to_string())?;
+                    // Validate prefix in the same way free_shared_memory does.
+                    if !shm_name.starts_with("dora_pool_")
+                        || shm_name.contains('/')
+                        || shm_name.contains("..")
+                    {
+                        return Err(format!("shared_memory_name `{}` is invalid", shm_name));
+                    }
+
+                    // Per-daemon pool cap (soft limit — rejects excess registrations).
+                    const MAX_POOLS: usize = 512;
+                    if self.memory_pool.table_size() >= MAX_POOLS {
+                        return Err(format!(
+                            "daemon pool table full ({MAX_POOLS} entries); \
+                             free unused pools before registering more"
+                        ));
+                    }
+
+                    self.memory_pool.register_memory_pool(
+                        MemoryPoolId {
+                            dataflow_id: dataflow_id.to_string(),
+                            id: shared_memory_id,
+                        },
+                        pool_metadata,
+                        node_id.to_string(),
+                    )
+                })();
+                let _ = reply_sender.send(DaemonReply::Result(result));
+            }
+            DaemonNodeEvent::ReadPinnedMemory {
+                shared_memory_id,
+                free,
+                reply_sender,
+            } => {
+                let result = (|| -> Result<dora_message::metadata::Metadata, String> {
+                    let id = MemoryPoolId {
+                        dataflow_id: dataflow_id.to_string(),
+                        id: shared_memory_id.clone(),
+                    };
+                    let metadata = self
+                        .memory_pool
+                        .read_memory_pool(&id, node_id.as_ref())
+                        .ok_or_else(|| {
+                            format!("memory pool with ID {} not found", shared_memory_id)
+                        })?;
+
+                    if free
+                        && let Err(err) = self.memory_pool.free_memory_pool(&id, node_id.as_ref())
+                    {
+                        tracing::warn!(
+                            "Failed to free memory pool {} after reading: {}",
+                            shared_memory_id,
+                            err
+                        );
+                    }
+
+                    let mut parameters = pool_metadata_to_params(&metadata);
+                    // When freeing, drop shared_memory_name — the segment has
+                    // been unlinked and the name is a dangling reference.
+                    if free {
+                        parameters.remove("shared_memory_name");
+                    }
+
+                    let timestamp = self.clock.new_timestamp();
+                    let type_info = dora_message::metadata::ArrowTypeInfo {
+                        data_type: DataType::Null,
+                        len: 0,
+                        null_count: 0,
+                        validity: None,
+                        offset: 0,
+                        buffer_offsets: vec![],
+                        child_data: vec![],
+                        field_names: None,
+                        schema_hash: None,
+                    };
+
+                    Ok(dora_message::metadata::Metadata::from_parameters(
+                        timestamp, type_info, parameters,
+                    ))
+                })();
+
+                match result {
+                    Ok(metadata) => {
+                        let _ = reply_sender.send(DaemonReply::PinnedMemoryMetadata { metadata });
+                    }
+                    Err(err) => {
+                        let _ = reply_sender.send(DaemonReply::Result(Err(err)));
+                    }
+                }
+            }
+            DaemonNodeEvent::FreePinnedMemory {
+                shared_memory_id,
+                reply_sender,
+            } => {
+                let id = MemoryPoolId {
+                    dataflow_id: dataflow_id.to_string(),
+                    id: shared_memory_id.clone(),
+                };
+                let result: Result<(), String> =
+                    match self.memory_pool.free_memory_pool(&id, node_id.as_ref()) {
+                        Ok(_) => Ok(()),
+                        Err(e) => Err(e),
+                    };
+                let _ = reply_sender.send(DaemonReply::Result(result));
+            }
         }
         Ok(())
     }
@@ -3630,6 +3904,10 @@ impl Daemon {
         event_sender: mpsc::Sender<Timestamped<NodeEvent>>,
         clock: &HLC,
     ) {
+        // record that this node has connected — it stays a finish-straggler
+        // candidate even if it later drops its event stream (dora#2270).
+        dataflow.connected_nodes.insert(node_id.clone());
+
         // some inputs might have been closed already -> report those events
         let closed_inputs = dataflow
             .mappings
@@ -4291,6 +4569,10 @@ impl Daemon {
                 if let Some(dataflow) = self.running.get_mut(&dataflow_id) {
                     dataflow.grace_duration_kills.remove(&node_id);
                     dataflow.all_inputs_closed_at.remove(&node_id);
+                    // a respawned node must re-subscribe before it counts as
+                    // connected, else a slow restart could be silence-escalated
+                    // mid-startup (dora-rs/dora#2270).
+                    dataflow.connected_nodes.remove(&node_id);
                 }
 
                 logger
@@ -5046,30 +5328,53 @@ fn break_input(
     }
 }
 
-/// Grace period before the finish-straggler watchdog escalates
-/// (dora-rs/dora#2152). Conservative by default: a sink may legitimately
-/// keep working for a while after its inputs close (flushing recordings,
-/// final writes). Override with `DORA_FINISH_DRAIN_GRACE_SECS`.
+/// Grace period used when the finish-straggler watchdog is enabled but
+/// `DORA_FINISH_DRAIN_GRACE_SECS` is set to an unparseable value. Conservative:
+/// a sink may legitimately keep working for a while after its inputs close
+/// (flushing recordings, final writes).
 const DEFAULT_FINISH_DRAIN_GRACE: Duration = Duration::from_secs(120);
 
-fn finish_drain_grace() -> Duration {
-    match std::env::var("DORA_FINISH_DRAIN_GRACE_SECS") {
-        Ok(value) => match value.parse::<u64>() {
-            Ok(secs) => Duration::from_secs(secs),
-            Err(_) => {
-                static WARNED: std::sync::atomic::AtomicBool =
-                    std::sync::atomic::AtomicBool::new(false);
-                if !WARNED.swap(true, atomic::Ordering::Relaxed) {
-                    tracing::warn!(
-                        "invalid DORA_FINISH_DRAIN_GRACE_SECS value `{value}` \
-                         (expected whole seconds); using the default of {}s",
-                        DEFAULT_FINISH_DRAIN_GRACE.as_secs()
-                    );
-                }
-                DEFAULT_FINISH_DRAIN_GRACE
+/// Grace period before the finish-straggler watchdog escalates a stuck node, or
+/// `None` if the watchdog has been explicitly **disabled**.
+///
+/// The watchdog is **on by default** (dora-rs/dora#2270): a node still stuck
+/// past the grace once its dataflow is otherwise finished is escalated rather
+/// than hanging until an external timeout. `DORA_FINISH_DRAIN_GRACE_SECS` tunes
+/// it — a whole number of seconds sets the grace; `off`/`disabled` opts out
+/// entirely (the escape hatch for a deployment that hits a false positive). It
+/// shipped dark first and was validated on nightly + a deterministic e2e
+/// (#2271, #2276, #2280) before this default flip.
+fn finish_drain_grace() -> Option<Duration> {
+    parse_finish_drain_grace(
+        std::env::var("DORA_FINISH_DRAIN_GRACE_SECS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn parse_finish_drain_grace(value: Option<&str>) -> Option<Duration> {
+    let Some(value) = value else {
+        // unset → enabled at the conservative default grace (on by default)
+        return Some(DEFAULT_FINISH_DRAIN_GRACE);
+    };
+    // explicit opt-out escape hatch for a deployment that hits a false positive
+    if value.eq_ignore_ascii_case("off") || value.eq_ignore_ascii_case("disabled") {
+        return None;
+    }
+    match value.parse::<u64>() {
+        Ok(secs) => Some(Duration::from_secs(secs)),
+        Err(_) => {
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, atomic::Ordering::Relaxed) {
+                tracing::warn!(
+                    "invalid DORA_FINISH_DRAIN_GRACE_SECS value `{value}` \
+                     (expected whole seconds or `off`); using the default of {}s",
+                    DEFAULT_FINISH_DRAIN_GRACE.as_secs()
+                );
             }
-        },
-        Err(_) => DEFAULT_FINISH_DRAIN_GRACE,
+            Some(DEFAULT_FINISH_DRAIN_GRACE)
+        }
     }
 }
 
@@ -5399,6 +5704,232 @@ mod fault_tolerance_tests {
         let events = drain_events(&mut rx);
         assert_eq!(events.len(), 1);
         assert!(matches_event(&events[0], "InputClosed"));
+    }
+
+    // -- dora#2270: finish-straggler watchdog must spare timer/log-fed nodes --
+
+    /// Insert a connected node that has been silent since the epoch, so
+    /// `finish_stragglers` sees it as long-idle regardless of grace.
+    fn insert_silent_node(df: &mut RunningDataflow, node: &NodeId) {
+        let running = test_running_node();
+        running.last_activity.store(1, atomic::Ordering::Release);
+        df.running_nodes.insert(node.clone(), running);
+        // a real running node has subscribed (can receive finish events)
+        let (tx, _rx) = mpsc::channel(NODE_EVENT_CHANNEL_CAPACITY);
+        df.subscribe_channels.insert(node.clone(), tx);
+        df.connected_nodes.insert(node.clone());
+    }
+
+    #[test]
+    fn timer_fed_node_is_not_a_finish_straggler() {
+        // A long-running timer-only node never drains and sends no daemon
+        // traffic, so it looks "silent + never drained" exactly like a wedge —
+        // but it is alive by design and must NOT be force-killed (#2270).
+        let mut df = test_dataflow();
+        let timer_node: NodeId = "timer_node".to_string().into();
+        insert_silent_node(&mut df, &timer_node);
+        df.timers
+            .entry(Duration::from_millis(100))
+            .or_default()
+            .insert((timer_node.clone(), "tick".to_string().into()));
+
+        let now = node_communication::current_millis();
+        let selected = df.finish_stragglers(Duration::from_millis(1), now);
+        assert!(
+            selected.is_empty(),
+            "timer-fed node must not be escalated: {selected:?}"
+        );
+    }
+
+    #[test]
+    fn wedged_user_input_node_is_a_finish_straggler() {
+        // A connected node with no timer/log input that has gone silent past
+        // grace while the rest of the dataflow finished IS a straggler.
+        let mut df = test_dataflow();
+        let stuck: NodeId = "stuck".to_string().into();
+        insert_silent_node(&mut df, &stuck);
+
+        let now = node_communication::current_millis();
+        let selected = df.finish_stragglers(Duration::from_millis(1), now);
+        assert_eq!(selected, vec![stuck]);
+    }
+
+    #[test]
+    fn unconnected_slow_starting_node_is_not_a_finish_straggler() {
+        // `last_activity` is seeded at spawn, so a node that has not subscribed
+        // yet looks long-silent — but it is still starting up (e.g. loading a
+        // model) and must not be force-killed (#2270 review).
+        let mut df = test_dataflow();
+        let starting: NodeId = "slow_loader".to_string().into();
+        let running = test_running_node();
+        running.last_activity.store(1, atomic::Ordering::Release);
+        df.running_nodes.insert(starting.clone(), running);
+        // NOTE: deliberately NOT added to subscribe_channels (not connected).
+
+        let now = node_communication::current_millis();
+        let selected = df.finish_stragglers(Duration::from_millis(1), now);
+        assert!(
+            selected.is_empty(),
+            "a node that has not subscribed must not be escalated: {selected:?}"
+        );
+    }
+
+    #[test]
+    fn dropped_stream_node_is_still_a_finish_straggler() {
+        // A node that connected, then dropped its event stream (channel removed)
+        // but kept its process alive, is still a wedge candidate — `connected`
+        // tracks `connected_nodes`, not current channel presence (#2270 review).
+        let mut df = test_dataflow();
+        let stuck: NodeId = "stuck".to_string().into();
+        let running = test_running_node();
+        running.last_activity.store(1, atomic::Ordering::Release);
+        df.running_nodes.insert(stuck.clone(), running);
+        df.connected_nodes.insert(stuck.clone());
+        // NOTE: no subscribe_channels entry — the event stream was dropped.
+
+        let now = node_communication::current_millis();
+        let selected = df.finish_stragglers(Duration::from_millis(1), now);
+        assert_eq!(selected, vec![stuck]);
+    }
+
+    #[test]
+    fn removed_node_id_is_not_connected_on_reuse() {
+        // RemoveNode clears connected_nodes, so a re-added node ID starts fresh:
+        // its slow-starting new incarnation must not be selected before it
+        // subscribes, even though the previous incarnation had connected.
+        let mut df = test_dataflow();
+        let node_a: NodeId = "node_a".to_string().into();
+        df.connected_nodes.insert(node_a.clone());
+        df.connected_nodes.remove(&node_a); // (the RemoveNode cleanup line)
+
+        let running = test_running_node();
+        running.last_activity.store(1, atomic::Ordering::Release);
+        df.running_nodes.insert(node_a.clone(), running);
+
+        let now = node_communication::current_millis();
+        let selected = df.finish_stragglers(Duration::from_millis(1), now);
+        assert!(
+            selected.is_empty(),
+            "a re-added node ID must not be selected before its new incarnation subscribes"
+        );
+    }
+
+    #[test]
+    fn cleared_timer_state_makes_reused_id_escalatable() {
+        // A timer-fed node is never-finishing (vetoed). RemoveNode clears its
+        // timer subscription, so a re-added user-input node under the same ID is
+        // classified by its own inputs and can be escalated (#2270 review).
+        let mut df = test_dataflow();
+        let node: NodeId = "reused".to_string().into();
+        insert_silent_node(&mut df, &node);
+        df.timers
+            .entry(Duration::from_millis(100))
+            .or_default()
+            .insert((node.clone(), "tick".to_string().into()));
+
+        let now = node_communication::current_millis();
+        // as a timer node → vetoed
+        assert!(
+            df.finish_stragglers(Duration::from_millis(1), now)
+                .is_empty(),
+            "timer-fed node must be vetoed"
+        );
+
+        // RemoveNode clears the timer subscription
+        for receivers in df.timers.values_mut() {
+            receivers.retain(|(nid, _)| nid != &node);
+        }
+        assert_eq!(
+            df.finish_stragglers(Duration::from_millis(1), now),
+            vec![node],
+            "once its timer state is cleared the node is classified by its own inputs"
+        );
+    }
+
+    #[test]
+    fn reopened_input_clears_stale_drain_timestamp() {
+        // A node drained long ago is eligible via the drained arm. Reopening a
+        // mapping must clear that timestamp so the node — now actively receiving
+        // again, not silent — is not force-stopped on a stale drain (#2270 review).
+        let mut df = test_dataflow();
+        let node: NodeId = "node_a".to_string().into();
+        let running = test_running_node();
+        // recent activity → not silent (only a stale drain clock could select it)
+        running.last_activity.store(
+            node_communication::current_millis(),
+            atomic::Ordering::Release,
+        );
+        df.running_nodes.insert(node.clone(), running);
+        df.connected_nodes.insert(node.clone());
+        df.all_inputs_closed_at.insert(
+            node.clone(),
+            std::time::Instant::now() - Duration::from_secs(1),
+        );
+
+        let grace = Duration::from_millis(500);
+        let now = node_communication::current_millis();
+        // drained past grace → selected
+        assert_eq!(df.finish_stragglers(grace, now), vec![node.clone()]);
+
+        // AddMapping reopen clears the drain clock
+        df.all_inputs_closed_at.remove(&node);
+        assert!(
+            df.finish_stragglers(grace, now).is_empty(),
+            "an active node with a reopened input must not be selected on a stale drain"
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_clears_connected_marker() {
+        // A restarting node keeps its ID but is a new incarnation: clear the
+        // connected marker so the restarting process isn't silence-escalatable
+        // before it re-subscribes (a slow restart / model reload) — #2270 review.
+        use crate::running_dataflow::{ProcessHandle, ProcessOperation};
+        let mut df = test_dataflow();
+        let clock = test_clock();
+        let node_a: NodeId = "node_a".to_string().into();
+
+        let mut running = test_running_node();
+        let (op_tx, _op_rx) = flume::unbounded::<ProcessOperation>();
+        running.process = Some(ProcessHandle::new(op_tx));
+        df.running_nodes.insert(node_a.clone(), running);
+        df.connected_nodes.insert(node_a.clone());
+        df.all_inputs_closed_at
+            .insert(node_a.clone(), std::time::Instant::now());
+
+        df.restart_single_node(&node_a, &clock, None).unwrap();
+
+        assert!(
+            !df.connected_nodes.contains(&node_a),
+            "restart must clear the connected marker so the new incarnation re-subscribes"
+        );
+    }
+
+    #[test]
+    fn finish_drain_grace_defaults_on_with_opt_out() {
+        // unset → enabled at the default grace (on by default, dora#2270 step 3)
+        assert_eq!(
+            parse_finish_drain_grace(None),
+            Some(DEFAULT_FINISH_DRAIN_GRACE)
+        );
+        // explicit opt-out escape hatch → disabled
+        assert_eq!(parse_finish_drain_grace(Some("off")), None);
+        assert_eq!(parse_finish_drain_grace(Some("disabled")), None);
+        assert_eq!(parse_finish_drain_grace(Some("OFF")), None);
+        // set → enabled at the given grace
+        assert_eq!(
+            parse_finish_drain_grace(Some("30")),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(
+            parse_finish_drain_grace(Some("0")),
+            Some(Duration::from_secs(0))
+        );
+        // set-but-garbage → enabled at the default (the user meant to turn it on)
+        assert_eq!(
+            parse_finish_drain_grace(Some("not-a-number")),
+            Some(DEFAULT_FINISH_DRAIN_GRACE)
+        );
     }
 
     // -- Test 2: close_input sends AllInputsClosed + disable_restart on last input --

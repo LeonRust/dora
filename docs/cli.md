@@ -346,6 +346,11 @@ dora build <PATH> [OPTIONS]
 | `--uv` | false | Use `uv` for Python builds |
 | `--local` | false | Force local build (skip coordinator) |
 | `--strict-types` | false | Treat type warnings as errors (non-zero exit code) |
+| `--locked` | false | Use pinned hub/git commits from the lockfile (no resolution) |
+| `--offline` | false | Do not refresh the hub index over the network; cache only |
+| `--hub-override <PKG=PATH>` | — | Substitute a local checkout for a hub package (repeatable; local builds only) |
+
+**`--hub-override`:** for the node author's inner loop (UC11) — test a local checkout against a consumer dataflow without publishing. `--hub-override <namespace>/<name>=<path>` reads the manifest from `<path>`, still validates contracts, and builds + runs the node from local source instead of resolving and cloning the index pin. The same flag is accepted by `dora run`. It implies a local build (the checkout only exists on this machine), so it is rejected when combined with a remote coordinator or a distributed (`deploy:`) dataflow. Pair `dora build --hub-override …` with `dora start`, or use `dora run --hub-override …` directly.
 
 **Type checking:** After expanding modules, `build` runs the same type checks as `validate`. Warnings are printed by default; use `--strict-types` (or set `strict_types: true` in the YAML) to fail the build on type mismatches. User-defined types in a `types/` directory next to the dataflow are loaded automatically.
 
@@ -1055,16 +1060,19 @@ dora graph dataflow.yml --mermaid
 
 #### `dora validate`
 
-Validate a dataflow YAML file and check type annotations.
+Validate a dataflow YAML file and check type annotations, or validate a node
+manifest (`dora-node.yml`).
 
 ```
 dora validate <PATH> [OPTIONS]
+dora validate --node-manifest <PATH>
 ```
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `<PATH>` | required | Dataflow descriptor path |
+| `<PATH>` | required unless `--node-manifest` | Dataflow descriptor path |
 | `--strict-types` | false | Treat warnings as errors (non-zero exit code for CI) |
+| `--node-manifest <PATH>` | — | Validate a node manifest instead of a dataflow (schema, entrypoint confinement, env deny-list, type URNs) |
 
 Checks:
 1. **Key existence**: `output_types`/`input_types` keys exist in the corresponding `outputs`/`inputs` lists
@@ -1084,9 +1092,83 @@ dora validate dataflow.yml
 
 # Strict mode for CI (exit 1 on warnings)
 dora validate --strict-types dataflow.yml
+
+# Validate a node manifest (always strict)
+dora validate --node-manifest dora-node.yml
 ```
 
 See the [Type Annotations Guide](types.md) for the full type library and usage details.
+
+#### `dora hub` (unstable)
+
+Package, discover, and use dora nodes. For the full walkthrough see the
+[Hub guide](../guide/src/hub/overview.md); the design spec is
+[the Dora Hub plan](plan-node-hub.md).
+
+```
+dora hub init [PATH]                       # scaffold a dora-node.yml manifest
+dora hub search <query> [--category C]     # find nodes by name/keyword/category
+                        [--platform P] [--offline]
+dora hub info <pkg>[@<ver>] [--offline]    # contracts + example for a package
+dora hub list <dataflow.yml>               # hub packages pinned in the lockfile
+dora hub fetch <dataflow.yml | pkg@ver>    # warm the index cache + mirror sources
+               [--target-dir DIR]
+dora hub install                           # (stub) prints how to add a hub: node
+dora hub publish [PATH] [--dry-run]        # validate + add a pinned index entry
+                 [--rev REF] [--repo URL]
+                 [--version SEMVER] [--index ALIAS]
+dora hub yank <pkg>@<version>              # yank/restore a published version
+              [--reason R] [--undo]
+dora hub outdated <dataflow.yml>           # locked hub pins behind the index
+                  [--offline]
+dora hub update <dataflow.yml>             # re-resolve hub pins + rewrite lockfile
+                [--offline] [--dry-run]
+```
+
+`yank` flips the `yanked` flag on a published version: new resolutions skip it,
+an existing `--locked` pin keeps working but `dora build` warns; `--undo`
+restores it (the one mutation an index entry allows, §7.5). For a local
+(`path =`) index the flag is flipped in place; for a git-backed index it prints
+the flag-flip change to open as a PR.
+
+`outdated` reads a dataflow's lockfile and, for each pinned hub package,
+compares the pin against the latest non-yanked **stable** version in the index
+(ignoring the dataflow's range, so a major/minor bump still shows up;
+pre-releases are not reported, matching resolution). Update the `hub:` range and
+rebuild to upgrade. Exits non-zero if any package could not be checked.
+
+`update` runs the same resolve / contract / type-check / lockfile pipeline as
+`dora build --write-lockfile` — re-resolving every hub node to the latest
+version satisfying the descriptor's `hub:` range (and any plain `git:` nodes to
+their current ref) — then stops *before* building. The lockfile it writes is
+therefore identical to a real build's, and consumable under `dora build
+--locked`. Because it re-checks each package's contract, it fails if a newer
+version's manifest no longer matches the wiring (rather than locking a version
+that won't build). `--dry-run` resolves and reports without writing.
+(Per-package filtering — `update <pkg>` — is not yet implemented; it re-resolves
+all hub nodes.)
+
+`init` pre-fills the name, runtime, and entrypoint from `pyproject.toml` /
+`Cargo.toml` when present and the namespace from the `origin` git remote;
+typed inputs/outputs are left as commented examples. Check the result with
+`dora validate --node-manifest dora-node.yml`.
+
+`publish` validates the manifest, reads the version from `[package].version`
+(Cargo) / `[project].version` (pyproject), resolves the source pin (the
+`origin` remote or `--repo`, the `--rev`/`HEAD` commit, and the directory's
+subdir within the repo), and produces the index entry
+`<namespace>/<name>/<version>.yml`. `--dry-run` prints the entry without
+writing it. Otherwise it writes into a **local** (`path =`) index — the
+enterprise/private and fixture form — and refuses to overwrite an existing
+version (the index is append-only). For a git-backed index it prints the entry
+and where to add it; automated PR-opening against the official `node-index`
+lands with the index bootstrap.
+
+`search`/`info`/`outdated`/`update` accept `--offline` to use only the cached index.
+Indexes are configured in `~/.config/dora/hub.toml`; a namespace resolves
+against exactly one index (see the plan §7.3). `hub:` nodes in a dataflow are
+resolved by `dora build` — there is deliberately no `dora hub install` (hub
+packages are resolved per-dataflow, cargo-style).
 
 ---
 

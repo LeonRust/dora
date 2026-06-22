@@ -12,6 +12,7 @@ pub mod build;
 pub mod descriptor;
 #[cfg(feature = "type-inference")]
 pub mod inference;
+pub mod manifest;
 pub mod metadata;
 pub mod topics;
 pub mod types;
@@ -20,7 +21,7 @@ pub mod types;
 ///
 /// Takes a base path (without platform-specific prefix and extension) and returns
 /// a path with the appropriate shared library naming conventions using
-/// [`DLL_PREFIX`](std::env::consts::DLL_PREFIX) and [`DLL_SUFFIX`](std::env::consts::DLL_SUFFIX).
+/// [`DLL_PREFIX`] and [`DLL_SUFFIX`].
 ///
 /// # Errors
 ///

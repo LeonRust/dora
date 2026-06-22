@@ -17,6 +17,7 @@ pub fn build_dataflow_locally(
     working_dir: PathBuf,
     uv: bool,
     parallel: bool,
+    node_working_dir_overrides: &BTreeMap<NodeId, PathBuf>,
 ) -> eyre::Result<BuildInfo> {
     let runtime = tokio::runtime::Runtime::new()?;
 
@@ -27,6 +28,7 @@ pub fn build_dataflow_locally(
         working_dir,
         uv,
         parallel,
+        node_working_dir_overrides,
     ))
 }
 
@@ -37,6 +39,7 @@ async fn build_dataflow(
     base_working_dir: PathBuf,
     uv: bool,
     parallel: bool,
+    node_working_dir_overrides: &BTreeMap<NodeId, PathBuf>,
 ) -> eyre::Result<BuildInfo> {
     let builder = Builder {
         session_id: dataflow_session.session_id,
@@ -56,12 +59,23 @@ async fn build_dataflow(
         let git_source = git_sources.get(&node_id).cloned();
         let prev_git_source = prev_git_sources.get(&node_id).cloned();
         let prev_git = prev_git_source.map(|prev_source| PrevGitSource {
-            still_needed_for_this_build: git_sources.values().any(|s| s == &prev_source),
+            // compare clone identity (repo + commit) only: hub provenance and
+            // subdir don't change which directory the clone occupies
+            still_needed_for_this_build: git_sources
+                .values()
+                .any(|s| s.repo == prev_source.repo && s.commit_hash == prev_source.commit_hash),
             git_source: prev_source,
         });
 
-        let task = builder
-            .clone()
+        // `--hub-override` roots this node's build (and, via the recorded
+        // working dir, its spawn) at a local checkout instead of the dataflow
+        // dir or a git clone.
+        let mut node_builder = builder.clone();
+        if let Some(override_dir) = node_working_dir_overrides.get(&node_id) {
+            node_builder.base_working_dir = override_dir.clone();
+        }
+
+        let task = node_builder
             .build_node(
                 node,
                 git_source,
@@ -79,6 +93,12 @@ async fn build_dataflow(
     let mut info = BuildInfo {
         node_working_dirs: Default::default(),
         python_env_dirs: Default::default(),
+        // hub-sourced nodes are spawned with confined path resolution
+        confined_nodes: git_sources
+            .iter()
+            .filter(|(_, source)| source.hub.is_some())
+            .map(|(node_id, _)| node_id.clone())
+            .collect(),
     };
 
     if parallel && tasks.len() > 1 {

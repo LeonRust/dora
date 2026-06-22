@@ -304,6 +304,12 @@ pub struct Node {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
 
+    /// SHA-256 checksum the `path` download must match, verified after fetch
+    /// and on cache reuse (spec §8.2/§8.4). Set internally when a `hub:`
+    /// reference resolves to a prebuilt binary artifact; rarely set by hand.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_sha256: Option<String>,
+
     /// Command-line arguments passed to the executable.
     ///
     /// The command-line arguments that should be passed to the executable/script specified in `path`.
@@ -647,6 +653,32 @@ pub struct Node {
     /// directory too. So a relative `path` will start from the clone directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git: Option<String>,
+
+    /// Hub package reference (unstable).
+    ///
+    /// References a node published in the Dora Hub index:
+    /// `[<namespace>/]<name>@<semver-requirement>`. A bare name is shorthand
+    /// for the official `dora-rs/` namespace.
+    ///
+    /// `dora build` resolves the reference against the index to a pinned
+    /// commit and the node is fetched/built through the same machinery as a
+    /// [`git`](Self::git) node; the package manifest supplies the
+    /// entrypoint, build command, and typed contracts. Mutually exclusive
+    /// with `path`, `git`, and `build`.
+    ///
+    /// ## Example
+    ///
+    /// ```yaml
+    /// nodes:
+    ///   - id: detector
+    ///     hub: dora-yolo@^0.5
+    ///     inputs:
+    ///       image: camera/image
+    ///     outputs:
+    ///       - bbox
+    /// ```
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hub: Option<String>,
 
     /// Git branch to checkout after cloning.
     ///
@@ -1033,6 +1065,11 @@ pub struct CustomNode {
     /// Source can match any executable in PATH.
     pub path: String,
     pub source: NodeSource,
+    /// SHA-256 the `path` download must match (set for hub binary artifacts,
+    /// spec §8.2). When present the daemon fetches `path` as a verified URL
+    /// download regardless of confinement — the checksum is the trust anchor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_sha256: Option<String>,
     /// Args for the executable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub args: Option<String>,

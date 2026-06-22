@@ -1097,6 +1097,81 @@ fn contract_record_replay_reproduces_validated_pipeline() {
     );
 
     let dora = dora_bin();
+
+    // On a loaded CI runner the record-node spawn can be slow enough that
+    // the body read times out before the node sends its first message,
+    // surfacing as "TCP read body timed out" — an infrastructure stall, not a
+    // semantic break in the recording. Retry the whole record+replay cycle a
+    // bounded number of times on *that signature in the record step only*; the
+    // replay step treats TCP timeouts as semantic failures (the recording is
+    // already known-good, so a missing message is a real regression). A missing
+    // SUCCESS marker on an otherwise-clean run fails immediately.
+    const MAX_ATTEMPTS: u32 = 3;
+    for attempt in 1..=MAX_ATTEMPTS {
+        match record_replay_once(&dora) {
+            Ok(()) => return,
+            Err(RecordReplayFailure::InfraTimeout(detail)) if attempt < MAX_ATTEMPTS => {
+                eprintln!(
+                    "record/replay attempt {attempt}/{MAX_ATTEMPTS} hit a TCP read timeout \
+                     (infra stall, not a semantic break); retrying.\n{detail}"
+                );
+            }
+            Err(failure) => panic!("{failure}"),
+        }
+    }
+}
+
+/// Why a single record+replay cycle failed.
+enum RecordReplayFailure {
+    /// A TCP body timeout during the **record** step — an infrastructure stall
+    /// under CI load (slow node spawn). Safe to retry.
+    InfraTimeout(String),
+    /// A real break: non-zero exit without a record-step TCP timeout, a missing
+    /// SUCCESS marker, a missing/empty recording, or *any* failure in the replay
+    /// step (the recording is known-good, so a TCP timeout there is semantic).
+    /// Never retried.
+    Semantic(String),
+}
+
+impl std::fmt::Display for RecordReplayFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RecordReplayFailure::InfraTimeout(d) | RecordReplayFailure::Semantic(d) => {
+                f.write_str(d)
+            }
+        }
+    }
+}
+
+/// Classify a failed record/replay step.
+///
+/// `in_record_step` gates whether a TCP-timeout signature is treated as
+/// retryable: during the **record** step a slow node spawn on a loaded CI runner
+/// can trigger the body timeout before the node sends its first message, and
+/// that is genuine infra noise. During the **replay** step the recording is
+/// already known-good, so a TCP timeout means a message never arrived and is a
+/// real replay regression — not safe to retry.
+fn classify_record_replay(
+    combined: &str,
+    detail: String,
+    in_record_step: bool,
+) -> RecordReplayFailure {
+    if in_record_step
+        && (combined.contains("TCP read header timed out")
+            || combined.contains("TCP read body timed out"))
+    {
+        RecordReplayFailure::InfraTimeout(detail)
+    } else {
+        RecordReplayFailure::Semantic(detail)
+    }
+}
+
+/// One record+replay cycle: record the validated pipeline, then replay the
+/// recording, asserting both reach the SUCCESS marker. Returns `Err` (rather
+/// than panicking) so the caller can retry on an infra timeout.
+fn record_replay_once(dora: &str) -> Result<(), RecordReplayFailure> {
+    let success_marker = "sink: SUCCESS - validated 10 doubled values";
+
     // Use the absolute-path fixture instead of examples/validated-pipeline/dataflow.yml:
     // `dora record` writes its modified descriptor into a tempfile in
     // /tmp, so any `build: cargo build -p …` directive carried over
@@ -1105,8 +1180,6 @@ fn contract_record_replay_reproduces_validated_pipeline() {
     // using absolute `path:`) sidesteps that.
     let yaml = write_absolute_path_validated_pipeline_fixture();
 
-    let success_marker = "sink: SUCCESS - validated 10 doubled values";
-
     // Stable per-test filename; --test-threads=1 means no cross-test
     // contention. Use std::env::temp_dir so macOS `/var/folders/...`
     // works alongside `/tmp` on Linux.
@@ -1114,7 +1187,7 @@ fn contract_record_replay_reproduces_validated_pipeline() {
     let _ = std::fs::remove_file(&drec);
 
     // ---- Step 1: record ----
-    let rec = Command::new(&dora)
+    let rec = Command::new(dora)
         .args([
             "record",
             yaml.to_str().unwrap(),
@@ -1131,23 +1204,40 @@ fn contract_record_replay_reproduces_validated_pipeline() {
     // Clean the fixture now; everything record needed is captured in
     // stdout/stderr and the .drec on disk.
     let _ = std::fs::remove_file(&yaml);
-    assert!(
-        rec.status.success(),
-        "dora record exited non-zero: {:?}\n---- stdout ----\n{rec_stdout}\n---- stderr ----\n{rec_stderr}",
-        rec.status
-    );
-    assert!(
-        rec_stdout.contains(success_marker) || rec_stderr.contains(success_marker),
-        "recorded run did not reach the SUCCESS marker — the baseline run is broken.\n\
-         ---- stdout ----\n{rec_stdout}\n---- stderr ----\n{rec_stderr}"
-    );
-    assert!(
-        drec.exists() && std::fs::metadata(&drec).unwrap().len() > 0,
-        "dora record did not produce a non-empty .drec at {drec:?}"
-    );
+    if !rec.status.success() {
+        let _ = std::fs::remove_file(&drec);
+        return Err(classify_record_replay(
+            &format!("{rec_stdout}{rec_stderr}"),
+            format!(
+                "dora record exited non-zero: {:?}\n---- stdout ----\n{rec_stdout}\n---- stderr ----\n{rec_stderr}",
+                rec.status
+            ),
+            true, // record step: TCP timeout may be infra noise
+        ));
+    }
+    if !(rec_stdout.contains(success_marker) || rec_stderr.contains(success_marker)) {
+        let _ = std::fs::remove_file(&drec);
+        return Err(classify_record_replay(
+            &format!("{rec_stdout}{rec_stderr}"),
+            format!(
+                "recorded run did not reach the SUCCESS marker — the baseline run is broken.\n\
+                 ---- stdout ----\n{rec_stdout}\n---- stderr ----\n{rec_stderr}"
+            ),
+            true, // record step: TCP timeout may be infra noise
+        ));
+    }
+    if !(drec.exists()
+        && std::fs::metadata(&drec)
+            .map(|m| m.len() > 0)
+            .unwrap_or(false))
+    {
+        return Err(RecordReplayFailure::Semantic(format!(
+            "dora record did not produce a non-empty .drec at {drec:?}"
+        )));
+    }
 
     // ---- Step 2: replay ----
-    let rep = Command::new(&dora)
+    let rep = Command::new(dora)
         .args(["replay", drec.to_str().unwrap()])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1158,20 +1248,31 @@ fn contract_record_replay_reproduces_validated_pipeline() {
     let rep_stderr = String::from_utf8_lossy(&rep.stderr);
     let _ = std::fs::remove_file(&drec);
 
-    assert!(
-        rep.status.success(),
-        "dora replay exited non-zero: {:?}\n---- stdout ----\n{rep_stdout}\n---- stderr ----\n{rep_stderr}",
-        rep.status
-    );
+    if !rep.status.success() {
+        return Err(classify_record_replay(
+            &format!("{rep_stdout}{rep_stderr}"),
+            format!(
+                "dora replay exited non-zero: {:?}\n---- stdout ----\n{rep_stdout}\n---- stderr ----\n{rep_stderr}",
+                rep.status
+            ),
+            false, // replay step: the recording is known-good; a TCP timeout is a real regression
+        ));
+    }
     // The contract: replay produces the exact same SUCCESS marker as
     // the recorded run. If the replay dropped/reordered/mutated any
     // value in the recording, sink's `expected = received * 2` check
     // would bail and this marker would never appear.
-    assert!(
-        rep_stdout.contains(success_marker) || rep_stderr.contains(success_marker),
-        "replay did not reproduce the SUCCESS marker — semantic equivalence broken.\n\
-         ---- stdout ----\n{rep_stdout}\n---- stderr ----\n{rep_stderr}"
-    );
+    if !(rep_stdout.contains(success_marker) || rep_stderr.contains(success_marker)) {
+        return Err(classify_record_replay(
+            &format!("{rep_stdout}{rep_stderr}"),
+            format!(
+                "replay did not reproduce the SUCCESS marker — semantic equivalence broken.\n\
+                 ---- stdout ----\n{rep_stdout}\n---- stderr ----\n{rep_stderr}"
+            ),
+            false, // replay step: missing SUCCESS means a dropped/mutated message, not infra noise
+        ));
+    }
+    Ok(())
 }
 
 /// Run `dora run --stop-after <secs>s` against `yaml_path`, capture combined
@@ -1783,6 +1884,76 @@ fn smoke_shell_node_blocked_without_flag() {
 }
 
 // ---------------------------------------------------------------------------
+// Memory-pool CPU transport (#2168)
+//
+// Requires `torch` and `tqdm` — not installed in standard PR CI. Run
+// explicitly on machines with torch available:
+//   cargo test --test example-smoke -- --ignored smoke_memory_pool
+// or via `scripts/smoke-all.sh` which gates on `python3 -c "import torch"`.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "requires `torch` and `tqdm` (not in standard CI)"]
+fn smoke_memory_pool_cpu2cpu() {
+    run_smoke_test(
+        "memory-pool-cpu2cpu",
+        "examples/memory-pool/cpu2cpu.yml",
+        Duration::from_secs(60),
+    );
+}
+
+#[test]
+#[ignore = "requires `torch` and `tqdm` (not in standard CI)"]
+fn smoke_local_memory_pool_cpu2cpu() {
+    run_smoke_test_local(
+        "local-memory-pool-cpu2cpu",
+        "examples/memory-pool/cpu2cpu.yml",
+        60,
+    );
+}
+
+// Negative-lifecycle scenarios validate the "warn, don't crash" contract.
+#[test]
+#[ignore = "requires `torch` and `tqdm` (not in standard CI)"]
+fn smoke_local_memory_pool_auto_cleanup() {
+    run_smoke_test_local(
+        "local-memory-pool-auto-cleanup",
+        "examples/memory-pool/auto_cleanup.yml",
+        10,
+    );
+}
+
+#[test]
+#[ignore = "requires `torch` and `tqdm` (not in standard CI)"]
+fn smoke_local_memory_pool_duplicate_free() {
+    run_smoke_test_local(
+        "local-memory-pool-duplicate-free",
+        "examples/memory-pool/duplicate_free.yml",
+        10,
+    );
+}
+
+#[test]
+#[ignore = "requires `torch` and `tqdm` (not in standard CI)"]
+fn smoke_local_memory_pool_read_after_free() {
+    run_smoke_test_local(
+        "local-memory-pool-read-after-free",
+        "examples/memory-pool/read_after_free.yml",
+        10,
+    );
+}
+
+#[test]
+#[ignore = "requires `torch` and `tqdm` (not in standard CI)"]
+fn smoke_local_memory_pool_write_after_free() {
+    run_smoke_test_local(
+        "local-memory-pool-write-after-free",
+        "examples/memory-pool/write_after_free.yml",
+        10,
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Examples under `examples/` that do NOT have a corresponding `smoke_*` or
 // `contract_*` test in this file. Some are blocked (filed issue or external
 // dep); others are intentionally covered by a DIFFERENT CI job. Keep this
@@ -1802,6 +1973,12 @@ fn smoke_shell_node_blocked_without_flag() {
 //
 // | Example                   | Where it's tested / blocker                          | Tracking |
 // |---------------------------|------------------------------------------------------|----------|
+// | memory-pool               | covered: smoke_memory_pool_cpu2cpu /                 | #2264    |
+// |                           | smoke_local_memory_pool_{cpu2cpu, auto_cleanup,      |          |
+// |                           | duplicate_free, read_after_free, write_after_free}   |          |
+// |                           | (#[ignore], run when torch+tqdm available);          |          |
+// |                           | smoke-all.sh gates on `import torch`.                 |          |
+// |                           | cuda2cpu/cpu2cuda/etc blocked: needs NVIDIA CUDA.     |          |
 // | cuda-benchmark            | blocker: needs NVIDIA CUDA toolkit                   | —        |
 // | dynamic-add-remove        | blocker: `dora node add` times out +                 | #1682    |
 // |                           | corrupts dataflow state                              |          |

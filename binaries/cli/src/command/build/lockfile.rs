@@ -4,20 +4,31 @@ use std::{
 };
 
 use dora_message::{
-    common::GitSource,
+    common::{BinaryPin, GitSource},
     descriptor::{GitRepoRev, NodeSource},
     id::NodeId,
 };
 use eyre::{Context, ContextCompat};
 
-const LOCKFILE_VERSION: u32 = 2;
+const LOCKFILE_VERSION: u32 = 3;
 const MIN_SUPPORTED_LOCKFILE_VERSION: u32 = 1;
+/// Version written when no entry carries hub provenance or a subdir. Writing
+/// the lower version keeps plain-git lockfiles byte-compatible with older
+/// dora; hub-carrying lockfiles get v3 so an older dora fails loudly instead
+/// of silently ignoring the extra fields (and rooting the build in the wrong directory).
+const BASE_LOCKFILE_VERSION: u32 = 2;
+/// Schema tag hashed into the descriptor fingerprint. Deliberately decoupled
+/// from `LOCKFILE_VERSION`: bumping the file version for hub support must not
+/// invalidate every existing v2 lockfile.
+const FINGERPRINT_SCHEMA_VERSION: u32 = 2;
 
 #[derive(serde::Serialize)]
 struct BuildLockfileView<'a> {
     version: u32,
     descriptor_fingerprint: &'a str,
     git_sources: &'a BTreeMap<NodeId, GitSource>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    binary_sources: &'a BTreeMap<NodeId, BinaryPin>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -26,6 +37,10 @@ pub struct BuildLockfile {
     #[serde(default)]
     descriptor_fingerprint: Option<String>,
     pub git_sources: BTreeMap<NodeId, GitSource>,
+    /// Per-node prebuilt-binary pins (spec §8.2). Empty/absent for plain-git
+    /// and pre-P2.8 lockfiles.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub binary_sources: BTreeMap<NodeId, BinaryPin>,
 }
 
 impl BuildLockfile {
@@ -58,9 +73,9 @@ impl BuildLockfile {
         descriptor_git_sources: &BTreeMap<NodeId, NodeSource>,
     ) -> String {
         let mut canonical = String::new();
-        // Intentional: include schema version in canonical content so lockfile format
-        // bumps force regeneration even if descriptor sources are unchanged.
-        canonical.push_str(&format!("dora-lockfile-v{LOCKFILE_VERSION}\n"));
+        // Intentional: include schema version in canonical content so fingerprint
+        // schema bumps force regeneration even if descriptor sources are unchanged.
+        canonical.push_str(&format!("dora-lockfile-v{FINGERPRINT_SCHEMA_VERSION}\n"));
 
         for (node_id, source) in descriptor_git_sources {
             let NodeSource::GitBranch { repo, rev } = source else {
@@ -114,18 +129,37 @@ impl BuildLockfile {
     pub fn write_git_sources(
         path: &Path,
         git_sources: &BTreeMap<NodeId, GitSource>,
+        binary_sources: &BTreeMap<NodeId, BinaryPin>,
         descriptor_fingerprint: &str,
     ) -> eyre::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).context("failed to create lockfile directory")?;
         }
+        // hub-form entries (subdir, provenance, or any binary pin) use the v3
+        // schema so an older dora fails loudly instead of dropping the fields.
+        let has_hub_entries = !binary_sources.is_empty()
+            || git_sources
+                .values()
+                .any(|s| s.hub.is_some() || s.subdir.is_some());
         let view = BuildLockfileView {
-            version: LOCKFILE_VERSION,
+            version: if has_hub_entries {
+                LOCKFILE_VERSION
+            } else {
+                BASE_LOCKFILE_VERSION
+            },
             descriptor_fingerprint,
             git_sources,
+            binary_sources,
         };
         let serialized = serde_yaml::to_string(&view).context("failed to serialize lockfile")?;
-        std::fs::write(path, serialized).context("failed to write lockfile")?;
+        // Write atomically (temp + rename in the same dir) so an interrupted
+        // write can't truncate or corrupt an existing valid lockfile — matters
+        // most for `dora hub update`, which rewrites it often without a build.
+        let mut tmp = path.to_path_buf().into_os_string();
+        tmp.push(".tmp");
+        let tmp = PathBuf::from(tmp);
+        std::fs::write(&tmp, serialized).context("failed to write lockfile")?;
+        std::fs::rename(&tmp, path).context("failed to replace lockfile")?;
         Ok(())
     }
 
@@ -153,6 +187,8 @@ mod tests {
         GitSource {
             repo: repo.to_owned(),
             commit_hash: commit_hash.to_owned(),
+            subdir: None,
+            hub: None,
         }
     }
 
@@ -182,14 +218,54 @@ mod tests {
         let fingerprint =
             BuildLockfile::fingerprint_descriptor_git_sources(&descriptor_git_sources);
 
-        BuildLockfile::write_git_sources(&lockfile_path, &git_sources, &fingerprint).unwrap();
+        BuildLockfile::write_git_sources(
+            &lockfile_path,
+            &git_sources,
+            &BTreeMap::new(),
+            &fingerprint,
+        )
+        .unwrap();
         let loaded = BuildLockfile::read_from(&lockfile_path).unwrap();
 
-        assert_eq!(loaded.version, LOCKFILE_VERSION);
+        assert_eq!(loaded.version, BASE_LOCKFILE_VERSION);
         assert_eq!(loaded.git_sources, git_sources);
         loaded
             .ensure_descriptor_fingerprint_matches(&fingerprint)
             .unwrap();
+    }
+
+    #[test]
+    fn hub_entries_bump_lockfile_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lockfile_path = tmp.path().join("hub.dora-lock.yaml");
+        let mut git_sources = BTreeMap::new();
+        git_sources.insert("detector".parse().unwrap(), {
+            let mut s = source("https://example.com/hub", "abc1234");
+            s.subdir = Some("node-hub/dora-yolo".into());
+            s.hub = Some(dora_message::common::HubProvenance {
+                name: "dora-rs/dora-yolo".into(),
+                version: "0.5.2".into(),
+                manifest_digest: Some("deadbeef".into()),
+            });
+            s
+        });
+        BuildLockfile::write_git_sources(&lockfile_path, &git_sources, &BTreeMap::new(), "fp")
+            .unwrap();
+        let loaded = BuildLockfile::read_from(&lockfile_path).unwrap();
+        assert_eq!(loaded.version, LOCKFILE_VERSION);
+        let node_id: NodeId = "detector".parse().unwrap();
+        assert_eq!(
+            loaded.git_sources[&node_id].hub.as_ref().unwrap().version,
+            "0.5.2"
+        );
+        // plain-git lockfiles keep the old version for compatibility
+        let plain: BTreeMap<NodeId, GitSource> = BTreeMap::from([(
+            "node-a".parse().unwrap(),
+            source("https://example.com/repo", "abc123"),
+        )]);
+        BuildLockfile::write_git_sources(&lockfile_path, &plain, &BTreeMap::new(), "fp").unwrap();
+        let loaded = BuildLockfile::read_from(&lockfile_path).unwrap();
+        assert_eq!(loaded.version, BASE_LOCKFILE_VERSION);
     }
 
     #[test]
@@ -203,6 +279,7 @@ mod tests {
             version: LOCKFILE_VERSION,
             descriptor_fingerprint: Some("abc".into()),
             git_sources,
+            binary_sources: BTreeMap::new(),
         };
 
         let err = lockfile
@@ -241,10 +318,44 @@ mod tests {
             version: 1,
             descriptor_fingerprint: None,
             git_sources: BTreeMap::new(),
+            binary_sources: BTreeMap::new(),
         };
         let err = lockfile
             .ensure_descriptor_fingerprint_matches("expected")
             .unwrap_err();
         assert!(err.to_string().contains("missing `descriptor_fingerprint`"));
+    }
+
+    #[test]
+    fn binary_sources_roundtrip_and_bump_version() {
+        use dora_message::common::HubProvenance;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let lockfile_path = tmp.path().join("bin.dora-lock.yaml");
+        let mut binary_sources = BTreeMap::new();
+        binary_sources.insert(
+            "lidar".parse().unwrap(),
+            BinaryPin {
+                platform: "linux-x86_64".into(),
+                url: "https://example.com/lidar-linux-x86_64".into(),
+                sha256: "a".repeat(64),
+                hub: HubProvenance {
+                    name: "acme/lidar".into(),
+                    version: "2.1.0".into(),
+                    manifest_digest: Some("deadbeef".into()),
+                },
+            },
+        );
+        BuildLockfile::write_git_sources(&lockfile_path, &BTreeMap::new(), &binary_sources, "fp")
+            .unwrap();
+        let loaded = BuildLockfile::read_from(&lockfile_path).unwrap();
+        // a binary pin is a hub entry -> the v3 schema, so older dora fails loud
+        assert_eq!(loaded.version, LOCKFILE_VERSION);
+        assert_eq!(loaded.binary_sources, binary_sources);
+        let node_id: NodeId = "lidar".parse().unwrap();
+        assert_eq!(
+            loaded.binary_sources[&node_id].url,
+            binary_sources[&node_id].url
+        );
     }
 }

@@ -2,7 +2,9 @@ use crate::log::NodeLogger;
 use clonable_command::Command;
 use dora_core::{
     build::managed_python_interpreter,
-    descriptor::{DYNAMIC_SOURCE, SHELL_SOURCE, resolve_path, source_is_url},
+    descriptor::{
+        DYNAMIC_SOURCE, SHELL_SOURCE, resolve_path, resolve_path_confined, source_is_url,
+    },
     get_python_path,
 };
 use dora_download::download_file;
@@ -10,10 +12,12 @@ use dora_message::common::LogLevel;
 use eyre::WrapErr;
 use std::path::Path;
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn path_spawn_command(
     working_dir: &Path,
     uv: bool,
     python_env_dir: Option<&Path>,
+    confined: bool,
     logger: &mut NodeLogger<'_>,
     node: &dora_core::descriptor::CustomNode,
     permit_url: bool,
@@ -44,7 +48,57 @@ pub(super) async fn path_spawn_command(
             }
         }
         source => {
-            let resolved_path = if source_is_url(source) {
+            // a checksum only means anything for a URL download — reject a
+            // `path_sha256` on a local/PATH source rather than silently ignoring it.
+            if node.path_sha256.is_some() && !source_is_url(source) {
+                eyre::bail!(
+                    "node has `path_sha256` set but its path `{source}` is not a URL — \
+                     a download checksum only applies to URL paths"
+                );
+            }
+            let resolved_path = if let Some(expected_sha256) = node
+                .path_sha256
+                .as_deref()
+                .filter(|_| source_is_url(source))
+            {
+                // `path_sha256` is also a descriptor field, so a hand-written
+                // descriptor could set it to a traversal string. It is used as a
+                // path segment below, and `download_file` creates the target dir
+                // before verifying, so enforce the 64-hex-char shape at this
+                // trust boundary first (a valid digest has no `/`, `.`, …).
+                if expected_sha256.len() != 64
+                    || !expected_sha256.bytes().all(|b| b.is_ascii_hexdigit())
+                {
+                    eyre::bail!("invalid `path_sha256` (must be 64 hex chars)");
+                }
+                // hub binary artifact (spec §8.2): a sha256-pinned URL download.
+                // The checksum is the integrity guarantee, so this is allowed
+                // regardless of confinement / `permit_url`. `download_file`
+                // re-fetches and re-verifies on every spawn (§8.4).
+                //
+                // Download under the node's own working dir and return an
+                // absolute path: the spawned child's cwd is set to `working_dir`,
+                // so a relative download path (resolved against the daemon's cwd)
+                // would exec the wrong file or fail to find it. Scope by the
+                // sha256 (content-addressed) so two nodes whose artifacts share a
+                // filename — and a `working_dir` that defaults to the shared
+                // dataflow dir — don't overwrite each other.
+                let target_dir = working_dir.join("build").join(expected_sha256);
+                let downloaded = download_file(source, &target_dir, Some(expected_sha256))
+                    .await
+                    .wrap_err("failed to download hub binary artifact")?;
+                downloaded.canonicalize().unwrap_or(downloaded)
+            } else if confined {
+                // hub-sourced node (spec §11): the entrypoint resolves only
+                // within the node's own working dir or managed env — no env
+                // expansion, no URL download, no ambient-$PATH fallback.
+                // (The *interpreter* for a script-only `.py` entrypoint still
+                // comes from `uv run` like any non-hub script node — hub
+                // Python nodes are expected to ship a `build:` so they get a
+                // managed env, spec §15 Q4.)
+                resolve_path_confined(source, working_dir, python_env_dir)
+                    .wrap_err_with(|| format!("failed to resolve hub entrypoint `{source}`"))?
+            } else if source_is_url(source) {
                 if !permit_url {
                     eyre::bail!("URL paths are not supported in this case");
                 }

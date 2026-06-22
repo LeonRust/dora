@@ -176,6 +176,13 @@
           "description": "Path of the source code\n\nIf you want to use a specific `conda` environment.\nProvide the python path within the source.\n\nsource: /home/peter/miniconda3/bin/python\n\nargs: some_node.py\n\nSource can match any executable in PATH.",
           "type": "string"
         },
+        "path_sha256": {
+          "description": "SHA-256 the `path` download must match (set for hub binary artifacts,\nspec §8.2). When present the daemon fetches `path` as a verified URL\ndownload regardless of confinement — the checksum is the trust anchor.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "restart_delay": {
           "description": "Initial delay in seconds before restarting (exponential backoff).",
           "type": [
@@ -507,6 +514,13 @@
           ],
           "format": "double"
         },
+        "hub": {
+          "description": "Hub package reference (unstable).\n\nReferences a node published in the Dora Hub index:\n`[<namespace>/]<name>@<semver-requirement>`. A bare name is shorthand\nfor the official `dora-rs/` namespace.\n\n`dora build` resolves the reference against the index to a pinned\ncommit and the node is fetched/built through the same machinery as a\n[`git`](Self::git) node; the package manifest supplies the\nentrypoint, build command, and typed contracts. Mutually exclusive\nwith `path`, `git`, and `build`.\n\n## Example\n\n```yaml\nnodes:\n  - id: detector\n    hub: dora-yolo@^0.5\n    inputs:\n      image: camera/image\n    outputs:\n      - bbox\n```",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "id": {
           "description": "Unique node identifier. Must not contain `/` characters.\n\nNode IDs can be arbitrary strings with the following limitations:\n\n- They must not contain any `/` characters (slashes).\n- We do not recommend using whitespace characters (e.g. spaces) in IDs\n\nEach node must have an ID field.\n\n## Example\n\n```yaml\nnodes:\n  - id: camera_node\n  - id: some_other_node\n```",
           "$ref": "#/$defs/NodeId"
@@ -642,6 +656,13 @@
         },
         "path": {
           "description": "Path to executable or script that should be run.\n\nSpecifies the path of the executable or script that Dora should run when starting the\ndataflow.\nThis can point to a normal executable (e.g. when using a compiled language such as Rust) or\na Python script.\n\nDora will automatically append a `.exe` extension on Windows systems when the specified\nfile name has no extension.\n\n## Example\n\n```yaml\nnodes:\n  - id: rust-example\n    path: target/release/rust-node\n  - id: python-example\n    path: ./receive_data.py\n```\n\n## URL as Path\n\nThe `path` field can also point to a URL instead of a local path.\nIn this case, Dora will download the given file when starting the dataflow.\n\nNote that this is quite an old feature and using this functionality is **not recommended**\nanymore. Instead, we recommend using a [`git`][Self::git] and/or [`build`](Self::build)\nkey.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path_sha256": {
+          "description": "SHA-256 checksum the `path` download must match, verified after fetch\nand on cache reuse (spec §8.2/§8.4). Set internally when a `hub:`\nreference resolves to a prebuilt binary artifact; rarely set by hand.",
           "type": [
             "string",
             "null"
