@@ -8,7 +8,9 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::get,
+    serve::ListenerExt,
 };
+use dora_coordinator_store::CoordinatorStore;
 use dora_core::uhlc::HLC;
 use dora_message::auth::AuthToken;
 use std::{
@@ -17,14 +19,27 @@ use std::{
     sync::{Arc, Mutex},
     time::Instant,
 };
-use tokio::{net::TcpListener, sync::mpsc};
+use tokio::{
+    net::TcpListener,
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc},
+};
 use tower::{ServiceBuilder, limit::ConcurrencyLimitLayer};
 
 /// Maximum message size for control plane JSON messages (1 MiB).
 const MAX_CONTROL_MESSAGE_BYTES: usize = 1024 * 1024;
 
-/// Maximum concurrent WebSocket connections.
+/// Maximum concurrent WebSocket connections, per endpoint.
+///
+/// Enforced by [`WsState::control_connections`] and
+/// [`WsState::daemon_connections`] for the lifetime of each upgraded socket.
+/// The two budgets are separate so a flood of control (CLI) connections
+/// cannot lock daemons out of registering. The router's `ConcurrencyLimitLayer` alone cannot do that: tower
+/// releases its permit once the handler's response (the `101 Switching
+/// Protocols`) is produced, while the socket itself lives on in the spawned
+/// `on_upgrade` task.
 const MAX_WS_CONNECTIONS: usize = 256;
+/// Idle time before the kernel starts probing a WS peer with TCP keepalive.
+const WS_TCP_KEEPALIVE_IDLE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Maximum new connections per IP within the rate window.
 const MAX_CONNECTIONS_PER_IP: u32 = 20;
@@ -78,10 +93,34 @@ impl IpRateLimiter {
 #[derive(Clone)]
 pub(crate) struct WsState {
     pub event_tx: mpsc::Sender<Event>,
+    /// Topic debug frames, kept off `event_tx` so they cannot queue ahead of
+    /// control events (dora-rs/dora#3535).
+    pub topic_debug_tx: mpsc::Sender<Event>,
     pub clock: Arc<HLC>,
     pub auth_token: Option<AuthToken>,
     pub artifact_store: Arc<ArtifactStore>,
+    pub store: Arc<dyn CoordinatorStore>,
     pub rate_limiter: IpRateLimiter,
+    /// DaemonId -> WS peer address (set at registration). Lets daemons
+    /// reach each other's direct-TCP memory-pool data listeners.
+    pub daemon_peer_addrs: Arc<std::sync::RwLock<std::collections::HashMap<String, SocketAddr>>>,
+    /// Open `/api/control` sockets (`MAX_WS_CONNECTIONS` permits). A permit
+    /// is moved into each `on_upgrade` task and released when the socket
+    /// closes.
+    pub control_connections: Arc<Semaphore>,
+    /// Open `/api/daemon` sockets, budgeted like `control_connections`.
+    pub daemon_connections: Arc<Semaphore>,
+}
+
+/// Reserve a slot for a new WebSocket connection, or reject it with `503`
+/// when `MAX_WS_CONNECTIONS` sockets are already open.
+fn acquire_ws_slot(connections: &Arc<Semaphore>) -> Result<OwnedSemaphorePermit, StatusCode> {
+    connections.clone().try_acquire_owned().map_err(|_| {
+        tracing::warn!(
+            "rejected WebSocket connection: {MAX_WS_CONNECTIONS} connections already open on this endpoint"
+        );
+        StatusCode::SERVICE_UNAVAILABLE
+    })
 }
 
 /// Query parameters for backward compatibility — old clients may send `?token=...`.
@@ -134,6 +173,8 @@ pub(crate) fn router(state: WsState) -> Router {
         .route("/api/artifacts/{build_id}/{node_id}", get(artifact_handler))
         .route("/health", get(health))
         .with_state(Arc::new(state))
+        // Bounds requests *in flight* (handshakes, artifact downloads); open
+        // WebSocket sockets are capped separately by the `WsState` semaphores.
         .layer(ServiceBuilder::new().layer(ConcurrencyLimitLayer::new(MAX_WS_CONNECTIONS)))
 }
 
@@ -154,10 +195,12 @@ async fn ws_control_handler(
     }
     let token = extract_token(&headers);
     validate_token(&state.auth_token, &token)?;
+    let permit = acquire_ws_slot(&state.control_connections)?;
     Ok(ws
         .max_message_size(MAX_CONTROL_MESSAGE_BYTES)
-        .on_upgrade(move |socket| {
-            handle_control_ws(socket, state.event_tx.clone(), state.clock.clone())
+        .on_upgrade(move |socket| async move {
+            let _permit = permit;
+            handle_control_ws(socket, state.event_tx.clone(), state.clock.clone()).await
         }))
 }
 
@@ -174,10 +217,21 @@ async fn ws_daemon_handler(
     }
     let token = extract_token(&headers);
     validate_token(&state.auth_token, &token)?;
+    let permit = acquire_ws_slot(&state.daemon_connections)?;
     Ok(ws
         .max_message_size(MAX_CONTROL_MESSAGE_BYTES)
-        .on_upgrade(move |socket| {
-            handle_daemon_ws(socket, state.event_tx.clone(), state.clock.clone())
+        .on_upgrade(move |socket| async move {
+            let _permit = permit;
+            handle_daemon_ws(
+                socket,
+                state.event_tx.clone(),
+                state.topic_debug_tx.clone(),
+                state.clock.clone(),
+                state.store.clone(),
+                addr,
+                state.daemon_peer_addrs.clone(),
+            )
+            .await
         }))
 }
 
@@ -216,12 +270,16 @@ async fn artifact_handler(
 }
 
 /// Start the axum WS server. Returns the bound port, a shutdown trigger, and a future to await.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn serve(
     bind: SocketAddr,
     event_tx: mpsc::Sender<Event>,
+    topic_debug_tx: mpsc::Sender<Event>,
     clock: Arc<HLC>,
     auth_token: Option<AuthToken>,
     artifact_store: Arc<ArtifactStore>,
+    store: Arc<dyn CoordinatorStore>,
+    daemon_peer_addrs: Arc<std::sync::RwLock<std::collections::HashMap<String, SocketAddr>>>,
 ) -> eyre::Result<(
     u16,
     ShutdownTrigger,
@@ -231,13 +289,29 @@ pub(crate) async fn serve(
     let port = listener.local_addr()?.port();
     let state = WsState {
         event_tx,
+        topic_debug_tx,
         clock,
         auth_token,
         artifact_store,
+        store,
         rate_limiter: IpRateLimiter::new(),
+        daemon_peer_addrs,
+        control_connections: Arc::new(Semaphore::new(MAX_WS_CONNECTIONS)),
+        daemon_connections: Arc::new(Semaphore::new(MAX_WS_CONNECTIONS)),
     };
     let app = router(state);
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+    // Each open WebSocket holds one of `MAX_WS_CONNECTIONS` slots until it
+    // closes. Neither the CLI nor the daemon pings, so a peer that vanished
+    // without a FIN (sleep, partition, NAT timeout) would keep its slot
+    // forever; TCP keepalive lets the kernel detect it and error the socket.
+    let listener = listener.tap_io(|tcp| {
+        let keepalive = socket2::TcpKeepalive::new().with_time(WS_TCP_KEEPALIVE_IDLE);
+        if let Err(err) = socket2::SockRef::from(&*tcp).set_tcp_keepalive(&keepalive) {
+            tracing::warn!("failed to enable TCP keepalive on WS connection: {err}");
+        }
+    });
 
     let future = async move {
         axum::serve(
@@ -267,6 +341,20 @@ impl ShutdownTrigger {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The connection cap rejects with 503 once every slot is held, and a
+    /// slot frees up again when its permit (owned by the socket task) drops.
+    #[test]
+    fn ws_slot_rejects_when_full_and_frees_on_drop() {
+        let connections = Arc::new(Semaphore::new(1));
+        let held = acquire_ws_slot(&connections).expect("first slot is free");
+        assert_eq!(
+            acquire_ws_slot(&connections).err(),
+            Some(StatusCode::SERVICE_UNAVAILABLE)
+        );
+        drop(held);
+        assert!(acquire_ws_slot(&connections).is_ok());
+    }
 
     // --- coordinator WebSocket auth (dora-rs/dora#2027 verified test gap) ---
 

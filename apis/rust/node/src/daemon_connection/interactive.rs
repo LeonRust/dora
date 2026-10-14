@@ -2,18 +2,18 @@ use std::{io::stdout, path::Path, time::Duration};
 
 use arrow::array::{Array, UInt8Array};
 use colored::Colorize;
-use dora_core::{metadata::ArrowTypeInfoExt, uhlc::HLC};
+use dora_core::uhlc::HLC;
 use dora_message::{
     common::{DataMessage, Timestamped},
     daemon_to_node::{DaemonReply, NodeEvent},
-    metadata::{ArrowTypeInfo, Metadata},
+    id::{DataId, InvalidId},
+    metadata::Metadata,
     node_to_daemon::DaemonRequest,
 };
 use eyre::{Context, ContextCompat};
 
 use crate::{
-    arrow_utils::{copy_array_into_sample, required_data_size},
-    daemon_connection::json_to_arrow::read_json_bytes_as_arrow,
+    arrow_utils::encode_arrow_ipc, daemon_connection::json_to_arrow::read_json_bytes_as_arrow,
     event_stream::data_to_arrow_array,
 };
 
@@ -44,10 +44,10 @@ impl InteractiveEvents {
             }
             DaemonRequest::SendMessage {
                 output_id,
-                metadata,
+                metadata: _,
                 data,
             } => {
-                let array = data_to_arrow_array(data.clone(), metadata);
+                let array = data_to_arrow_array(data.clone());
 
                 let array_display = match array {
                     Err(err) => format!("<error>: {err:?}"),
@@ -80,11 +80,16 @@ impl InteractiveEvents {
                 println!("{}", "node reports EventStreamDropped".blue());
                 DaemonReply::Result(Ok(()))
             }
-            DaemonRequest::RegisterPinnedMemory { .. }
-            | DaemonRequest::ReadPinnedMemory { .. }
-            | DaemonRequest::FreePinnedMemory { .. } => DaemonReply::Result(Ok(())),
+            DaemonRequest::ExtensionRequest { namespace, .. } => {
+                eyre::bail!("extension {namespace} is not available in interactive mode")
+            }
             DaemonRequest::NodeConfig { .. } => {
                 eyre::bail!("unexpected NodeConfig in interactive mode")
+            }
+            // `DaemonRequest` is `#[non_exhaustive]`: a request this build
+            // predates is unsupported here.
+            other => {
+                eyre::bail!("unsupported request in interactive mode: {other:?}")
             }
         };
         Ok(reply)
@@ -100,77 +105,98 @@ impl InteractiveEvents {
             );
             return Ok(None);
         }
-        let stdout_lock = stdout().lock();
-        let id = inquire::Text::new("Input ID")
-            .with_help_message("empty input ID to stop")
-            .prompt()?;
-        std::mem::drop(stdout_lock);
-        let event = if id.is_empty() {
-            println!("{}", "given input ID is empty -> stopping".blue());
-            self.stopped = true;
-            NodeEvent::Stop
-        } else {
-            let id = id.into();
-            let (data, type_info) = loop {
-                let stdout_lock = stdout().lock();
-                let data = inquire::Text::new("Data")
-                    .with_help_message(
-                        "String/JSON, FILE:<path.arrow>, HEX:<hexbytes>, or esc to skip",
-                    )
-                    .prompt_skippable()?;
-                std::mem::drop(stdout_lock);
-                let typed_data = if let Some(data) = data {
-                    let array_data = if let Some(path) = data.strip_prefix("FILE:") {
-                        match read_arrow_ipc_file(Path::new(path.trim())) {
-                            Ok(d) => d,
-                            Err(err) => {
-                                eprintln!("{}", format!("{err}").red());
-                                continue;
-                            }
-                        }
-                    } else if let Some(hex) = data.strip_prefix("HEX:") {
-                        match decode_hex_as_uint8_array(hex.trim()) {
-                            Ok(d) => d,
-                            Err(err) => {
-                                eprintln!("{}", format!("{err}").red());
-                                continue;
-                            }
-                        }
-                    } else {
-                        // JSON or plain text
-                        match read_json_bytes_as_arrow(data.as_bytes()) {
-                            Ok(d) => d,
-                            Err(err) => {
-                                eprintln!("{}", format!("{err}").red());
-                                continue;
-                            }
-                        }
-                    };
-
-                    let total_len = required_data_size(&array_data);
-                    let mut buf = vec![0; total_len];
-                    let type_info = copy_array_into_sample(buf.as_mut_slice(), &array_data);
-
-                    (Some(buf), type_info)
-                } else {
-                    (None, ArrowTypeInfo::empty())
-                };
-                break typed_data;
-            };
-
-            NodeEvent::Input {
-                id,
-                metadata: std::sync::Arc::new(Metadata::new(
-                    HLC::default().new_timestamp(),
-                    type_info,
-                )),
-                data: data.map(|d| {
-                    std::sync::Arc::new(DataMessage::Vec(aligned_vec::AVec::from_slice(1, &d)))
-                }),
+        let id: DataId = loop {
+            let stdout_lock = stdout().lock();
+            let id = inquire::Text::new("Input ID")
+                .with_help_message("empty input ID to stop")
+                .prompt()?;
+            std::mem::drop(stdout_lock);
+            if id.is_empty() {
+                println!("{}", "given input ID is empty -> stopping".blue());
+                self.stopped = true;
+                return Ok(Some(NodeEvent::Stop));
+            }
+            // `id` is typed at an interactive prompt, so parse it fallibly via
+            // `parse_input_id` (see its docs): `DataId::from(String)` / `.into()`
+            // would panic on an invalid id and crash the whole node. Re-prompt
+            // instead, matching how the `Data` prompt below rejects bad input
+            // rather than aborting.
+            match parse_input_id(&id) {
+                Ok(id) => break id,
+                Err(err) => {
+                    eprintln!("{}", format!("invalid input ID: {err}").red());
+                }
             }
         };
-        Ok(Some(event))
+        let data = loop {
+            let stdout_lock = stdout().lock();
+            let data = inquire::Text::new("Data")
+                .with_help_message("String/JSON, FILE:<path.arrow>, HEX:<hexbytes>, or esc to skip")
+                .prompt_skippable()?;
+            std::mem::drop(stdout_lock);
+            let typed_data = if let Some(data) = data {
+                let array_data = if let Some(path) = data.strip_prefix("FILE:") {
+                    match read_arrow_ipc_file(Path::new(path.trim())) {
+                        Ok(d) => d,
+                        Err(err) => {
+                            eprintln!("{}", format!("{err}").red());
+                            continue;
+                        }
+                    }
+                } else if let Some(hex) = data.strip_prefix("HEX:") {
+                    match decode_hex_as_uint8_array(hex.trim()) {
+                        Ok(d) => d,
+                        Err(err) => {
+                            eprintln!("{}", format!("{err}").red());
+                            continue;
+                        }
+                    }
+                } else {
+                    // JSON or plain text
+                    match read_json_bytes_as_arrow(data.as_bytes()) {
+                        Ok(d) => d,
+                        Err(err) => {
+                            eprintln!("{}", format!("{err}").red());
+                            continue;
+                        }
+                    }
+                };
+
+                // The receive side decodes a self-describing Arrow IPC
+                // stream, so encode the array into one here.
+                match encode_arrow_ipc(&dora_arrow_convert::internal::from_array_data(array_data)) {
+                    Ok(buf) => Some(buf),
+                    Err(err) => {
+                        eprintln!("{}", format!("{err}").red());
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+            break typed_data;
+        };
+
+        Ok(Some(NodeEvent::Input {
+            id,
+            metadata: std::sync::Arc::new(Metadata::new(HLC::default().new_timestamp())),
+            data: data.map(|d| {
+                std::sync::Arc::new(DataMessage::Vec(aligned_vec::AVec::from_slice(1, &d)))
+            }),
+        }))
     }
+}
+
+/// Parse a `DataId` typed at the interactive `Input ID` prompt.
+///
+/// Deliberately fallible: `DataId`'s `From<String>` (`.into()`) panics on an
+/// invalid id — e.g. one containing a space or `;` — which would crash the
+/// whole node. Returning `Err` lets the prompt loop re-ask instead of aborting.
+/// Keeping this as a named helper (rather than an inline `.parse()`) gives the
+/// call site one testable seam and a place to document why `.into()` must not
+/// be used here.
+fn parse_input_id(raw: &str) -> Result<DataId, InvalidId> {
+    raw.parse()
 }
 
 /// Read the first batch from an Arrow IPC file and return it as `ArrayData`.
@@ -230,6 +256,29 @@ fn decode_hex_as_uint8_array(hex: &str) -> eyre::Result<arrow::array::ArrayData>
 mod tests {
     use super::*;
     use arrow::array::ArrayRef;
+
+    /// The interactive `Input ID` prompt routes the typed id through
+    /// [`parse_input_id`] — a fallible `str::parse` — instead of
+    /// `DataId::from(String)` / `.into()`, which panics on an invalid id and
+    /// would crash the whole node. Guard that contract on the actual helper the
+    /// call site uses: ids a user could plausibly mistype come back as `Err` (so
+    /// the prompt loop re-asks) rather than panicking, and a well-formed id
+    /// parses. If `parse_input_id` regressed to `.into()`, the first assertion
+    /// would panic instead of returning `Err`, failing this test.
+    #[test]
+    fn parse_input_id_rejects_invalid_without_panicking() {
+        for bad in ["my input", "a;b", "a b/c", "café"] {
+            assert!(
+                parse_input_id(bad).is_err(),
+                "expected `{bad}` to be rejected by parse_input_id"
+            );
+        }
+        // a well-formed id still parses and round-trips unchanged
+        assert_eq!(
+            &*parse_input_id("valid_id.0-1/sub").expect("valid id should parse"),
+            "valid_id.0-1/sub"
+        );
+    }
 
     #[test]
     fn test_decode_hex_valid() {

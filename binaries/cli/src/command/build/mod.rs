@@ -93,10 +93,10 @@ pub struct Build {
     /// Port number of the coordinator control server
     #[clap(long, value_name = "PORT", env = "DORA_COORDINATOR_PORT")]
     coordinator_port: Option<u16>,
-    // Use UV to build nodes.
+    /// Use `uv` to build nodes
     #[clap(long, action)]
     uv: bool,
-    // Run build on local machine
+    /// Run build on local machine
     #[clap(long, action)]
     local: bool,
     /// Treat type warnings as errors
@@ -268,7 +268,7 @@ pub fn build(cfg: BuildConfig) -> eyre::Result<()> {
         .wrap_err_with(|| {
             format!(
                 "failed to read dataflow at `{}`\n\n  \
-                 hint: check the file exists and is valid YAML",
+                 hint: check the file exists, is valid YAML, and matches the dataflow schema (see details below)",
                 dataflow_path.display()
             )
         })?

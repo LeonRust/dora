@@ -4,10 +4,15 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Validate that a node identifier contains only safe characters: `[a-zA-Z0-9_.-]`,
-/// does not start with `.`, and is not empty.
+/// does not start with `.`, is not empty, and is not the reserved id `dora`.
 ///
 /// NodeIds must NOT contain `/` because `/` is the separator between
 /// `<node_id>/<output_id>` in input mapping syntax.
+///
+/// The exact id `dora` is reserved for the built-in input namespaces
+/// (`dora/timer/...`, `dora/logs`), which `InputMapping::from_str` matches
+/// before any user node. Only the exact string is reserved -- ids that merely
+/// contain or extend it (`dora-node`, `my-dora`, `Dora`) stay valid.
 ///
 /// Leading dots are rejected because the node id is joined into filesystem paths
 /// (e.g. `managed_python_env_dir` appends `node.id` under `.dora/python-envs/`).
@@ -17,6 +22,19 @@ use serde::{Deserialize, Serialize};
 fn validate_node_id(id: &str) -> Result<(), InvalidId> {
     if id.is_empty() {
         return Err(InvalidId("identifier must not be empty".into()));
+    }
+    // `dora` is reserved for built-in input namespaces (`dora/timer/...`,
+    // `dora/logs`). A user node literally named `dora` would be silently
+    // unusable as an input source: `InputMapping::from_str` treats any
+    // `dora/<output>` mapping as a built-in and fails to parse the
+    // subscription. Reject the id up front with a clear message instead of
+    // surfacing an opaque input-parse error later.
+    if id == "dora" {
+        return Err(InvalidId(
+            "identifier 'dora' is reserved for built-in inputs \
+             (dora/timer/..., dora/logs) and cannot be used as a node id"
+                .into(),
+        ));
     }
     if id.starts_with('.') {
         return Err(InvalidId(format!(
@@ -66,8 +84,19 @@ fn validate_data_id(id: &str) -> Result<(), InvalidId> {
     Ok(())
 }
 
+/// Error returned when a string fails validation as a [`NodeId`] or
+/// [`DataId`].
+///
+/// Produced by their [`FromStr`](std::str::FromStr) implementations. The
+/// wrapped `String` is a human-readable explanation of why the id was
+/// rejected (empty, a reserved name, a disallowed character, an empty path
+/// segment, …); its [`Display`](std::fmt::Display) forwards to that message.
+/// ([`OperatorId`] parsing is infallible and does not produce this error.)
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InvalidId(pub String);
+pub struct InvalidId(
+    /// Human-readable reason the id was rejected.
+    pub String,
+);
 
 impl std::fmt::Display for InvalidId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -77,6 +106,45 @@ impl std::fmt::Display for InvalidId {
 
 impl std::error::Error for InvalidId {}
 
+/// A validated node identifier.
+///
+/// A `NodeId` may contain only `[a-zA-Z0-9_.-]`, must be non-empty, and must
+/// not start with `.` (dot-segments like `.` or `..` could traverse into a
+/// parent directory when the id is joined into a filesystem path). Unlike
+/// [`DataId`], a `NodeId` may **not** contain `/`, which separates
+/// `<node_id>/<output_id>` in input-mapping syntax.
+///
+/// The exact id `dora` is additionally reserved: it names the built-in input
+/// namespaces (`dora/timer/...`, `dora/logs`), which input-mapping parsing
+/// matches before any user node, so a node called `dora` could never be
+/// subscribed to. Only the exact string is reserved — `dora-node`, `my-dora`
+/// and `Dora` all remain valid.
+///
+/// # Parsing vs. conversion (panic footgun)
+///
+/// Use [`str::parse`] / [`FromStr`](std::str::FromStr) for untrusted input: it
+/// returns `Result<NodeId, InvalidId>`. The `From<String>` conversion — and
+/// therefore `.into()` and the auto-derived `TryFrom<String>` — **panics** on
+/// an invalid id.
+///
+/// ```
+/// use dora_message::id::NodeId;
+///
+/// // Fallible path — always safe for untrusted input:
+/// assert!("camera_node".parse::<NodeId>().is_ok());
+/// assert!("node/out".parse::<NodeId>().is_err()); // '/' is not allowed in a NodeId
+/// assert!("".parse::<NodeId>().is_err());         // empty is rejected
+/// assert!(".hidden".parse::<NodeId>().is_err());  // leading '.' is rejected
+/// assert!("dora".parse::<NodeId>().is_err());     // reserved for built-in inputs
+/// assert!("dora-node".parse::<NodeId>().is_ok()); // only the exact id is reserved
+/// ```
+///
+/// The infallible-looking conversion panics on the same invalid input:
+///
+/// ```should_panic
+/// use dora_message::id::NodeId;
+/// let _ = NodeId::from("node/out".to_string()); // panics — prefer .parse()
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, JsonSchema)]
 pub struct NodeId(pub(crate) String);
 
@@ -102,7 +170,10 @@ impl FromStr for NodeId {
 
 /// # Panics
 ///
-/// Panics if `id` contains invalid characters (not in `[a-zA-Z0-9_.-]`).
+/// Panics if `id` is not a valid node id: if it is empty, contains
+/// characters outside `[a-zA-Z0-9_.-]`, starts with `.`, or is the
+/// reserved id `dora`. Pre-validating against the character set alone is
+/// *not* sufficient to make this conversion infallible.
 ///
 /// **For untrusted input, use `id.parse::<NodeId>()`** which calls
 /// `FromStr::from_str` and returns `Result<Self, InvalidId>`.
@@ -132,6 +203,32 @@ impl AsRef<str> for NodeId {
     }
 }
 
+/// The identifier of an operator running inside a `dora runtime` node.
+///
+/// An operator is addressed as `<node_id>/<operator_id>/<output_id>`, so an
+/// `OperatorId` is the middle segment of a runtime output's fully-qualified
+/// name.
+///
+/// Unlike [`NodeId`] and [`DataId`], an `OperatorId` is **not** validated:
+/// [`FromStr`] is [`Infallible`] and [`From<String>`] accepts any string
+/// verbatim (this is why it derives `Deserialize` directly rather than through
+/// a validating deserializer). Callers are responsible for not embedding a `/`
+/// in an operator id — a `/` collides with the `<node>/<operator>/<output>`
+/// addressing separator and makes the operator unaddressable (it would resolve
+/// to a different operator/output split).
+///
+/// ```
+/// use dora_message::id::OperatorId;
+///
+/// // Construction is infallible from both `&str` and `String`:
+/// let from_str: OperatorId = "detector".parse().unwrap(); // FromStr is Infallible
+/// let from_string = OperatorId::from("detector".to_string());
+/// assert_eq!(from_str, from_string);
+///
+/// // Display and AsRef expose the underlying id:
+/// assert_eq!(from_str.to_string(), "detector");
+/// assert_eq!(from_str.as_ref(), "detector");
+/// ```
 #[derive(
     Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
 )]
@@ -163,6 +260,37 @@ impl AsRef<str> for OperatorId {
     }
 }
 
+/// A validated data (output) identifier.
+///
+/// A `DataId` may contain only `[a-zA-Z0-9_./-]` and must be non-empty. Unlike
+/// [`NodeId`], a `DataId` **may** contain `/` (runtime-operator outputs are
+/// namespaced as `<operator-id>/<output-name>`), but leading, trailing, or
+/// consecutive slashes — which would produce empty path segments — are
+/// rejected.
+///
+/// # Parsing vs. conversion (panic footgun)
+///
+/// Use [`str::parse`] / [`FromStr`](std::str::FromStr) for untrusted input: it
+/// returns `Result<DataId, InvalidId>`. The `From<String>` / `From<&str>`
+/// conversions — and therefore `.into()` and the auto-derived `TryFrom` —
+/// **panic** on an invalid id.
+///
+/// ```
+/// use dora_message::id::DataId;
+///
+/// assert!("image".parse::<DataId>().is_ok());
+/// assert!("op/status".parse::<DataId>().is_ok()); // '/' is allowed in a DataId
+/// assert!("a//b".parse::<DataId>().is_err());     // empty path segment rejected
+/// assert!("/out".parse::<DataId>().is_err());     // leading '/' rejected
+/// assert!("bad id".parse::<DataId>().is_err());   // space rejected
+/// ```
+///
+/// The infallible-looking conversion panics on the same invalid input:
+///
+/// ```should_panic
+/// use dora_message::id::DataId;
+/// let _ = DataId::from("a//b".to_string()); // panics — prefer .parse()
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, JsonSchema)]
 pub struct DataId(String);
 
@@ -194,7 +322,11 @@ impl From<DataId> for String {
 
 /// # Panics
 ///
-/// Panics if `id` contains invalid characters (not in `[a-zA-Z0-9_./-]`).
+/// Panics if `id` is not a valid data id: if it is empty, contains
+/// characters outside `[a-zA-Z0-9_./-]`, or has an empty path segment (a
+/// leading, trailing, or consecutive `/`). Pre-validating against the
+/// character set alone is *not* sufficient to make this conversion
+/// infallible.
 ///
 /// **For untrusted input, use `id.parse::<DataId>()`** which calls
 /// `FromStr::from_str` and returns `Result<Self, InvalidId>`.
@@ -203,6 +335,13 @@ impl From<DataId> for String {
 /// auto-derived blanket impl that delegates to this `From` impl, so it
 /// panics exactly like `.into()`. Only `parse::<DataId>()` / `from_str`
 /// is fallible.
+///
+/// ```should_panic
+/// use dora_message::id::DataId;
+/// // A trailing '/' contains only valid characters but is still rejected
+/// // (empty path segment), so this conversion panics.
+/// let _ = DataId::from("op/".to_string());
+/// ```
 impl From<String> for DataId {
     fn from(id: String) -> Self {
         if let Err(e) = validate_data_id(&id) {
@@ -214,7 +353,9 @@ impl From<String> for DataId {
 
 /// # Panics
 ///
-/// Panics if `id` contains invalid characters. Prefer `id.parse::<DataId>()`
+/// Panics if `id` is not a valid data id: if it is empty, contains
+/// characters outside `[a-zA-Z0-9_./-]`, or has an empty path segment (a
+/// leading, trailing, or consecutive `/`). Prefer `id.parse::<DataId>()`
 /// when handling untrusted input.
 impl From<&str> for DataId {
     fn from(id: &str) -> Self {
@@ -280,6 +421,17 @@ mod tests {
         assert!(validate_node_id("node name").is_err());
         assert!(validate_node_id("node;rm").is_err());
         assert!(validate_node_id("node\0").is_err());
+    }
+
+    #[test]
+    fn node_id_rejects_reserved_dora() {
+        // `dora` collides with the built-in input namespace and would make the
+        // node's outputs unsubscribable, so it is rejected up front.
+        assert!(validate_node_id("dora").is_err(), "dora must be rejected");
+        // Names that merely contain or extend `dora` are still fine.
+        assert!(validate_node_id("dora-node").is_ok());
+        assert!(validate_node_id("my-dora").is_ok());
+        assert!(validate_node_id("Dora").is_ok());
     }
 
     #[test]

@@ -12,8 +12,9 @@ use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
 /// Helper for deserializing incoming WS frames without going through
-/// `serde_json::Value` for the result/payload fields. This preserves
-/// u128 fidelity for uhlc::ID inside timestamps.
+/// `serde_json::Value` for the result/payload fields: they are handed to the
+/// caller as raw bytes to be parsed into their real type, so they are never
+/// re-serialized from an intermediate `Value`.
 #[derive(serde::Deserialize)]
 struct IncomingFrame {
     #[serde(default)]
@@ -201,10 +202,7 @@ impl WsSession {
         topics: Vec<(dora_message::id::NodeId, dora_message::id::DataId)>,
     ) -> eyre::Result<(Uuid, std_mpsc::Receiver<eyre::Result<Vec<u8>>>)> {
         let request = serde_json::to_vec(
-            &dora_message::cli_to_coordinator::ControlRequest::TopicSubscribe {
-                dataflow_id,
-                topics,
-            },
+            &dora_message::cli_to_coordinator::ControlRequest::topic_subscribe(dataflow_id, topics),
         )
         .map_err(|e| eyre!("failed to serialize TopicSubscribe: {e}"))?;
 
@@ -419,7 +417,14 @@ async fn session_loop(ws_stream: WsStream, mut cmd_rx: mpsc::UnboundedReceiver<S
                     Ok(other) => {
                         tracing::trace!("ignoring unexpected WS message type: {other:?}");
                     }
-                    Err(_) => break,
+                    Err(e) => {
+                        if is_connection_drop(&e) {
+                            tracing::debug!("coordinator WebSocket session ended: {e}");
+                        } else {
+                            tracing::warn!("coordinator WebSocket session ended: {e}");
+                        }
+                        break;
+                    }
                 }
             }
         }
@@ -435,6 +440,38 @@ async fn session_loop(ws_stream: WsStream, mut cmd_rx: mpsc::UnboundedReceiver<S
     for (_, (ack, _)) in pending_topic_subscribes.drain() {
         let _ = ack.send(Err(eyre!("WS connection closed")));
     }
+}
+
+/// Whether a WebSocket read error is the connection simply going away.
+///
+/// The coordinator exits after `dora down` without a closing handshake, so a
+/// reset is the normal end of that session and must not print a warning.
+/// Anything else (a capacity limit, a protocol violation) is worth a warning.
+fn is_connection_drop(e: &tokio_tungstenite::tungstenite::Error) -> bool {
+    use tokio_tungstenite::tungstenite::error::{Error, ProtocolError};
+    match e {
+        Error::ConnectionClosed
+        | Error::AlreadyClosed
+        | Error::Protocol(ProtocolError::ResetWithoutClosingHandshake) => true,
+        Error::Io(io) => matches!(
+            io.kind(),
+            std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::UnexpectedEof
+        ),
+        _ => false,
+    }
+}
+
+/// Error for a `TopicSubscribed` ack whose binary-frame encoding does not match
+/// ours. Wraps the shared message so both sides of the handshake explain a
+/// mismatch identically.
+fn topic_protocol_mismatch_error(coordinator_version: Option<u16>) -> eyre::Report {
+    eyre!(dora_message::topic_protocol_mismatch_message(
+        "coordinator",
+        coordinator_version
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -470,9 +507,27 @@ fn handle_response(
             match reply {
                 Ok(dora_message::coordinator_to_cli::ControlRequestReply::TopicSubscribed {
                     subscription_id,
+                    protocol_version,
                 }) => {
-                    topic_subscribers.insert(subscription_id, data_tx);
-                    let _ = ack_tx.send(Ok(subscription_id));
+                    // A coordinator on the other encoding would send frames we
+                    // would misparse rather than fail on, so refuse the
+                    // subscription instead of consuming them (dora-rs/dora#3153).
+                    //
+                    // We deliberately don't send `TopicUnsubscribe` here. Only
+                    // a *pre-handshake* coordinator reaches this branch having
+                    // actually created a subscription (a current one rejects
+                    // before creating anything), and every `subscribe_topics`
+                    // caller propagates this error with `?`, dropping the
+                    // `WsSession` — which closes the connection and makes the
+                    // coordinator tear its subscriptions down. Threading an
+                    // outgoing sender into `handle_response` to save that
+                    // already-closing subscription would not earn its keep.
+                    if protocol_version != Some(dora_message::TOPIC_DATA_PROTOCOL_VERSION) {
+                        let _ = ack_tx.send(Err(topic_protocol_mismatch_error(protocol_version)));
+                    } else {
+                        topic_subscribers.insert(subscription_id, data_tx);
+                        let _ = ack_tx.send(Ok(subscription_id));
+                    }
                 }
                 Ok(dora_message::coordinator_to_cli::ControlRequestReply::Error(e)) => {
                     let _ = ack_tx.send(Err(eyre!("{e}")));
@@ -494,7 +549,8 @@ fn handle_response(
             let err_reply = dora_message::coordinator_to_cli::ControlRequestReply::Error(error);
             Ok(serde_json::to_vec(&err_reply).unwrap_or_default())
         } else if let Some(raw) = result {
-            // Preserve raw JSON bytes to maintain u128 fidelity for uhlc::ID
+            // Hand the raw JSON bytes to the caller, which parses them into the
+            // concrete reply type.
             Ok(raw.get().as_bytes().to_vec())
         } else {
             Err(eyre!("empty WS response"))
@@ -643,7 +699,10 @@ mod tests {
 
         handle_response(
             id,
-            Some(raw(json!({"TopicSubscribed": {"subscription_id": sub_id}}))),
+            Some(raw(json!({"TopicSubscribed": {
+                "subscription_id": sub_id,
+                "protocol_version": dora_message::TOPIC_DATA_PROTOCOL_VERSION,
+            }}))),
             None,
             &mut pending,
             &mut subscribes,
@@ -657,6 +716,74 @@ mod tests {
         assert!(topic_subs.contains_key(&sub_id));
     }
 
+    /// Binary topic frames are positionally encoded, so a coordinator on a
+    /// different encoding produces plausible garbage rather than a decode
+    /// error. The ack must be refused, and the subscription must not be
+    /// registered — otherwise frames would be dispatched to a consumer that
+    /// cannot read them (dora-rs/dora#3153).
+    fn ack_with_protocol_version(version: Option<u16>) -> (eyre::Result<Uuid>, bool) {
+        let id = Uuid::new_v4();
+        let sub_id = Uuid::new_v4();
+        let (ack_tx, mut ack_rx) = oneshot::channel();
+        let (data_tx, _data_rx) = std_mpsc::channel();
+        let mut pending = HashMap::new();
+        let mut subscribes = HashMap::new();
+        let mut subs = Vec::new();
+        let mut topic_pending = HashMap::new();
+        topic_pending.insert(id, (ack_tx, data_tx));
+        let mut topic_subs = HashMap::new();
+
+        let result = match version {
+            Some(version) => json!({"TopicSubscribed": {
+                "subscription_id": sub_id, "protocol_version": version,
+            }}),
+            // A pre-handshake coordinator omits the field entirely.
+            None => json!({"TopicSubscribed": {"subscription_id": sub_id}}),
+        };
+
+        handle_response(
+            id,
+            Some(raw(result)),
+            None,
+            &mut pending,
+            &mut subscribes,
+            &mut subs,
+            &mut topic_pending,
+            &mut topic_subs,
+        );
+
+        (ack_rx.try_recv().unwrap(), topic_subs.contains_key(&sub_id))
+    }
+
+    #[test]
+    fn topic_subscribe_ack_rejects_older_protocol_version() {
+        let (ack, registered) = ack_with_protocol_version(Some(1));
+        let err = ack.expect_err("an older protocol version must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("version 1") && msg.contains("misparse"),
+            "error should name the peer's version and why it is fatal, got: {msg}"
+        );
+        assert!(
+            !registered,
+            "a rejected subscription must not be registered for frame dispatch"
+        );
+    }
+
+    #[test]
+    fn topic_subscribe_ack_rejects_missing_protocol_version() {
+        let (ack, registered) = ack_with_protocol_version(None);
+        let err = ack.expect_err("a pre-handshake coordinator must be rejected");
+        assert!(
+            format!("{err}").contains("predates"),
+            "error should say the coordinator predates the handshake, got: {err}"
+        );
+        assert!(
+            !registered,
+            "a rejected subscription must not be registered for frame dispatch"
+        );
+    }
+
     #[tokio::test]
     async fn connect_rejects_from_async_context() {
         let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -667,6 +794,26 @@ mod tests {
             ),
             Ok(_) => panic!("expected error from async context"),
         }
+    }
+
+    #[test]
+    fn connection_drop_is_not_a_warning() {
+        use tokio_tungstenite::tungstenite::error::{CapacityError, Error, ProtocolError};
+        // `dora down`: the coordinator exits without a closing handshake.
+        assert!(is_connection_drop(&Error::Protocol(
+            ProtocolError::ResetWithoutClosingHandshake
+        )));
+        assert!(is_connection_drop(&Error::ConnectionClosed));
+        assert!(is_connection_drop(&Error::Io(std::io::Error::from(
+            std::io::ErrorKind::ConnectionReset
+        ))));
+        // A real failure still warns.
+        assert!(!is_connection_drop(&Error::Capacity(
+            CapacityError::MessageTooLong {
+                size: 17 << 20,
+                max_size: 16 << 20,
+            }
+        )));
     }
 
     #[tokio::test]

@@ -1,12 +1,13 @@
 use crate::{Event, control::ControlEvent};
 use axum::extract::ws::{Message, WebSocket};
 use dora_message::{
+    TOPIC_DATA_PROTOCOL_VERSION,
     cli_to_coordinator::{ControlRequest, check_cli_version},
     common::Timestamped,
     coordinator_to_cli::ControlRequestReply,
     current_crate_version,
     daemon_to_daemon::InterDaemonEvent,
-    metadata::{ArrowTypeInfo, BufferOffset, Metadata},
+    metadata::{FRAMING, FRAMING_ARROW_IPC, Metadata, MetadataParameters, Parameter},
     ws_protocol::{WsRequest, WsResponse},
 };
 use futures::{SinkExt, StreamExt};
@@ -16,6 +17,22 @@ use uuid::Uuid;
 
 /// Maximum topics allowed in a single TopicSubscribe request.
 const MAX_TOPICS_PER_SUBSCRIBE: usize = 64;
+
+/// Whether a client's advertised binary-frame encoding is one we can serve.
+///
+/// `Err` carries the rejection message. Split out from the request handler so
+/// the decision is testable without a live WebSocket — the handler itself only
+/// runs inside `handle_control_ws`.
+fn check_topic_protocol(client_version: Option<u16>) -> Result<(), String> {
+    if client_version == Some(TOPIC_DATA_PROTOCOL_VERSION) {
+        Ok(())
+    } else {
+        Err(dora_message::topic_protocol_mismatch_message(
+            "client",
+            client_version,
+        ))
+    }
+}
 
 /// Maximum concurrent topic subscriptions per WebSocket connection.
 const MAX_SUBSCRIPTIONS_PER_CONNECTION: usize = 16;
@@ -43,10 +60,29 @@ async fn send_ws_response(
     ws_tx.send(Message::Text(json.into())).await.map_err(|_| ())
 }
 
+/// Send the standard reply for a log-subscribe request: `{"subscribed": true}`
+/// when the target existed, or an error carrying `not_found_msg` otherwise.
+/// Shared by the `LogSubscribe` and `BuildLogSubscribe` handlers, which differ
+/// only in the event they emit and this message.
+async fn send_subscribe_reply(
+    ws_tx: &mut futures::stream::SplitSink<WebSocket, Message>,
+    req_id: Uuid,
+    found: bool,
+    not_found_msg: impl FnOnce() -> String,
+) -> Result<(), ()> {
+    let resp = if found {
+        WsResponse::ok(req_id, serde_json::json!({"subscribed": true}))
+    } else {
+        WsResponse::err(req_id, not_found_msg())
+    };
+    send_ws_response(ws_tx, &resp).await
+}
+
 /// Format a `WsResponse`-shaped JSON envelope using `serde_json::to_string`.
 ///
-/// This is needed (instead of `send_ws_response`) for replies that contain u128
-/// values (e.g. uhlc::ID) which lose fidelity through `serde_json::Value`.
+/// Used instead of `send_ws_response` where the reply is already a concrete
+/// type: it serializes straight into the envelope rather than materializing an
+/// intermediate `serde_json::Value` for the `WsResponse::result` field.
 fn format_response_json(id: Uuid, reply: &impl serde::Serialize) -> String {
     match serde_json::to_string(reply) {
         Ok(result_json) => {
@@ -58,6 +94,88 @@ fn format_response_json(id: Uuid, reply: &impl serde::Serialize) -> String {
             format!(r#"{{"id":"{id}","error":{err_json}}}"#)
         }
     }
+}
+
+/// Push one log line to the CLI.
+async fn send_log_line(
+    ws_tx: &mut futures::stream::SplitSink<WebSocket, Message>,
+    log_json: String,
+) -> Result<(), ()> {
+    ws_tx
+        .send(Message::Text(log_json.into()))
+        .await
+        .map_err(|_| ())
+}
+
+/// Push one topic data frame to the CLI as `subscription_id ++ payload`.
+async fn send_topic_frame(
+    ws_tx: &mut futures::stream::SplitSink<WebSocket, Message>,
+    frame: crate::topic_subscriber::TopicFrame,
+) -> Result<(), ()> {
+    let mut data = Vec::with_capacity(16 + frame.payload.len());
+    data.extend_from_slice(&frame.subscription_id.into_bytes());
+    data.extend_from_slice(&frame.payload);
+    ws_tx
+        .send(Message::Binary(data.into()))
+        .await
+        .map_err(|_| ())
+}
+
+/// Wait for a control request's reply while still draining the connection's
+/// pushed log lines and topic frames to the CLI.
+///
+/// The coordinator event loop fills `log_rx`/`binary_rx` (64 slots each) and
+/// only this connection empties them. Awaiting the reply alone would leave
+/// them undrained for as long as the request takes, which for `WaitForBuild`
+/// or `Stop` is the whole build or shutdown: once full, every further log line
+/// costs the event loop a 100 ms send timeout and the subscriber is dropped
+/// after 100 of them, losing the rest of the log.
+///
+/// `Err` means the WebSocket send failed (the connection is gone).
+async fn await_reply_forwarding_pushes(
+    mut reply_rx: oneshot::Receiver<eyre::Result<ControlRequestReply>>,
+    ws_tx: &mut futures::stream::SplitSink<WebSocket, Message>,
+    log_rx: &mut mpsc::Receiver<String>,
+    binary_rx: &mut mpsc::Receiver<crate::topic_subscriber::TopicFrame>,
+) -> Result<ControlRequestReply, ()> {
+    let reply = loop {
+        tokio::select! {
+            reply = &mut reply_rx => break reply,
+            Some(log_json) = log_rx.recv() => send_log_line(ws_tx, log_json).await?,
+            Some(frame) = binary_rx.recv() => send_topic_frame(ws_tx, frame).await?,
+        }
+    };
+    // Lines the event loop queued before answering belong ahead of the
+    // reply: a CLI that exits on it would lose them. Flush only what is queued
+    // now, though: draining until empty would let a producer that outpaces the
+    // socket hold the reply back for as long as its burst lasts.
+    for _ in 0..log_rx.len() {
+        let Ok(log_json) = log_rx.try_recv() else {
+            break;
+        };
+        send_log_line(ws_tx, log_json).await?;
+    }
+    for _ in 0..binary_rx.len() {
+        let Ok(frame) = binary_rx.try_recv() else {
+            break;
+        };
+        send_topic_frame(ws_tx, frame).await?;
+    }
+    Ok(match reply {
+        Ok(Ok(reply)) => reply,
+        Ok(Err(err)) => {
+            tracing::error!("control request failed: {err:?}");
+            // Send only the root error message to the client, not the
+            // full internal chain (which may leak implementation details).
+            let root = err.root_cause().to_string();
+            ControlRequestReply::Error(root)
+        }
+        Err(_) => ControlRequestReply::Error(
+            "coordinator dropped the request without a reply \
+             (it may have shut down or the dataflow exited unexpectedly)"
+                .to_string(),
+        ),
+    })
 }
 
 /// Handle a single CLI WebSocket connection on `/api/control`.
@@ -158,12 +276,13 @@ pub(crate) async fn handle_control_ws(
                         })).await;
 
                         let found = found_rx.await.unwrap_or(false);
-                        let resp = if found {
-                            WsResponse::ok(req.id, serde_json::json!({"subscribed": true}))
-                        } else {
-                            WsResponse::err(req.id, format!("no running dataflow with id {dataflow_id}"))
-                        };
-                        let _ = send_ws_response(&mut ws_tx, &resp).await;
+                        let _ = send_subscribe_reply(
+                            &mut ws_tx,
+                            req.id,
+                            found,
+                            || format!("no running dataflow with id {dataflow_id}"),
+                        )
+                        .await;
                         continue;
                     }
                     ControlRequest::BuildLogSubscribe { build_id, level } => {
@@ -176,15 +295,31 @@ pub(crate) async fn handle_control_ws(
                         })).await;
 
                         let found = found_rx.await.unwrap_or(false);
-                        let resp = if found {
-                            WsResponse::ok(req.id, serde_json::json!({"subscribed": true}))
-                        } else {
-                            WsResponse::err(req.id, format!("no running build with id {build_id}"))
-                        };
-                        let _ = send_ws_response(&mut ws_tx, &resp).await;
+                        let _ = send_subscribe_reply(
+                            &mut ws_tx,
+                            req.id,
+                            found,
+                            || format!("no running build with id {build_id}"),
+                        )
+                        .await;
                         continue;
                     }
-                    ControlRequest::TopicSubscribe { dataflow_id, topics } => {
+                    ControlRequest::TopicSubscribe {
+                        dataflow_id,
+                        topics,
+                        protocol_version,
+                        ..
+                    } => {
+                        // Reject before doing any work: the frames this
+                        // subscription would produce are positionally encoded,
+                        // so a client on the other encoding misparses them
+                        // instead of erroring (dora-rs/dora#3153).
+                        if let Err(msg) = check_topic_protocol(*protocol_version) {
+                            let resp = WsResponse::err(req.id, msg);
+                            let _ = send_ws_response(&mut ws_tx, &resp).await;
+                            continue;
+                        }
+
                         let mut normalized_topics = topics.clone();
                         normalized_topics.sort();
 
@@ -194,6 +329,7 @@ pub(crate) async fn handle_control_ws(
                         }) {
                             let reply = ControlRequestReply::TopicSubscribed {
                                 subscription_id: existing.subscription_id,
+                                protocol_version: Some(TOPIC_DATA_PROTOCOL_VERSION),
                             };
                             let resp_json = format_response_json(req.id, &reply);
                             if ws_tx.send(Message::Text(resp_json.into())).await.is_err() {
@@ -262,7 +398,10 @@ pub(crate) async fn handle_control_ws(
                             }
                         };
 
-                        let reply = ControlRequestReply::TopicSubscribed { subscription_id };
+                        let reply = ControlRequestReply::TopicSubscribed {
+                            subscription_id,
+                            protocol_version: Some(TOPIC_DATA_PROTOCOL_VERSION),
+                        };
                         let resp_json = format_response_json(req.id, &reply);
                         if ws_tx.send(Message::Text(resp_json.into())).await.is_err() {
                             break;
@@ -305,7 +444,7 @@ pub(crate) async fn handle_control_ws(
                             let resp = WsResponse::err(
                                 req.id,
                                 format!(
-                                    "dataflow {dataflow_id} not found, output unavailable, or topic publish requires `_unstable_debug.enable_debug_inspection: true` (previously named `publish_all_messages_to_zenoh`; old name is still accepted)"
+                                    "dataflow {dataflow_id} not found, output unavailable, or topic publish requires `debug.enable_debug_inspection: true`"
                                 ),
                             );
                             let _ = send_ws_response(&mut ws_tx, &resp).await;
@@ -352,26 +491,19 @@ pub(crate) async fn handle_control_ws(
                     break;
                 }
 
-                let reply = match reply_rx.await {
-                    Ok(Ok(reply)) => reply,
-                    Ok(Err(err)) => {
-                        tracing::error!("control request failed: {err:?}");
-                        // Send only the root error message to the client, not the
-                        // full internal chain (which may leak implementation details).
-                        let root = err.root_cause().to_string();
-                        ControlRequestReply::Error(root)
-                    }
-                    Err(_) => ControlRequestReply::Error(
-                        "coordinator dropped the request without a reply \
-                         (it may have shut down or the dataflow exited unexpectedly)"
-                            .to_string(),
-                    ),
+                // Keep forwarding pushed log lines and topic frames while the
+                // reply is pending: `WaitForBuild` and `Stop` only answer once
+                // the build or dataflow ends, and the logs they produce in the
+                // meantime are pushed through this same connection.
+                let Ok(reply) =
+                    await_reply_forwarding_pushes(reply_rx, &mut ws_tx, &mut log_rx, &mut binary_rx)
+                        .await
+                else {
+                    break;
                 };
 
                 let stop = matches!(reply, ControlRequestReply::CoordinatorStopped);
 
-                // Serialize reply via to_string (not to_value) to preserve u128
-                // fidelity for uhlc::ID inside DataflowResult timestamps.
                 let resp_json = format_response_json(req.id, &reply);
                 if ws_tx.send(Message::Text(resp_json.into())).await.is_err() || stop {
                     break;
@@ -379,16 +511,13 @@ pub(crate) async fn handle_control_ws(
             }
             // Log events to push to CLI
             Some(log_json) = log_rx.recv() => {
-                if ws_tx.send(Message::Text(log_json.into())).await.is_err() {
+                if send_log_line(&mut ws_tx, log_json).await.is_err() {
                     break;
                 }
             }
             // Binary topic data to push to CLI
             Some(frame) = binary_rx.recv() => {
-                let mut data = Vec::with_capacity(16 + frame.payload.len());
-                data.extend_from_slice(&frame.subscription_id.into_bytes());
-                data.extend_from_slice(&frame.payload);
-                if ws_tx.send(Message::Binary(data.into())).await.is_err() {
+                if send_topic_frame(&mut ws_tx, frame).await.is_err() {
                     break;
                 }
             }
@@ -423,27 +552,22 @@ async fn publish_topic(
 ) -> Result<(), String> {
     let topic = dora_core::topics::zenoh_daemon_control_topic(dataflow_id, node_id, output_id);
 
-    // Store JSON as raw UTF-8 bytes in a UInt8 array
-    let data_bytes = data_json.as_bytes();
-    let data = dora_message::aligned_vec::AVec::from_slice(128, data_bytes);
+    // Encode the JSON (as a UInt8 array) into a self-describing Arrow IPC
+    // stream — the framing every data-plane payload now uses, so the receiving
+    // node's IPC decode reconstructs it.
+    let array = arrow::array::UInt8Array::from(data_json.as_bytes().to_vec());
+    let ipc_bytes = encode_topic_ipc(&array)
+        .map_err(|e| format!("failed to Arrow-IPC-encode topic data: {e}"))?;
+    let data = dora_message::aligned_vec::AVec::from_slice(128, &ipc_bytes);
 
-    let type_info = ArrowTypeInfo {
-        data_type: dora_message::arrow_schema::DataType::UInt8,
-        len: data_bytes.len(),
-        null_count: 0,
-        validity: None,
-        offset: 0,
-        buffer_offsets: vec![BufferOffset {
-            offset: 0,
-            len: data_bytes.len(),
-        }],
-        child_data: vec![],
-        field_names: None,
-        schema_hash: None,
-    };
+    let mut params = MetadataParameters::new();
+    params.insert(
+        FRAMING.to_string(),
+        Parameter::String(FRAMING_ARROW_IPC.to_string()),
+    );
 
     let timestamp = clock.new_timestamp();
-    let metadata = Metadata::new(timestamp, type_info);
+    let metadata = Metadata::from_parameters(timestamp, params);
 
     let event = Timestamped {
         inner: InterDaemonEvent::Output {
@@ -462,7 +586,7 @@ async fn publish_topic(
 
     if session.is_none() {
         *session = Some(
-            dora_core::topics::open_zenoh_session(None)
+            dora_core::topics::open_zenoh_session()
                 .await
                 .map_err(|e| format!("failed to open zenoh session: {e}"))?,
         );
@@ -476,4 +600,183 @@ async fn publish_topic(
         .map_err(|e| format!("failed to publish to zenoh: {e}"))?;
 
     Ok(())
+}
+
+/// Encode `array` into a single-column Arrow IPC stream (column named `data`),
+/// matching the framing produced by `dora_node_api::arrow_utils::encode_arrow_ipc`
+/// so the node-side IPC decode reconstructs it.
+fn encode_topic_ipc(array: &arrow::array::UInt8Array) -> eyre::Result<Vec<u8>> {
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::ipc::writer::StreamWriter;
+    use arrow::record_batch::RecordBatch;
+    use eyre::Context;
+    use std::sync::Arc;
+
+    let schema = Arc::new(Schema::new(vec![Field::new("data", DataType::UInt8, true)]));
+    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(array.clone())])
+        .context("failed to create RecordBatch for topic IPC encoding")?;
+
+    let mut buf = Vec::new();
+    {
+        let mut writer = StreamWriter::try_new(&mut buf, &schema)
+            .context("failed to create Arrow IPC StreamWriter")?;
+        writer
+            .write(&batch)
+            .context("failed to write RecordBatch to IPC stream")?;
+        writer
+            .finish()
+            .context("failed to finish Arrow IPC stream")?;
+    }
+    Ok(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A request whose reply is held back -- `WaitForBuild` is answered only
+    /// when the build ends -- must not stop the connection from forwarding
+    /// the log lines pushed to it meanwhile. Before the fix the WS loop sat in
+    /// `reply_rx.await`, so after 64 lines the coordinator's sends blocked
+    /// (and in production timed out, then dropped the subscriber).
+    #[tokio::test]
+    async fn logs_keep_flowing_while_a_reply_is_pending() {
+        use futures::{SinkExt as _, StreamExt as _};
+        use std::time::Duration;
+        use tokio_tungstenite::tungstenite::Message as ClientMessage;
+
+        const LINES: usize = 500;
+
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let clock = Arc::new(dora_core::uhlc::HLC::default());
+        let app =
+            axum::Router::new().route(
+                "/",
+                axum::routing::any(move |ws: axum::extract::WebSocketUpgrade| {
+                    let event_tx = event_tx.clone();
+                    let clock = clock.clone();
+                    async move {
+                        ws.on_upgrade(move |socket| handle_control_ws(socket, event_tx, clock))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+
+        // Stand-in for the coordinator event loop: accept the log subscription,
+        // then push LINES log lines before answering the pending request.
+        let coordinator = tokio::spawn(async move {
+            let mut log_sender = None;
+            while let Some(event) = event_rx.recv().await {
+                match event {
+                    Event::Control(ControlEvent::BuildLogSubscribe {
+                        sender, found_tx, ..
+                    }) => {
+                        log_sender = Some(sender);
+                        let _ = found_tx.send(true);
+                    }
+                    Event::Control(ControlEvent::IncomingRequest { reply_sender, .. }) => {
+                        let sender = log_sender.take().expect("subscribed before the request");
+                        for i in 0..LINES {
+                            tokio::time::timeout(
+                                Duration::from_secs(5),
+                                sender.send(format!("{{\"line\":{i}}}")),
+                            )
+                            .await
+                            .expect("log channel not drained while the reply was pending")
+                            .expect("log channel closed");
+                        }
+                        let _ = reply_sender.send(Ok(ControlRequestReply::TopicPublished));
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/"))
+            .await
+            .unwrap();
+        let mut send = async |request: ControlRequest| {
+            let id = Uuid::new_v4();
+            let req = WsRequest {
+                id,
+                method: "control".into(),
+                params: serde_json::to_value(&request).unwrap(),
+            };
+            ws.send(ClientMessage::Text(
+                serde_json::to_string(&req).unwrap().into(),
+            ))
+            .await
+            .unwrap();
+            id
+        };
+        let build_id = dora_message::BuildId::generate();
+        send(ControlRequest::BuildLogSubscribe {
+            build_id,
+            level: log::LevelFilter::Info,
+        })
+        .await;
+        let wait_id = send(ControlRequest::WaitForBuild { build_id }).await;
+
+        let mut lines = 0;
+        loop {
+            let msg = tokio::time::timeout(Duration::from_secs(30), ws.next())
+                .await
+                .expect("timed out waiting for the connection")
+                .expect("connection closed")
+                .unwrap();
+            let ClientMessage::Text(text) = msg else {
+                continue;
+            };
+            let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+            if value.get("line").is_some() {
+                assert_eq!(value["line"], lines, "log lines must arrive in order");
+                lines += 1;
+            } else if value["id"] == serde_json::json!(wait_id) {
+                break;
+            }
+        }
+        assert_eq!(lines, LINES, "every log line must reach the CLI");
+        coordinator.await.unwrap();
+    }
+
+    /// The rejection has to be actionable: an operator seeing it should know
+    /// which side is old without reading the source. Both arms name our
+    /// version and say why a mismatch cannot simply be tolerated — binary
+    /// topic frames are positionally encoded, so the wrong encoding misparses
+    /// instead of erroring (dora-rs/dora#3153).
+    /// The accept/reject decision itself, not just its wording: inverting or
+    /// deleting the guard in the request handler must fail here.
+    #[test]
+    fn only_our_exact_protocol_version_is_accepted() {
+        assert!(
+            check_topic_protocol(Some(TOPIC_DATA_PROTOCOL_VERSION)).is_ok(),
+            "our own version must be accepted"
+        );
+        assert!(
+            check_topic_protocol(None).is_err(),
+            "a pre-handshake client must be rejected, not defaulted to compatible"
+        );
+        for version in [0, 1, TOPIC_DATA_PROTOCOL_VERSION + 1, u16::MAX] {
+            assert!(
+                check_topic_protocol(Some(version)).is_err(),
+                "version {version} must be rejected: binary frames are positional, \
+                 so a mismatch misparses rather than failing"
+            );
+        }
+    }
+
+    /// The rejection must actually carry the shared explanation, not an empty
+    /// or generic string — that text is what tells an operator which side is old.
+    #[test]
+    fn rejection_carries_the_shared_mismatch_message() {
+        let err = check_topic_protocol(Some(1)).expect_err("version 1 must be rejected");
+        assert_eq!(
+            err,
+            dora_message::topic_protocol_mismatch_message("client", Some(1)),
+            "should reuse the shared message rather than a local variant"
+        );
+    }
 }

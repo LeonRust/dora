@@ -1,30 +1,19 @@
+use super::classify;
 use dora_message::{
-    config::{Input, InputMapping, UserInputMapping},
-    descriptor::{Descriptor, EnvValue, Node},
+    config::{Input, InputMapping, LogSubscriptionFilter, UserInputMapping},
+    descriptor::{
+        DYNAMIC_SOURCE, Descriptor, EnvValue, Node, OperatorConfig, OperatorSource, SHELL_SOURCE,
+    },
     id::{DataId, NodeId},
 };
 use eyre::{Context, bail};
 use serde::Deserialize;
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
 };
 
-/// Lexically normalize a path (collapse `.` and resolve `..`) without touching
-/// the filesystem — the executable may not be built yet when this is called.
-fn normalize_path(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                out.pop();
-            }
-            other => out.push(other),
-        }
-    }
-    out
-}
+use super::normalize_path;
 
 /// Check if a path string is absolute on any platform.
 /// On Windows, `Path::is_absolute()` returns false for Unix-style `/foo` paths,
@@ -46,8 +35,15 @@ const MAX_MODULE_FILE_SIZE: u64 = 1_048_576;
 /// Usage in module YAML: `_mod/port_name`
 const MODULE_INPUT_SOURCE: &str = "_mod";
 
+/// Where the outputs a module declares end up after expansion: maps each
+/// declared output name to the mapping a consumer must use to read it — the
+/// prefixed inner node ID plus the output name as that node addresses it
+/// (see [`node_output_refs`]).
+type ModuleOutputMap = BTreeMap<String, UserInputMapping>;
+
 /// Header section of a module definition file.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ModuleHeader {
     name: String,
     #[serde(default)]
@@ -107,18 +103,38 @@ pub fn expand_modules_with_boundaries(
         });
     }
 
-    let canonical_base = base_dir
-        .canonicalize()
-        .with_context(|| format!("failed to resolve base directory: {}", base_dir.display()))?;
+    let project_root = normalize_path(dunce::simplified(
+        &std::path::absolute(base_dir)
+            .with_context(|| format!("failed to make base_dir absolute: {}", base_dir.display()))?,
+    ));
+    let canonical_project_root = dunce::canonicalize(&project_root)
+        .with_context(|| format!("failed to resolve project root: {}", project_root.display()))?;
     let mut seen = HashSet::new();
     let mut flat_nodes = Vec::new();
-    let mut output_maps: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+    let mut output_maps: BTreeMap<String, ModuleOutputMap> = BTreeMap::new();
     let mut boundaries = ModuleBoundaries::default();
 
     for node in &descriptor.nodes {
         if node.module.is_some() {
-            let (expanded, omap) =
-                expand_module_node(node, base_dir, &canonical_base, 0, &mut seen)?;
+            // Field validation happens inside `expand_module_node`, so top-level
+            // and nested module nodes go through the same whitelist.
+            let (mut expanded, omap) = expand_module_node(
+                node,
+                base_dir,
+                &project_root,
+                &canonical_project_root,
+                0,
+                &mut seen,
+            )?;
+            // Propagate the module node's own `build` to each expanded leaf node,
+            // mirroring how a nested module node's build is propagated in Phase 2
+            // of `expand_module_node`. `check_module` accepts `build` for exactly
+            // this reason.
+            if let Some(ref outer_build) = node.build {
+                for expanded_node in &mut expanded {
+                    prepend_module_build_to_node(expanded_node, outer_build);
+                }
+            }
             let module_id = node.id.to_string();
             output_maps.insert(module_id.clone(), omap);
             let node_ids: Vec<String> = expanded.iter().map(|n| n.id.to_string()).collect();
@@ -143,17 +159,17 @@ pub fn expand_modules_with_boundaries(
         }
     }
 
+    // Expansion rewrites `nodes` and nothing else, so clone the source
+    // descriptor and swap that one field. Listing the dataflow-level options
+    // individually would silently drop any option added later — `Descriptor` is
+    // `#[non_exhaustive]`, so a missing field is no longer a compile error. This
+    // also keeps the with-modules path structurally identical to the early
+    // return above, which already clones.
+    let mut expanded = descriptor.clone();
+    expanded.nodes = flat_nodes;
+
     Ok(ExpandedDescriptor {
-        descriptor: Descriptor {
-            nodes: flat_nodes,
-            communication: descriptor.communication.clone(),
-            deploy: descriptor.deploy.clone(),
-            debug: descriptor.debug.clone(),
-            health_check_interval: descriptor.health_check_interval,
-            strict_types: descriptor.strict_types,
-            type_rules: descriptor.type_rules.clone(),
-            env: descriptor.env.clone(),
-        },
+        descriptor: expanded,
         boundaries,
     })
 }
@@ -161,7 +177,7 @@ pub fn expand_modules_with_boundaries(
 /// Validate a module file in isolation without expanding it into a dataflow.
 ///
 /// Checks:
-/// - Module header is well-formed (name, inputs, outputs)
+/// - Module header is well-formed (required name, optional inputs/outputs)
 /// - All inner nodes are parseable
 /// - All `_mod/X` references point to declared inputs or optional inputs
 /// - All declared outputs are produced by some inner node (or nested module)
@@ -170,7 +186,32 @@ pub fn check_module_file(module_path: &Path) -> eyre::Result<()> {
     let canonical = module_path
         .canonicalize()
         .with_context(|| format!("module file not found: {}", module_path.display()))?;
-    let module_file = load_module_file(&canonical)?;
+    let mut seen = HashSet::new();
+    check_module_file_inner(&canonical, 0, &mut seen)
+}
+
+fn check_module_file_inner(
+    canonical: &Path,
+    depth: u8,
+    seen: &mut HashSet<PathBuf>,
+) -> eyre::Result<()> {
+    if depth >= MAX_MODULE_DEPTH {
+        bail!(
+            "module nesting exceeds depth limit of {MAX_MODULE_DEPTH} while checking module file: {}",
+            canonical.display()
+        );
+    }
+
+    if !seen.insert(canonical.to_path_buf()) {
+        bail!(
+            "circular module reference detected while checking module file: {}\n\
+             hint: check that module files do not reference each other in a cycle",
+            canonical.display()
+        );
+    }
+
+    let module_file = load_module_file(canonical)?;
+    validate_module_header(&module_file.module)?;
     let module_dir = canonical
         .parent()
         .expect("module file must have a parent directory");
@@ -184,41 +225,139 @@ pub fn check_module_file(module_path: &Path) -> eyre::Result<()> {
         .map(|d| d.to_string())
         .collect();
 
-    // Check _mod/ references point to declared inputs
+    // Check _mod/ references point to declared inputs. Runtime (operator)
+    // and legacy custom nodes wire their inputs through config.inputs /
+    // run_config.inputs rather than the node-level `inputs` map, so those
+    // need the same check (see #2441).
     for node in &module_file.nodes {
-        for (input_id, input) in &node.inputs {
-            if let InputMapping::User(m) = &input.mapping
-                && m.source.to_string() == MODULE_INPUT_SOURCE
-            {
-                let port = m.output.to_string();
-                if !all_input_names.contains(&port) {
-                    bail!(
-                        "module `{}`: node `{}` input `{}` references \
-                             `_mod/{}` but `{}` is not declared in module \
-                             inputs or inputs_optional",
-                        module_file.module.name,
-                        node.id,
-                        input_id,
-                        port,
-                        port,
-                    );
-                }
-            }
+        for inputs in node_input_maps(node) {
+            check_mod_refs(&module_file.module.name, &node.id, inputs, &all_input_names)?;
         }
     }
+    let module_outputs = collect_module_source_outputs(&module_file, module_dir)?;
+    check_internal_wiring(
+        &module_file.module.name,
+        &module_file.nodes,
+        &module_outputs,
+    )?;
 
     // Check outputs: each declared output should be produced by some inner node.
     // For nested module children, recursively load their declared outputs.
-    let mut inner_outputs: BTreeSet<String> = module_file
-        .nodes
-        .iter()
-        .filter(|n| n.module.is_none())
-        .flat_map(|n| n.outputs.iter().map(|o| o.to_string()))
-        .collect();
+    // Runtime (operator) and legacy custom nodes declare their outputs in
+    // config.outputs / run_config.outputs rather than the node-level `outputs`
+    // set, so `node_output_refs` collects those too (see #2817).
+    let mut inner_outputs: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for node in module_file.nodes.iter().filter(|n| n.module.is_none()) {
+        for (name, output_ref) in node_output_refs(node) {
+            inner_outputs
+                .entry(name)
+                .or_default()
+                .push(format!("{}/{}", node.id, output_ref));
+        }
+    }
 
     // Check nested module files exist and collect their declared outputs
     for node in &module_file.nodes {
         if let Some(ref mod_path) = node.module {
+            if is_absolute_any_platform(mod_path) {
+                bail!(
+                    "module `{}`: nested module path `{}` must be relative (node `{}`)",
+                    module_file.module.name,
+                    mod_path,
+                    node.id,
+                );
+            }
+            // The same field whitelist applies at every nesting level.
+            // Without this, `dora expand --module m.yml` reports a file as
+            // valid while `dora run` on a dataflow using it hard-fails.
+            classify::check_module(node)
+                .with_context(|| format!("invalid module node `{}`", node.id))?;
+            let nested = module_dir.join(mod_path);
+            let nested_canonical = nested.canonicalize().with_context(|| {
+                format!(
+                    "module `{}`: nested module `{}` referenced by node `{}` not found",
+                    module_file.module.name, mod_path, node.id,
+                )
+            })?;
+            // Note: unlike `expand_module_node`, we intentionally do NOT reject
+            // a nested reference that leaves `module_dir`. The real expansion
+            // path confines nested modules to the *project root*
+            // (`project_root`, threaded through recursion), which routinely
+            // sits above an individual module's directory -- a module in
+            // `modules/a/` may reference a sibling module in `modules/shared/`
+            // via `../shared/base.yml`. This linter runs on a module file in
+            // isolation, with no project root to bound against, so a
+            // `module_dir` containment check would spuriously reject
+            // cross-directory references that `dora run` / `dora build` accept
+            // and run fine (see #2851). We keep the absolute-path rejection and
+            // the `canonicalize()` existence check above; the containment
+            // boundary is enforced by the real expansion path, not this lint.
+            //
+            // Load nested module to collect its declared outputs.
+            let nested_module = load_module_file(&nested_canonical)?;
+            check_nested_module_required_inputs(
+                &module_file.module.name,
+                &node.id,
+                &nested_module.module,
+                &node.inputs,
+            )?;
+            check_module_file_inner(&nested_canonical, depth + 1, seen).with_context(|| {
+                format!(
+                    "module `{}`: while checking nested module `{}` referenced by node `{}`",
+                    module_file.module.name, nested_module.module.name, node.id,
+                )
+            })?;
+            for output in &nested_module.module.outputs {
+                inner_outputs
+                    .entry(output.to_string())
+                    .or_default()
+                    .push(format!("{}/{}", node.id, output));
+            }
+        }
+    }
+
+    for declared_output in &module_file.module.outputs {
+        let output_str = declared_output.to_string();
+        match inner_outputs.get(&output_str) {
+            None => {
+                bail!(
+                    "module `{}` declares output `{}` but no inner node produces it",
+                    module_file.module.name,
+                    declared_output,
+                );
+            }
+            Some(producers) if producers.len() > 1 => {
+                bail!(
+                    "module `{}` declares output `{}` but multiple inner nodes produce it: {}",
+                    module_file.module.name,
+                    declared_output,
+                    producers.join(", "),
+                );
+            }
+            Some(_) => {}
+        }
+    }
+
+    seen.remove(canonical);
+    Ok(())
+}
+
+fn collect_module_source_outputs(
+    module_file: &ModuleFile,
+    module_dir: &Path,
+) -> eyre::Result<BTreeMap<String, BTreeSet<String>>> {
+    let mut outputs = BTreeMap::new();
+    for node in &module_file.nodes {
+        let node_id = node.id.to_string();
+        if outputs.contains_key(&node_id) {
+            bail!(
+                "module `{}` has duplicate node ID `{}`",
+                module_file.module.name,
+                node.id,
+            );
+        }
+
+        let node_outputs = if let Some(ref mod_path) = node.module {
             if is_absolute_any_platform(mod_path) {
                 bail!(
                     "module `{}`: nested module path `{}` must be relative (node `{}`)",
@@ -234,47 +373,222 @@ pub fn check_module_file(module_path: &Path) -> eyre::Result<()> {
                     module_file.module.name, mod_path, node.id,
                 )
             })?;
-            let base_canonical = module_dir.canonicalize()?;
-            if !nested_canonical.starts_with(&base_canonical) {
-                bail!(
-                    "module `{}`: nested module path `{}` escapes the module directory",
-                    module_file.module.name,
-                    mod_path,
-                );
-            }
-            // Load nested module to collect its declared outputs
             let nested_module = load_module_file(&nested_canonical)?;
-            for output in &nested_module.module.outputs {
-                inner_outputs.insert(output.to_string());
+            nested_module
+                .module
+                .outputs
+                .iter()
+                .map(|output| output.to_string())
+                .collect()
+        } else {
+            node_output_refs(node)
+                .into_iter()
+                .map(|(_, output_ref)| output_ref)
+                .collect()
+        };
+
+        outputs.insert(node_id, node_outputs);
+    }
+    Ok(outputs)
+}
+
+fn check_internal_wiring(
+    module_name: &str,
+    nodes: &[Node],
+    module_outputs: &BTreeMap<String, BTreeSet<String>>,
+) -> eyre::Result<()> {
+    for node in nodes {
+        for inputs in node_input_maps(node) {
+            for (input_id, input) in inputs {
+                if let InputMapping::User(mapping) = &input.mapping {
+                    let source = mapping.source.to_string();
+                    if source == MODULE_INPUT_SOURCE {
+                        continue;
+                    }
+                    if let Some(outputs) = module_outputs.get(&source) {
+                        let output = mapping.output.to_string();
+                        if !outputs.contains(&output) {
+                            bail!(
+                                "module `{}`: node `{}` input `{}` references \
+                                 `{}/{}` but that output is not produced",
+                                module_name,
+                                node.id,
+                                input_id,
+                                source,
+                                output,
+                            );
+                        }
+                    }
+                }
             }
         }
     }
+    Ok(())
+}
 
-    for declared_output in &module_file.module.outputs {
-        let output_str = declared_output.to_string();
-        if !inner_outputs.contains(&output_str) {
+fn validate_module_header(module: &ModuleHeader) -> eyre::Result<()> {
+    reject_duplicate_ports(&module.name, "inputs", &module.inputs)?;
+    reject_duplicate_ports(&module.name, "inputs_optional", &module.inputs_optional)?;
+    reject_duplicate_ports(&module.name, "outputs", &module.outputs)?;
+
+    let required: BTreeSet<_> = module.inputs.iter().collect();
+    if let Some(overlap) = module
+        .inputs_optional
+        .iter()
+        .find(|input| required.contains(input))
+    {
+        bail!(
+            "module `{}` input `{}` is declared as both required and optional",
+            module.name,
+            overlap
+        );
+    }
+    Ok(())
+}
+
+fn reject_duplicate_ports(module_name: &str, field: &str, ports: &[DataId]) -> eyre::Result<()> {
+    let mut seen = BTreeSet::new();
+    for port in ports {
+        if !seen.insert(port) {
+            bail!("module `{module_name}` has duplicate `{field}` entry `{port}`");
+        }
+    }
+    Ok(())
+}
+
+fn check_nested_module_required_inputs(
+    module_name: &str,
+    node_id: &NodeId,
+    nested_module: &ModuleHeader,
+    node_inputs: &BTreeMap<DataId, Input>,
+) -> eyre::Result<()> {
+    for declared_input in &nested_module.inputs {
+        if !node_inputs.contains_key(declared_input) {
             bail!(
-                "module `{}` declares output `{}` but no inner node produces it",
-                module_file.module.name,
-                declared_output,
+                "module `{}`: nested module `{}` declares required input `{}` \
+                 but node `{}` does not provide it",
+                module_name,
+                nested_module.name,
+                declared_input,
+                node_id,
             );
         }
     }
-
     Ok(())
+}
+
+/// Check that every `_mod/X` reference in `inputs` points to a declared
+/// module input (or optional input). Shared by the node-level `inputs`
+/// check and the operator/custom `config.inputs` / `run_config.inputs`
+/// checks in [`check_module_file`].
+fn check_mod_refs(
+    module_name: &str,
+    node_id: &NodeId,
+    inputs: &BTreeMap<DataId, Input>,
+    all_input_names: &BTreeSet<String>,
+) -> eyre::Result<()> {
+    for (input_id, input) in inputs {
+        if let InputMapping::User(m) = &input.mapping
+            && m.source.to_string() == MODULE_INPUT_SOURCE
+        {
+            let port = m.output.to_string();
+            if !all_input_names.contains(&port) {
+                bail!(
+                    "module `{}`: node `{}` input `{}` references \
+                         `_mod/{}` but `{}` is not declared in module \
+                         inputs or inputs_optional",
+                    module_name,
+                    node_id,
+                    input_id,
+                    port,
+                    port,
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// All the places a node's inputs can live: the node-level `inputs` map,
+/// plus the operator/custom `config.inputs` / `run_config.inputs` maps for
+/// runtime (operator) and legacy custom inner nodes. Centralizes the
+/// node-kind enumeration so `_mod/`-reference validation and rewriting stay
+/// in sync as node kinds are added or change (see #2441).
+fn node_input_maps(node: &Node) -> Vec<&BTreeMap<DataId, Input>> {
+    let mut maps = vec![&node.inputs];
+    if let Some(ref operators) = node.operators {
+        maps.extend(operators.operators.iter().map(|op| &op.config.inputs));
+    }
+    if let Some(ref operator) = node.operator {
+        maps.push(&operator.config.inputs);
+    }
+    maps
+}
+
+/// Mutable counterpart of [`node_input_maps`], used by the Phase 1 rewrite
+/// pass in [`expand_module_node`].
+fn node_input_maps_mut(node: &mut Node) -> Vec<&mut BTreeMap<DataId, Input>> {
+    let mut maps = vec![&mut node.inputs];
+    if let Some(ref mut operators) = node.operators {
+        maps.extend(
+            operators
+                .operators
+                .iter_mut()
+                .map(|op| &mut op.config.inputs),
+        );
+    }
+    if let Some(ref mut operator) = node.operator {
+        maps.push(&mut operator.config.inputs);
+    }
+    maps
+}
+
+/// Every output an inner node produces, as `(output_name, output_ref)` pairs
+/// where `output_ref` is how a consumer addresses that output on this node.
+///
+/// The two differ only for multi-operator runtime nodes: their outputs live in
+/// `operators[].config.outputs` and must be referenced as
+/// `<operator_id>/<output>`. Node-level `outputs` and single `operator:`
+/// outputs are both referenced by
+/// their bare name — for `operator:` the `op/` prefix is injected later by
+/// `resolve_aliases_and_set_defaults`, so adding it here would double it up.
+///
+/// Output-side counterpart of [`node_input_maps`]: centralizes the node-kind
+/// enumeration so module output resolution stays in sync as node kinds are
+/// added or change (see #2817).
+fn node_output_refs(node: &Node) -> Vec<(String, String)> {
+    fn bare(outputs: &BTreeSet<DataId>) -> impl Iterator<Item = (String, String)> {
+        outputs.iter().map(|o| (o.to_string(), o.to_string()))
+    }
+
+    let mut refs: Vec<(String, String)> = bare(&node.outputs).collect();
+    if let Some(ref operators) = node.operators {
+        for op in &operators.operators {
+            refs.extend(
+                op.config
+                    .outputs
+                    .iter()
+                    .map(|o| (o.to_string(), format!("{}/{o}", op.id))),
+            );
+        }
+    }
+    if let Some(ref operator) = node.operator {
+        refs.extend(bare(&operator.config.outputs));
+    }
+    refs
 }
 
 /// Expand a single module node into its constituent flat nodes.
 ///
-/// Returns `(expanded_nodes, output_map)` where output_map maps each declared
-/// module output name to the prefixed inner node ID that produces it.
+/// Returns `(expanded_nodes, output_map)`; see [`ModuleOutputMap`].
 fn expand_module_node(
     node: &Node,
     base_dir: &Path,
-    canonical_base: &Path,
+    project_root: &Path,
+    canonical_project_root: &Path,
     depth: u8,
     seen: &mut HashSet<PathBuf>,
-) -> eyre::Result<(Vec<Node>, BTreeMap<String, String>)> {
+) -> eyre::Result<(Vec<Node>, ModuleOutputMap)> {
     if depth >= MAX_MODULE_DEPTH {
         bail!(
             "module nesting exceeds depth limit of {MAX_MODULE_DEPTH} \
@@ -282,6 +596,13 @@ fn expand_module_node(
             node.id
         );
     }
+
+    // Validate the module node's fields against the module whitelist. This is
+    // the single validation site for both top-level and nested module nodes, so
+    // a field that has no meaning on a module node (e.g. `outputs`,
+    // `cpu_affinity`) is rejected here rather than silently dropped during
+    // expansion, at every nesting level.
+    classify::check_module(node).with_context(|| format!("invalid module node `{}`", node.id))?;
 
     let module_path_str = node
         .module
@@ -297,14 +618,83 @@ fn expand_module_node(
         );
     }
 
+    // Find the canonical target of the first symlink component, if any
+    let mut current = base_dir.to_path_buf();
+    let mut symlink_target_root: Option<PathBuf> = None;
+    for component in Path::new(module_path_str).components() {
+        match component {
+            std::path::Component::Normal(c) => {
+                current.push(c);
+                if let Ok(meta) = std::fs::symlink_metadata(&current)
+                    && meta.is_symlink()
+                    && symlink_target_root.is_none()
+                {
+                    symlink_target_root = dunce::canonicalize(&current).ok();
+                }
+            }
+            std::path::Component::ParentDir => {
+                if let Ok(meta) = std::fs::symlink_metadata(&current)
+                    && meta.is_symlink()
+                {
+                    let target = dunce::canonicalize(&current).ok();
+                    let is_in_tree = target
+                        .as_ref()
+                        .is_some_and(|t| t.starts_with(canonical_project_root));
+                    if !is_in_tree {
+                        bail!(
+                            "module path `{}` escapes the project directory (node `{}`)",
+                            module_path_str,
+                            node.id
+                        );
+                    }
+                }
+                current.pop();
+            }
+            _ => {}
+        }
+    }
+
     let module_path = base_dir.join(module_path_str);
-    let canonical = module_path
-        .canonicalize()
+    let canonical = dunce::canonicalize(&module_path)
         .with_context(|| format!("module file not found: {}", module_path.display()))?;
 
-    if !canonical.starts_with(canonical_base) {
+    let absolute_module = normalize_path(dunce::simplified(
+        &std::path::absolute(&module_path).with_context(|| {
+            format!(
+                "failed to make module path absolute: {}",
+                module_path.display()
+            )
+        })?,
+    ));
+    if !absolute_module.starts_with(project_root) {
         bail!(
             "module path `{}` escapes the project directory (node `{}`)",
+            module_path_str,
+            node.id
+        );
+    }
+
+    // Lexical and physical resolutions must name the same file. This prevents
+    // `..` traversal over symlinks from escaping, while leaving in-tree symlinks working.
+    if dunce::canonicalize(&absolute_module).ok().as_ref() != Some(&canonical) {
+        bail!(
+            "module path `{}` escapes the project directory (node `{}`)",
+            module_path_str,
+            node.id
+        );
+    }
+
+    // Confinement: the loaded physical file must either reside within the
+    // canonical project root, or within the canonical target of a symlink
+    // located inside the project directory.
+    let in_project = canonical.starts_with(canonical_project_root);
+    let in_symlink = symlink_target_root
+        .as_ref()
+        .is_some_and(|target| canonical.starts_with(target));
+
+    if !in_project && !in_symlink {
+        bail!(
+            "module path `{}` physically escapes the project directory (node `{}`)",
             module_path_str,
             node.id
         );
@@ -321,8 +711,9 @@ fn expand_module_node(
     }
 
     let module_file = load_module_file(&canonical)?;
+    validate_module_header(&module_file.module)?;
     let module_id = node.id.to_string();
-    let module_dir = canonical
+    let module_dir = absolute_module
         .parent()
         .expect("module file must have a parent directory");
 
@@ -350,8 +741,33 @@ fn expand_module_node(
         .iter()
         .map(|d| d.to_string())
         .collect();
+    let declared_inputs: BTreeSet<String> = module_file
+        .module
+        .inputs
+        .iter()
+        .chain(module_file.module.inputs_optional.iter())
+        .map(|d| d.to_string())
+        .collect();
+    for provided_input in node.inputs.keys() {
+        let provided = provided_input.to_string();
+        if !declared_inputs.contains(&provided) {
+            bail!(
+                "module `{}` does not declare input `{}` provided by node `{}`\n\
+                 hint: declared inputs are: {}",
+                module_file.module.name,
+                provided_input,
+                node.id,
+                declared_inputs
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+        }
+    }
 
     // Validate and collect params
+    let mut seen_upper: BTreeMap<String, &String> = BTreeMap::new();
     for key in node.params.keys() {
         if !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') || key.is_empty() {
             bail!(
@@ -359,6 +775,22 @@ fn expand_module_node(
                  contain only [A-Za-z0-9_]",
                 key,
                 node.id
+            );
+        }
+        // Params are injected into the node env as `PARAM_<KEY>` with the key
+        // upper-cased (see `substitute_params_in_node`). Two keys that differ
+        // only in case (e.g. `mode` and `Mode`) would both map to `PARAM_MODE`,
+        // so one would silently overwrite the other. Reject the collision
+        // instead of dropping a param.
+        let upper = key.to_uppercase();
+        if let Some(existing) = seen_upper.insert(upper.clone(), key) {
+            bail!(
+                "param keys `{}` and `{}` in node `{}` collide: both map to the \
+                 env var `PARAM_{}`. Param keys must be unique case-insensitively.",
+                existing,
+                key,
+                node.id,
+                upper
             );
         }
     }
@@ -374,49 +806,31 @@ fn expand_module_node(
         let prefixed_id: NodeId = format!("{module_id}.{}", inner_node.id).into();
         inner_node.id = prefixed_id;
 
-        // Rewrite inputs (None = optional input not provided, skip it)
-        let mut new_inputs = BTreeMap::new();
-        for (input_id, input) in &inner_node.inputs {
-            match rewrite_module_input(
-                input,
+        // Rewrite inputs (None = optional input not provided, skip it).
+        // Runtime (operator) nodes and legacy custom nodes wire their inputs
+        // through config.inputs / run_config.inputs rather than the
+        // node-level `inputs` map, so `node_input_maps_mut` rewrites all of
+        // them the same way — otherwise `_mod/` references and sibling
+        // cross-references wouldn't resolve for operator/custom inner nodes
+        // (see #2441).
+        for inputs in node_input_maps_mut(&mut inner_node) {
+            *inputs = rewrite_module_inputs_map(
+                inputs,
                 &module_id,
                 &node.inputs,
                 &inner_node_ids,
                 &optional_inputs,
-            )? {
-                Some(new_input) => {
-                    new_inputs.insert(input_id.clone(), new_input);
-                }
-                None => continue, // optional input not provided
-            }
+            )?;
         }
-        inner_node.inputs = new_inputs;
 
-        // Resolve relative paths: make inner node paths relative to base_dir.
-        // Normalize lexically (collapse `..`) before the containment check so
-        // that paths like `../../evil` are detected even though the binary may
-        // not exist yet (ruling out filesystem canonicalize).
-        if let Some(ref path) = inner_node.path
-            && !super::source_is_url(path)
-            && !Path::new(path).is_absolute()
-        {
-            let resolved = normalize_path(&module_dir.join(path));
-            let relative = resolved.strip_prefix(canonical_base).map_err(|_| {
-                eyre::eyre!(
-                    "module node `{}` path `{}` resolves outside the project \
-                         directory (resolved to `{}`)",
-                    inner_node.id,
-                    path,
-                    resolved.display()
-                )
-            })?;
-            inner_node.path = Some(relative.to_string_lossy().into_owned());
-        }
+        resolve_inner_node_paths(&mut inner_node, module_dir, project_root)?;
 
         // Propagate deploy from module node to inner nodes
         if inner_node.deploy.is_none() {
             inner_node.deploy = node.deploy.clone();
         }
+
+        propagate_module_node_env(&mut inner_node, node.env.as_ref());
 
         // Substitute params in env values
         if !params.is_empty() {
@@ -425,11 +839,7 @@ fn expand_module_node(
 
         // Prepend module-level build command to inner node builds
         if let Some(ref module_build) = module_file.build {
-            let inner_build = inner_node.build.take();
-            inner_node.build = Some(match inner_build {
-                Some(existing) => format!("{module_build}\n{existing}"),
-                None => module_build.clone(),
-            });
+            prepend_module_build_to_node(&mut inner_node, module_build);
         }
 
         prefixed_nodes.push(inner_node);
@@ -438,28 +848,59 @@ fn expand_module_node(
     // Phase 2: recursively expand nested modules (before building output map)
     // Collect nested output maps so sibling nodes can reference nested module
     // outputs correctly via rewrite_external_refs.
-    let mut nested_output_maps: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+    let mut nested_output_maps: BTreeMap<String, ModuleOutputMap> = BTreeMap::new();
+    let mut direct_output_targets: BTreeMap<String, Vec<(String, UserInputMapping)>> =
+        BTreeMap::new();
     let mut final_nodes = Vec::new();
     for inner_node in prefixed_nodes {
         if inner_node.module.is_some() {
             let nested_id = inner_node.id.to_string();
             let accumulated_build = inner_node.build.clone();
-            let (mut nested, nested_omap) =
-                expand_module_node(&inner_node, module_dir, canonical_base, depth + 1, seen)?;
+            let (mut nested, nested_omap) = expand_module_node(
+                &inner_node,
+                module_dir,
+                project_root,
+                canonical_project_root,
+                depth + 1,
+                seen,
+            )?;
             // Propagate the outer module's accumulated build to each nested leaf node,
             // mirroring how `deploy` is propagated through recursion.
             if let Some(ref outer_build) = accumulated_build {
                 for nested_node in &mut nested {
-                    let inner_build = nested_node.build.take();
-                    nested_node.build = Some(match inner_build {
-                        Some(existing) => format!("{outer_build}\n{existing}"),
-                        None => outer_build.clone(),
-                    });
+                    prepend_module_build_to_node(nested_node, outer_build);
                 }
+            }
+            for (output, target) in &nested_omap {
+                direct_output_targets
+                    .entry(output.clone())
+                    .or_default()
+                    .push((format!("{nested_id}/{output}"), target.clone()));
             }
             nested_output_maps.insert(nested_id, nested_omap);
             final_nodes.extend(nested);
         } else {
+            for (name, output_ref) in node_output_refs(&inner_node) {
+                // `output_ref` may be an operator-qualified `<op_id>/<output>`
+                // form, and `OperatorId` is unvalidated, so parse fallibly
+                // instead of `output_ref.into()` — `DataId::from` panics on
+                // characters outside `[a-zA-Z0-9_./-]`, which would abort
+                // expansion on an otherwise-parseable descriptor. Mirrors
+                // `prefix_output_with_operator_id` in `descriptor/mod.rs`.
+                let output: DataId = output_ref.parse().map_err(|e| {
+                    eyre::eyre!(
+                        "node `{}` produces an invalid output id `{output_ref}`: {e}",
+                        inner_node.id
+                    )
+                })?;
+                direct_output_targets.entry(name).or_default().push((
+                    format!("{}/{output}", inner_node.id),
+                    UserInputMapping {
+                        source: inner_node.id.clone(),
+                        output,
+                    },
+                ));
+            }
             final_nodes.push(inner_node);
         }
     }
@@ -469,20 +910,37 @@ fn expand_module_node(
         rewrite_external_refs(&mut final_nodes, &nested_output_maps)?;
     }
 
-    // Phase 3: build output map from fully-expanded flat nodes
-    let mut output_map: BTreeMap<String, String> = BTreeMap::new();
+    // Phase 3: build output map from direct children only. A producer may
+    // be a plain node, a runtime node's operator, or a legacy custom node, so
+    // the lookup goes through `node_output_refs` — which also yields the form
+    // consumers must use to address the output (see #2817).
+    let mut output_map = ModuleOutputMap::new();
     for declared_output in &module_file.module.outputs {
-        let producer = final_nodes
-            .iter()
-            .find(|n| n.outputs.contains(declared_output))
-            .ok_or_else(|| {
-                eyre::eyre!(
+        let declared = declared_output.to_string();
+        let target = match direct_output_targets.get(&declared).map(Vec::as_slice) {
+            None | Some([]) => {
+                bail!(
                     "module `{}` declares output `{}` but no inner node produces it",
                     module_file.module.name,
                     declared_output,
-                )
-            })?;
-        output_map.insert(declared_output.to_string(), producer.id.to_string());
+                );
+            }
+            Some([(_, target)]) => target.clone(),
+            Some(targets) => {
+                let producers = targets
+                    .iter()
+                    .map(|(producer, _)| producer.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                bail!(
+                    "module `{}` declares output `{}` but multiple inner nodes produce it: {}",
+                    module_file.module.name,
+                    declared_output,
+                    producers,
+                );
+            }
+        };
+        output_map.insert(declared, target);
     }
 
     // Remove from seen so the same module file can be used in different
@@ -492,8 +950,140 @@ fn expand_module_node(
     Ok((final_nodes, output_map))
 }
 
-/// Substitute `${_param.name}` references in a node's args and inject params
-/// into the node's env map as `EnvValue::String` entries.
+fn resolve_inner_node_paths(
+    node: &mut Node,
+    module_dir: &Path,
+    project_root: &Path,
+) -> eyre::Result<()> {
+    let owner = node.id.to_string();
+    // A `git:` node's `path` is relative to its clone (the node's working dir
+    // at build and spawn), not to the module file, so leave it untouched.
+    if node.git.is_none()
+        && let Some(ref mut path) = node.path
+    {
+        resolve_module_relative_path(path, module_dir, project_root, &owner)?;
+    }
+    if let Some(ref mut operators) = node.operators {
+        for op in &mut operators.operators {
+            resolve_operator_source_paths(&mut op.config, module_dir, project_root, &owner)?;
+        }
+    }
+    if let Some(ref mut operator) = node.operator {
+        resolve_operator_source_paths(&mut operator.config, module_dir, project_root, &owner)?;
+    }
+    Ok(())
+}
+
+fn resolve_operator_source_paths(
+    config: &mut OperatorConfig,
+    module_dir: &Path,
+    project_root: &Path,
+    owner: &str,
+) -> eyre::Result<()> {
+    match &mut config.source {
+        OperatorSource::SharedLibrary(path) | OperatorSource::Wasm(path) => {
+            resolve_module_relative_path(path, module_dir, project_root, owner)
+        }
+        OperatorSource::Python(source) => {
+            resolve_module_relative_path(&mut source.source, module_dir, project_root, owner)
+        }
+    }
+}
+
+fn resolve_module_relative_path(
+    path: &mut String,
+    module_dir: &Path,
+    project_root: &Path,
+    owner: &str,
+) -> eyre::Result<()> {
+    // Resolve relative paths: make inner node/operator sources relative to
+    // base_dir. Normalize lexically (collapse `..`) before the containment
+    // check so paths like `../../evil` are detected even if the binary does
+    // not exist yet (ruling out filesystem canonicalize).
+    if path == DYNAMIC_SOURCE
+        || path == SHELL_SOURCE
+        || super::source_is_url(path)
+        // `Path::is_absolute()` is false for a Unix-style `/foo` on Windows,
+        // where `module_dir.join("/foo")` then rewrites it into the module
+        // directory and the confinement check below rejects it with a
+        // misleading "resolves outside the project directory".
+        || is_absolute_any_platform(path)
+    {
+        return Ok(());
+    }
+
+    let resolved = normalize_path(&module_dir.join(path.as_str()));
+    let relative = resolved.strip_prefix(project_root).map_err(|_| {
+        eyre::eyre!(
+            "module node `{}` path `{}` resolves outside the project \
+                 directory (resolved to `{}`)",
+            owner,
+            path,
+            resolved.display()
+        )
+    })?;
+    *path = relative.to_string_lossy().into_owned();
+    Ok(())
+}
+
+fn prepend_module_build_to_node(node: &mut Node, module_build: &str) {
+    // The node-level `build` is consumed by every standard node -- `path:`,
+    // `git:`, and `hub:` sourced -- (`build/mod.rs` reads `n.build` for all
+    // `CoreNodeKind::Custom` nodes) and by nested `module:` nodes (which
+    // forward it to their own leaves in Phase 2). It is *not* valid on
+    // runtime/operator/ROS2 nodes, where the field classifier rejects it, so
+    // for those the module build lands in the operator configs only.
+    //
+    // Do NOT key this off `node.path`: module expansion runs *before* git/hub
+    // source resolution, so a `git:`/`hub:`-sourced inner node still has
+    // `path == None` here. Keying off `path` silently dropped the module build
+    // for those nodes (#3296). Gate on "not a runtime/operator/ROS2 node"
+    // instead, which correctly includes git/hub standard leaves.
+    let is_standard_or_module = node.module.is_some()
+        || (node.operators.is_none() && node.operator.is_none() && node.ros2.is_none());
+    if is_standard_or_module {
+        prepend_build(&mut node.build, module_build);
+    }
+    if let Some(ref mut operators) = node.operators {
+        for op in &mut operators.operators {
+            prepend_build(&mut op.config.build, module_build);
+        }
+    }
+    if let Some(ref mut operator) = node.operator {
+        prepend_build(&mut operator.config.build, module_build);
+    }
+}
+
+fn prepend_build(build: &mut Option<String>, module_build: &str) {
+    let existing = build.take();
+    *build = Some(match existing {
+        Some(existing) => format!("{module_build}\n{existing}"),
+        None => module_build.to_string(),
+    });
+}
+
+/// Fill an inner node's `env` with entries from the module node that references
+/// it.
+///
+/// The inner node's own `env` wins on conflict: the module node's entries only
+/// fill keys the inner node did not set. This matches `merge_env`'s "per-node
+/// entries override global ones" and the `deploy` propagation above, which also
+/// only fills when the inner value is unset.
+fn propagate_module_node_env(
+    inner_node: &mut Node,
+    module_env: Option<&BTreeMap<String, EnvValue>>,
+) {
+    let Some(module_env) = module_env.filter(|env| !env.is_empty()) else {
+        return;
+    };
+    let env = inner_node.env.get_or_insert_with(BTreeMap::new);
+    for (key, value) in module_env {
+        env.entry(key.clone()).or_insert_with(|| value.clone());
+    }
+}
+
+/// Substitute `${_param.name}` and `$PARAM_<NAME>` references in a node's args
+/// and inject params into the node's env map as `EnvValue::String` entries.
 fn substitute_params_in_node(node: &mut Node, params: &BTreeMap<String, String>) {
     // Substitute in args
     if let Some(ref mut args) = node.args {
@@ -510,12 +1100,92 @@ fn substitute_params_in_node(node: &mut Node, params: &BTreeMap<String, String>)
     }
 }
 
+/// Replace every parameter reference with its value in a single left-to-right
+/// pass. Two forms are accepted:
+///
+/// - `${_param.<key>}` -- delimited; the key is matched case-sensitively and
+///   the closing brace terminates it.
+/// - `$PARAM_<KEY>` -- the documented shell-style form (see `docs/modules.md`),
+///   matched against the upper-cased key. Having no delimiter it extends over
+///   the maximal run of `[A-Za-z0-9_]`, so `$PARAM_SPEED_LIMIT` is a single
+///   token and never partially matches a declared `speed` (#2901).
+///
+/// A previous implementation looped over the params calling `String::replace`
+/// on the accumulating result, which had two problems: the outcome depended on
+/// `BTreeMap` key ordering, and a parameter *value* that itself contained a
+/// `${_param.…}` token (or a literal one a user wanted to keep) was expanded
+/// transitively. Scanning once and never re-examining substituted text makes
+/// substitution simultaneous and order-independent. Unknown keys are left
+/// verbatim, matching the old behavior of only replacing keys present in
+/// `params`.
 fn substitute_params_in_str(s: &str, params: &BTreeMap<String, String>) -> String {
-    let mut result = s.to_string();
-    for (key, value) in params {
-        let pattern = format!("${{_param.{key}}}");
-        result = result.replace(&pattern, value);
+    const BRACED: &str = "${_param.";
+    const ENV_STYLE: &str = "$PARAM_";
+
+    // `$PARAM_<KEY>` matches against the uppercased param name, the same
+    // mapping `substitute_params_in_node` uses for the injected env vars.
+    // Keys that differ only in case are rejected before we get here, so this
+    // map cannot silently drop a param.
+    let env_style: BTreeMap<String, &String> = params
+        .iter()
+        .map(|(key, value)| (key.to_uppercase(), value))
+        .collect();
+
+    let mut result = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(start) = rest.find('$') {
+        result.push_str(&rest[..start]);
+        let at_token = &rest[start..];
+
+        if let Some(after_prefix) = at_token.strip_prefix(BRACED) {
+            match after_prefix.find('}') {
+                Some(end) => {
+                    let key = &after_prefix[..end];
+                    match params.get(key) {
+                        Some(value) => result.push_str(value),
+                        // Unknown key: emit the token unchanged rather than dropping it.
+                        None => {
+                            result.push_str(BRACED);
+                            result.push_str(key);
+                            result.push('}');
+                        }
+                    }
+                    // Continue *after* the closing brace so a substituted value is
+                    // never re-scanned for further tokens.
+                    rest = &after_prefix[end + 1..];
+                }
+                // No closing brace: emit the prefix literally and continue past it
+                // (guarantees progress, so the loop always terminates).
+                None => {
+                    result.push_str(BRACED);
+                    rest = after_prefix;
+                }
+            }
+        } else if let Some(after_prefix) = at_token.strip_prefix(ENV_STYLE) {
+            // The undelimited form ends at the first character that cannot be
+            // part of a shell identifier, so `$PARAM_SPEED_LIMIT` is one token
+            // and never matches a declared `speed` as a prefix (#2901).
+            let end = after_prefix
+                .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .unwrap_or(after_prefix.len());
+            let key = &after_prefix[..end];
+            match env_style.get(key) {
+                Some(value) => result.push_str(value),
+                // Unknown key: emit the token unchanged rather than dropping it.
+                None => {
+                    result.push_str(ENV_STYLE);
+                    result.push_str(key);
+                }
+            }
+            rest = &after_prefix[end..];
+        } else {
+            // A bare `$` that starts neither form: emit it and step past, so
+            // the loop always makes progress.
+            result.push('$');
+            rest = &at_token[1..];
+        }
     }
+    result.push_str(rest);
     result
 }
 
@@ -534,6 +1204,19 @@ fn rewrite_module_input(
     optional_inputs: &BTreeSet<String>,
 ) -> eyre::Result<Option<Input>> {
     match &input.mapping {
+        // `dora/logs/<level>/<node>` naming a sibling: prefix the node filter
+        // like a sibling data source, or it would match no node after
+        // expansion and the sink would silently receive nothing.
+        InputMapping::Logs(LogSubscriptionFilter {
+            min_level,
+            node_filter: Some(node),
+        }) if inner_node_ids.contains(node.as_ref()) => Ok(Some(Input {
+            mapping: InputMapping::Logs(LogSubscriptionFilter {
+                min_level: min_level.clone(),
+                node_filter: Some(format!("{module_id}.{node}").into()),
+            }),
+            ..input.clone()
+        })),
         InputMapping::Timer { .. } | InputMapping::Logs(_) => Ok(Some(input.clone())),
         InputMapping::User(user_mapping) => {
             let source_str = user_mapping.source.to_string();
@@ -577,14 +1260,42 @@ fn rewrite_module_input(
     }
 }
 
+/// Rewrite every input in `inputs` via [`rewrite_module_input`], dropping
+/// entries whose optional module input wasn't provided. Used for both the
+/// node-level `inputs` map and the operator/custom `config.inputs` /
+/// `run_config.inputs` maps in Phase 1 of [`expand_module_node`].
+fn rewrite_module_inputs_map(
+    inputs: &BTreeMap<DataId, Input>,
+    module_id: &str,
+    module_inputs: &BTreeMap<DataId, Input>,
+    inner_node_ids: &BTreeSet<String>,
+    optional_inputs: &BTreeSet<String>,
+) -> eyre::Result<BTreeMap<DataId, Input>> {
+    let mut new_inputs = BTreeMap::new();
+    for (input_id, input) in inputs {
+        if let Some(new_input) = rewrite_module_input(
+            input,
+            module_id,
+            module_inputs,
+            inner_node_ids,
+            optional_inputs,
+        )? {
+            new_inputs.insert(input_id.clone(), new_input);
+        }
+    }
+    Ok(new_inputs)
+}
+
 /// Rewrite inputs across all nodes that reference module outputs.
 ///
 /// If node X has input `nav_stack/cmd_vel` and `nav_stack` was a module whose
 /// output `cmd_vel` is produced by inner node `controller`, rewrite to
-/// `nav_stack.controller/cmd_vel`.
+/// `nav_stack.controller/cmd_vel`. If the producer is an operator of a runtime
+/// node, the rewritten output keeps the operator segment the runtime node
+/// requires: `nav_stack.runtime/controller_op/cmd_vel`.
 fn rewrite_external_refs(
     nodes: &mut [Node],
-    output_maps: &BTreeMap<String, BTreeMap<String, String>>,
+    output_maps: &BTreeMap<String, ModuleOutputMap>,
 ) -> eyre::Result<()> {
     if output_maps.is_empty() {
         return Ok(());
@@ -601,16 +1312,13 @@ fn rewrite_external_refs(
         if let Some(ref mut operator) = node.operator {
             rewrite_inputs_map(&mut operator.config.inputs, output_maps, &node.id)?;
         }
-        if let Some(ref mut custom) = node.custom {
-            rewrite_inputs_map(&mut custom.run_config.inputs, output_maps, &node.id)?;
-        }
     }
     Ok(())
 }
 
 fn rewrite_inputs_map(
     inputs: &mut BTreeMap<DataId, Input>,
-    output_maps: &BTreeMap<String, BTreeMap<String, String>>,
+    output_maps: &BTreeMap<String, ModuleOutputMap>,
     node_id: &NodeId,
 ) -> eyre::Result<()> {
     let mut new_inputs = BTreeMap::new();
@@ -620,12 +1328,9 @@ fn rewrite_inputs_map(
                 let source_str = user_mapping.source.to_string();
                 if let Some(omap) = output_maps.get(&source_str) {
                     let output_str = user_mapping.output.to_string();
-                    if let Some(prefixed_node) = omap.get(&output_str) {
+                    if let Some(target) = omap.get(&output_str) {
                         Input {
-                            mapping: InputMapping::User(UserInputMapping {
-                                source: prefixed_node.clone().into(),
-                                output: user_mapping.output.clone(),
-                            }),
+                            mapping: InputMapping::User(target.clone()),
                             queue_size: input.queue_size,
                             input_timeout: input.input_timeout,
                             queue_policy: input.queue_policy,
@@ -654,18 +1359,27 @@ fn rewrite_inputs_map(
 }
 
 fn load_module_file(path: &Path) -> eyre::Result<ModuleFile> {
-    let metadata = std::fs::metadata(path)
-        .with_context(|| format!("failed to stat module file: {}", path.display()))?;
-    if metadata.len() > MAX_MODULE_FILE_SIZE {
+    use std::io::Read as _;
+    // Bound the read itself, not just a `metadata().len()` pre-check: that
+    // check reports 0 for FIFOs/character devices (e.g. `/dev/zero`) and is
+    // racy against a file being appended to, so it would sail past the cap and
+    // then `std::fs::read` unboundedly — exactly the "infinite files" DoS the
+    // limit is meant to prevent. `take(MAX + 1)` caps the read regardless of
+    // what the file claims its size is; if we hit the cap we reject. Mirrors
+    // the manifest loader in `crate::manifest`.
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("failed to read module file: {}", path.display()))?;
+    let mut buf = Vec::new();
+    file.take(MAX_MODULE_FILE_SIZE + 1)
+        .read_to_end(&mut buf)
+        .with_context(|| format!("failed to read module file: {}", path.display()))?;
+    if buf.len() as u64 > MAX_MODULE_FILE_SIZE {
         bail!(
-            "module file too large ({} bytes, limit {}): {}",
-            metadata.len(),
+            "module file too large (limit {} bytes): {}",
             MAX_MODULE_FILE_SIZE,
             path.display()
         );
     }
-    let buf = std::fs::read(path)
-        .with_context(|| format!("failed to read module file: {}", path.display()))?;
     serde_yaml::from_slice(&buf)
         .with_context(|| format!("failed to parse module file: {}", path.display()))
 }
@@ -688,6 +1402,156 @@ mod tests {
 
     fn parse_descriptor(yaml: &str) -> Descriptor {
         serde_yaml::from_str(yaml).unwrap()
+    }
+
+    /// dora-rs/dora#2920: a dataflow-level setting that expansion drops is
+    /// silently lost for every dataflow that uses modules. The completion
+    /// policy decides whether the graph can ever end, so losing it turns a
+    /// batch run into a hang.
+    ///
+    /// Both paths now clone the source descriptor, so this is a regression
+    /// guard rather than the primary defense. The descriptor MUST still
+    /// contain a module: without one, `expand_modules_with_boundaries`
+    /// short-circuits before the expansion path this exercises.
+    #[test]
+    fn expand_preserves_exit_when_nodes_finish() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+        write_file(
+            base,
+            "echo_module.yml",
+            r#"
+module:
+  name: echo
+  inputs: [data_in]
+  outputs: [data_out]
+
+nodes:
+  - id: passthrough
+    path: echo.py
+    inputs:
+      incoming: _mod/data_in
+    outputs:
+      - data_out
+"#,
+        );
+        let descriptor = parse_descriptor(
+            r#"
+exit_when_nodes_finish: true
+
+nodes:
+  - id: source
+    path: source.py
+    outputs:
+      - number
+
+  - id: my_echo
+    module: echo_module.yml
+    inputs:
+      data_in: source/number
+"#,
+        );
+        assert_eq!(descriptor.exit_when_nodes_finish, Some(true));
+        assert!(
+            descriptor.nodes.iter().any(|n| n.module.is_some()),
+            "precondition: without a module, expansion clones the whole \
+             descriptor and this test would pass even if the rebuild \
+             dropped the field"
+        );
+
+        let expanded = expand_modules(&descriptor, base).unwrap();
+        assert_eq!(
+            expanded.exit_when_nodes_finish,
+            Some(true),
+            "expansion must carry the completion policy through, or a \
+             module-using dataflow silently loses it and never ends"
+        );
+    }
+
+    /// Absent means absent: it must not become `Some(false)`, which
+    /// would be indistinguishable from an explicit opt out and would
+    /// start round-tripping into serialized output.
+    #[test]
+    fn expand_leaves_exit_when_nodes_finish_unset() {
+        let tmp = TempDir::new().unwrap();
+        let descriptor = parse_descriptor(
+            "nodes:\n  \
+               - id: worker\n    \
+                 path: ./worker\n",
+        );
+        assert_eq!(descriptor.exit_when_nodes_finish, None);
+        let expanded = expand_modules(&descriptor, tmp.path()).unwrap();
+        assert_eq!(expanded.exit_when_nodes_finish, None);
+    }
+
+    /// A module whose inner runtime node declares an operator with an id
+    /// containing characters outside `[a-zA-Z0-9_./-]` must surface a clean
+    /// descriptor error, not panic. `OperatorId` is unvalidated, so its id
+    /// flows verbatim into the `<op_id>/<output>` qualified output id, which
+    /// used to be built with `DataId::from` (panics) rather than a fallible
+    /// parse.
+    #[test]
+    fn expand_rejects_invalid_operator_output_id_without_panicking() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+        write_file(
+            base,
+            "bad_module.yml",
+            r#"
+module:
+  name: bad
+  outputs: [data_out]
+
+nodes:
+  - id: runtime_node
+    operators:
+      - id: "bad id"
+        shared-library: op
+        outputs:
+          - data_out
+"#,
+        );
+        let descriptor = parse_descriptor(
+            r#"
+nodes:
+  - id: my_mod
+    module: bad_module.yml
+"#,
+        );
+        let err = expand_modules(&descriptor, base)
+            .expect_err("an invalid operator output id must be a clean error, not a panic");
+        let msg = err.to_string();
+        assert!(msg.contains("invalid output id"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn load_module_file_rejects_oversized_file() {
+        let tmp = TempDir::new().unwrap();
+        // A valid module prefix followed by padding that pushes the file just
+        // over the cap. The read is bounded, so this is rejected before the
+        // whole (potentially unbounded) file is pulled into memory.
+        let mut content = String::from("module:\n  name: big\n  outputs: [x]\nnodes: []\n");
+        content.push_str("# ");
+        content.push_str(&"a".repeat((MAX_MODULE_FILE_SIZE + 16) as usize));
+        let path = write_file(tmp.path(), "big_module.yml", &content);
+
+        let err = load_module_file(&path).unwrap_err().to_string();
+        assert!(err.contains("too large"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn load_module_file_accepts_file_at_limit() {
+        let tmp = TempDir::new().unwrap();
+        // Exactly the cap (padding the comment out to MAX_MODULE_FILE_SIZE
+        // bytes total) must still load — the `+ 1` in `take` is what makes the
+        // boundary inclusive.
+        let prefix = "module:\n  name: ok\n  outputs: [x]\nnodes: []\n# ";
+        let pad = (MAX_MODULE_FILE_SIZE as usize) - prefix.len();
+        let content = format!("{prefix}{}", "a".repeat(pad));
+        assert_eq!(content.len() as u64, MAX_MODULE_FILE_SIZE);
+        let path = write_file(tmp.path(), "ok_module.yml", &content);
+
+        assert!(load_module_file(&path).is_ok());
     }
 
     #[test]
@@ -995,6 +1859,51 @@ nodes:
     }
 
     #[test]
+    fn expand_rejects_duplicate_module_header_inputs() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+
+        write_file(
+            base,
+            "dup_header_module.yml",
+            r#"
+module:
+  name: dup_header
+  inputs: [data, data]
+  outputs: [out]
+
+nodes:
+  - id: inner
+    path: inner.py
+    inputs:
+      x: _mod/data
+    outputs:
+      - out
+"#,
+        );
+
+        let desc = parse_descriptor(
+            r#"
+nodes:
+  - id: src
+    path: src.py
+    outputs: [val]
+  - id: m
+    module: dup_header_module.yml
+    inputs:
+      data: src/val
+"#,
+        );
+
+        let result = expand_modules(&desc, base);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("duplicate"), "got: {msg}");
+        assert!(msg.contains("inputs"), "got: {msg}");
+        assert!(msg.contains("data"), "got: {msg}");
+    }
+
+    #[test]
     fn expand_undefined_output_port() {
         let tmp = TempDir::new().unwrap();
         let base = tmp.path();
@@ -1291,6 +2200,54 @@ nodes:
         );
     }
 
+    #[test]
+    fn expand_rejects_module_input_not_declared_required_or_optional() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+
+        write_file(
+            base,
+            "strict_inputs_module.yml",
+            r#"
+module:
+  name: strict_inputs
+  inputs: [required]
+  inputs_optional: [config]
+  outputs: [out]
+
+nodes:
+  - id: worker
+    path: worker.py
+    inputs:
+      data: _mod/required
+    outputs:
+      - out
+"#,
+        );
+
+        let desc = parse_descriptor(
+            r#"
+nodes:
+  - id: src
+    path: src.py
+    outputs: [data, extra]
+  - id: m
+    module: strict_inputs_module.yml
+    inputs:
+      required: src/data
+      typo: src/extra
+"#,
+        );
+
+        let result = expand_modules(&desc, base);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("does not declare input"), "got: {msg}");
+        assert!(msg.contains("typo"), "got: {msg}");
+        assert!(msg.contains("required"), "got: {msg}");
+        assert!(msg.contains("config"), "got: {msg}");
+    }
+
     // ---- Feature 4: params substitution ----
 
     #[test]
@@ -1394,7 +2351,493 @@ nodes:
         assert_eq!(proc.args.as_deref(), Some("--speed 2.0 --verbose"));
     }
 
+    #[test]
+    fn expand_params_in_documented_env_style_args() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+
+        write_file(
+            base,
+            "args_module.yml",
+            r#"
+module:
+  name: with_args
+  inputs: [data]
+  outputs: [out]
+
+nodes:
+  - id: proc
+    path: proc.py
+    inputs:
+      data: _mod/data
+    outputs:
+      - out
+    args: --speed $PARAM_SPEED --mode $PARAM_MODE
+"#,
+        );
+
+        let desc = parse_descriptor(
+            r#"
+nodes:
+  - id: src
+    path: src.py
+    outputs: [val]
+  - id: m
+    module: args_module.yml
+    inputs:
+      data: src/val
+    params:
+      speed: "2.0"
+      mode: turbo
+"#,
+        );
+
+        let expanded = expand_modules(&desc, base).unwrap();
+        let proc = expanded
+            .nodes
+            .iter()
+            .find(|n| n.id.to_string() == "m.proc")
+            .unwrap();
+        assert_eq!(proc.args.as_deref(), Some("--speed 2.0 --mode turbo"));
+    }
+
+    #[test]
+    fn expand_params_in_env_style_args_distinguishes_overlapping_keys() {
+        // `speed` and `speed_limit` overlap as prefixes. The scanner takes the
+        // maximal `[A-Za-z0-9_]` run as the key, so each token resolves to the
+        // key it names exactly -- no ordering between the params is involved.
+        // (The old implementation needed a longest-first sort here.)
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+
+        write_file(
+            base,
+            "args_module.yml",
+            r#"
+module:
+  name: with_args
+  inputs: [data]
+  outputs: [out]
+
+nodes:
+  - id: proc
+    path: proc.py
+    inputs:
+      data: _mod/data
+    outputs:
+      - out
+    args: --short $PARAM_SPEED --long $PARAM_SPEED_LIMIT
+"#,
+        );
+
+        let desc = parse_descriptor(
+            r#"
+nodes:
+  - id: src
+    path: src.py
+    outputs: [val]
+  - id: m
+    module: args_module.yml
+    inputs:
+      data: src/val
+    params:
+      speed: "2.0"
+      speed_limit: "4.5"
+"#,
+        );
+
+        let expanded = expand_modules(&desc, base).unwrap();
+        let proc = expanded
+            .nodes
+            .iter()
+            .find(|n| n.id.to_string() == "m.proc")
+            .unwrap();
+        assert_eq!(proc.args.as_deref(), Some("--short 2.0 --long 4.5"));
+    }
+
+    #[test]
+    fn substitute_params_basic_and_unknown() {
+        let params = BTreeMap::from([
+            ("speed".to_string(), "2.0".to_string()),
+            ("name".to_string(), "robot".to_string()),
+        ]);
+        assert_eq!(
+            substitute_params_in_str("--speed ${_param.speed} --name ${_param.name}", &params),
+            "--speed 2.0 --name robot"
+        );
+        // Multiple occurrences of the same key are all replaced.
+        assert_eq!(
+            substitute_params_in_str("${_param.speed}/${_param.speed}", &params),
+            "2.0/2.0"
+        );
+        // An unknown key is left verbatim, not dropped.
+        assert_eq!(
+            substitute_params_in_str("${_param.missing}", &params),
+            "${_param.missing}"
+        );
+        // A dangling prefix without a closing brace is emitted literally.
+        assert_eq!(
+            substitute_params_in_str("prefix ${_param.speed", &params),
+            "prefix ${_param.speed"
+        );
+    }
+
+    #[test]
+    fn substitute_params_env_style_requires_an_identifier_boundary() {
+        // `$PARAM_<KEY>` has no terminator, so the key must run to the end of
+        // the shell-identifier characters. A declared param that is only a
+        // *prefix* of the token must not match (#2901).
+        let params = BTreeMap::from([("speed".to_string(), "2.0".to_string())]);
+        assert_eq!(
+            substitute_params_in_str("--flag $PARAM_SPEED_LIMIT", &params),
+            "--flag $PARAM_SPEED_LIMIT"
+        );
+        // The exact token still substitutes, and a non-identifier character
+        // terminates it.
+        assert_eq!(
+            substitute_params_in_str("--flag $PARAM_SPEED --x", &params),
+            "--flag 2.0 --x"
+        );
+        assert_eq!(
+            substitute_params_in_str("$PARAM_SPEED,$PARAM_SPEED", &params),
+            "2.0,2.0"
+        );
+        // A bare `$` and an unknown token are both emitted verbatim.
+        assert_eq!(
+            substitute_params_in_str("cost $5 $PARAM_MISSING", &params),
+            "cost $5 $PARAM_MISSING"
+        );
+    }
+
+    #[test]
+    fn substitute_params_env_style_is_not_re_expanded() {
+        // A value that itself looks like a token is inserted verbatim, never
+        // re-scanned — the property the single-pass scanner exists for.
+        let params = BTreeMap::from([
+            ("a".to_string(), "$PARAM_B".to_string()),
+            ("b".to_string(), "x".to_string()),
+        ]);
+        assert_eq!(substitute_params_in_str("$PARAM_A", &params), "$PARAM_B");
+    }
+
+    #[test]
+    fn substitute_params_is_order_independent_and_non_transitive() {
+        // A parameter value that itself looks like a `${_param.…}` token must be
+        // inserted verbatim, never re-expanded — and the result must not depend
+        // on `BTreeMap` key ordering. With the old chained-`replace` approach,
+        // `a`'s value `${_param.b}` was expanded to `x` because `a` sorts first.
+        let params = BTreeMap::from([
+            ("a".to_string(), "${_param.b}".to_string()),
+            ("b".to_string(), "x".to_string()),
+        ]);
+        assert_eq!(
+            substitute_params_in_str("${_param.a}", &params),
+            "${_param.b}"
+        );
+        assert_eq!(substitute_params_in_str("${_param.b}", &params), "x");
+    }
+
+    #[test]
+    fn expand_module_node_env_propagates_to_inner_nodes() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+
+        write_file(
+            base,
+            "env_module.yml",
+            r#"
+module:
+  name: env_module
+  inputs: [data]
+  outputs: [out]
+
+nodes:
+  - id: worker
+    path: worker.py
+    env:
+      INNER_ONLY: from-inner
+      SHARED: inner
+    inputs:
+      data: _mod/data
+    outputs:
+      - out
+"#,
+        );
+
+        let desc = parse_descriptor(
+            r#"
+nodes:
+  - id: src
+    path: src.py
+    outputs: [val]
+  - id: m
+    module: env_module.yml
+    env:
+      WRAPPER_ONLY: from-wrapper
+      SHARED: wrapper
+    inputs:
+      data: src/val
+"#,
+        );
+
+        let expanded = expand_modules(&desc, base).unwrap();
+        let worker = expanded
+            .nodes
+            .iter()
+            .find(|n| n.id.to_string() == "m.worker")
+            .unwrap();
+        let env = worker.env.as_ref().unwrap();
+        assert_eq!(
+            env["INNER_ONLY"],
+            EnvValue::String("from-inner".to_string())
+        );
+        assert_eq!(
+            env["WRAPPER_ONLY"],
+            EnvValue::String("from-wrapper".to_string())
+        );
+        // The inner node's own `env` wins over the module node's, matching
+        // `merge_env` ("per-node entries override global ones") and `deploy`.
+        assert_eq!(env["SHARED"], EnvValue::String("inner".to_string()));
+    }
+
+    #[test]
+    fn expand_module_node_with_empty_env_leaves_inner_env_unset() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+
+        write_file(
+            base,
+            "empty_env_module.yml",
+            r#"
+module:
+  name: empty_env_module
+  inputs: [data]
+  outputs: [out]
+
+nodes:
+  - id: worker
+    path: worker.py
+    inputs:
+      data: _mod/data
+    outputs:
+      - out
+"#,
+        );
+
+        let desc = parse_descriptor(
+            r#"
+nodes:
+  - id: src
+    path: src.py
+    outputs: [val]
+  - id: m
+    module: empty_env_module.yml
+    env: {}
+    inputs:
+      data: src/val
+"#,
+        );
+
+        let expanded = expand_modules(&desc, base).unwrap();
+        let worker = expanded
+            .nodes
+            .iter()
+            .find(|n| n.id.to_string() == "m.worker")
+            .unwrap();
+        assert_eq!(worker.env, None);
+    }
+
+    #[test]
+    fn expand_outer_params_reach_nested_module_inner_nodes_as_env() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+
+        write_file(
+            base,
+            "inner.yml",
+            r#"
+module:
+  name: inner
+  inputs: [data]
+  outputs: [out]
+
+nodes:
+  - id: worker
+    path: worker.py
+    inputs:
+      data: _mod/data
+    outputs:
+      - out
+"#,
+        );
+
+        write_file(
+            base,
+            "outer.yml",
+            r#"
+module:
+  name: outer
+  inputs: [data]
+  outputs: [out]
+
+nodes:
+  - id: inner
+    module: inner.yml
+    inputs:
+      data: _mod/data
+"#,
+        );
+
+        let desc = parse_descriptor(
+            r#"
+nodes:
+  - id: src
+    path: src.py
+    outputs: [val]
+  - id: outer
+    module: outer.yml
+    inputs:
+      data: src/val
+    params:
+      speed: "2.0"
+"#,
+        );
+
+        let expanded = expand_modules(&desc, base).unwrap();
+        let worker = expanded
+            .nodes
+            .iter()
+            .find(|n| n.id.to_string() == "outer.inner.worker")
+            .unwrap();
+        let env = worker.env.as_ref().unwrap();
+        assert_eq!(env["PARAM_SPEED"], EnvValue::String("2.0".to_string()));
+    }
+
     // ---- Feature 5: module-level build ----
+
+    /// Regression for #3258 (defect 1): a `build:` set on the module node itself
+    /// (not the module file header) is accepted and propagates into the expanded
+    /// leaf nodes, matching the documented contract and the nested behavior.
+    #[test]
+    fn expand_top_level_module_build_propagated() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+
+        write_file(
+            base,
+            "leaf_module.yml",
+            r#"
+module:
+  name: leaf
+  inputs: [data]
+  outputs: [out]
+
+nodes:
+  - id: proc
+    path: proc.py
+    inputs:
+      data: _mod/data
+    outputs:
+      - out
+    build: python setup.py build
+"#,
+        );
+
+        let desc = parse_descriptor(
+            r#"
+nodes:
+  - id: src
+    path: src.py
+    outputs: [val]
+  - id: m
+    module: leaf_module.yml
+    build: pip install foo
+    inputs:
+      data: src/val
+"#,
+        );
+
+        let expanded = expand_modules(&desc, base).unwrap();
+        let proc = expanded
+            .nodes
+            .iter()
+            .find(|n| n.id.to_string() == "m.proc")
+            .unwrap();
+        let build = proc.build.as_deref().unwrap();
+        assert!(
+            build.starts_with("pip install foo"),
+            "the module node's own build must be prepended; got: {build}"
+        );
+        assert!(build.contains("python setup.py build"), "{build}");
+    }
+
+    /// Regression for #3258 (defect 2): a per-node runtime field that has no
+    /// meaning on a module node (here `outputs`) is rejected at expansion time
+    /// rather than silently dropped, at every nesting level.
+    #[test]
+    fn nested_module_node_rejects_disallowed_field() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+
+        write_file(
+            base,
+            "leaf_module.yml",
+            r#"
+module:
+  name: leaf
+  inputs: [x]
+  outputs: [y]
+
+nodes:
+  - id: worker
+    path: worker.py
+    inputs:
+      x: _mod/x
+    outputs:
+      - y
+"#,
+        );
+
+        // `outputs` on the nested module node is not part of the module
+        // whitelist; expansion must reject it.
+        write_file(
+            base,
+            "outer_module.yml",
+            r#"
+module:
+  name: outer
+  inputs: [x]
+  outputs: [y]
+
+nodes:
+  - id: inner
+    module: leaf_module.yml
+    inputs:
+      x: _mod/x
+    outputs:
+      - y
+"#,
+        );
+
+        let desc = parse_descriptor(
+            r#"
+nodes:
+  - id: src
+    path: src.py
+    outputs: [val]
+  - id: top
+    module: outer_module.yml
+    inputs:
+      x: src/val
+"#,
+        );
+
+        let error = format!("{:#}", expand_modules(&desc, base).unwrap_err());
+        assert!(
+            error.contains("outputs") && error.contains("Module"),
+            "nested module node with `outputs` should be rejected; got: {error}"
+        );
+    }
 
     #[test]
     fn expand_module_build_prepended() {
@@ -1493,6 +2936,222 @@ nodes:
             .find(|n| n.id.to_string() == "m.proc")
             .unwrap();
         assert_eq!(proc.build.as_deref(), Some("make all"));
+    }
+
+    /// A module-level `build:` must reach `git:`/`hub:`-sourced inner nodes,
+    /// not just `path:`-sourced ones. Module expansion runs before git/hub
+    /// source resolution, so these nodes still have `path == None` at this
+    /// point; the build must be keyed off the node kind, not `node.path`
+    /// (#3296).
+    #[test]
+    fn expand_module_build_prepended_to_git_and_hub_inner_nodes() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+
+        write_file(
+            base,
+            "git_hub_module.yml",
+            r#"
+module:
+  name: git_hub
+  outputs: [from_git, from_hub]
+
+build: pip install -r requirements.txt
+
+nodes:
+  - id: worker
+    git: https://github.com/example/worker.git
+    outputs:
+      - from_git
+    build: cargo build --release
+  - id: fetched
+    hub: example/fetched
+    outputs:
+      - from_hub
+"#,
+        );
+
+        let desc = parse_descriptor(
+            r#"
+nodes:
+  - id: m
+    module: git_hub_module.yml
+"#,
+        );
+
+        let expanded = expand_modules(&desc, base).unwrap();
+
+        // git-sourced inner node: module build prepended before its own build.
+        let worker = expanded
+            .nodes
+            .iter()
+            .find(|n| n.id.to_string() == "m.worker")
+            .unwrap();
+        assert_eq!(
+            worker.build.as_deref(),
+            Some("pip install -r requirements.txt\ncargo build --release"),
+        );
+
+        // hub-sourced inner node with no own build: module build is set.
+        let fetched = expanded
+            .nodes
+            .iter()
+            .find(|n| n.id.to_string() == "m.fetched")
+            .unwrap();
+        assert_eq!(
+            fetched.build.as_deref(),
+            Some("pip install -r requirements.txt"),
+        );
+    }
+
+    /// A module-level `build:` must not make an operator inner node
+    /// unresolvable. The expansion-only tests above stop at `expand_modules`;
+    /// the field classifier runs at *resolution*, so the regression this pins
+    /// lives in the seam between the two (#3070).
+    #[test]
+    fn module_build_keeps_operator_inner_nodes_resolvable() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+
+        write_file(
+            base,
+            "kinds_module.yml",
+            r#"
+build: pip install shared
+
+module:
+  name: kinds
+  inputs: [data]
+  outputs: [from_runtime, from_operator]
+
+nodes:
+  - id: runtime
+    operators:
+      - id: proc
+        shared-library: proc
+        inputs:
+          data: _mod/data
+        outputs:
+          - from_runtime
+
+  - id: single
+    operator:
+      python: single.py
+      inputs:
+        data: _mod/data
+      outputs:
+        - from_operator
+"#,
+        );
+
+        let desc = parse_descriptor(
+            r#"
+nodes:
+  - id: src
+    path: src.py
+    outputs: [val]
+  - id: m
+    module: kinds_module.yml
+    inputs:
+      data: src/val
+"#,
+        );
+
+        let expanded = expand_modules(&desc, base).unwrap();
+        // The module build must land in the operator configs, which is where
+        // `build/mod.rs` reads it from for runtime nodes...
+        let runtime = expanded
+            .nodes
+            .iter()
+            .find(|n| n.id.to_string() == "m.runtime")
+            .unwrap();
+        assert_eq!(
+            runtime.operators.as_ref().unwrap().operators[0]
+                .config
+                .build
+                .as_deref(),
+            Some("pip install shared"),
+        );
+        // ...and must NOT land on the node itself, where no kind but
+        // `path:`/`module:` consumes it.
+        assert_eq!(runtime.build, None);
+
+        crate::descriptor::DescriptorExt::resolve_aliases_and_set_defaults(&expanded)
+            .expect("a module-level build must not make operator nodes unresolvable");
+    }
+
+    #[test]
+    fn expand_module_build_prepended_to_operator_and_custom_builds() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+
+        write_file(
+            base,
+            "inner_kind_build_module.yml",
+            r#"
+module:
+  name: inner_kind_builds
+  inputs: [data]
+  outputs: [from_runtime, from_operator]
+
+build: pip install shared
+
+nodes:
+  - id: runtime
+    operators:
+      - id: proc
+        shared-library: libproc.so
+        build: make proc
+        inputs:
+          data: _mod/data
+        outputs:
+          - from_runtime
+
+  - id: single
+    operator:
+      python: single.py
+      build: pip install single
+      inputs:
+        data: _mod/data
+      outputs:
+        - from_operator
+"#,
+        );
+
+        let desc = parse_descriptor(
+            r#"
+nodes:
+  - id: src
+    path: src.py
+    outputs: [val]
+  - id: m
+    module: inner_kind_build_module.yml
+    inputs:
+      data: src/val
+"#,
+        );
+
+        let expanded = expand_modules(&desc, base).unwrap();
+
+        let runtime = expanded
+            .nodes
+            .iter()
+            .find(|n| n.id.to_string() == "m.runtime")
+            .unwrap();
+        let runtime_build = runtime.operators.as_ref().unwrap().operators[0]
+            .config
+            .build
+            .as_deref()
+            .unwrap();
+        assert_eq!(runtime_build, "pip install shared\nmake proc");
+
+        let single = expanded
+            .nodes
+            .iter()
+            .find(|n| n.id.to_string() == "m.single")
+            .unwrap();
+        let single_build = single.operator.as_ref().unwrap().config.build.as_deref();
+        assert_eq!(single_build, Some("pip install shared\npip install single"));
     }
 
     // ---- Feature 1: boundaries metadata ----
@@ -1600,6 +3259,87 @@ nodes:
     }
 
     #[test]
+    fn check_module_file_rejects_duplicate_header_ports() {
+        let tmp = TempDir::new().unwrap();
+
+        let duplicate_inputs = write_file(
+            tmp.path(),
+            "duplicate_inputs.yml",
+            r#"
+module:
+  name: duplicate_inputs
+  inputs: [data, data]
+  outputs: [out]
+
+nodes:
+  - id: worker
+    path: worker.py
+    inputs:
+      x: _mod/data
+    outputs:
+      - out
+"#,
+        );
+        let msg = check_module_file(&duplicate_inputs)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("duplicate"), "got: {msg}");
+        assert!(msg.contains("inputs"), "got: {msg}");
+        assert!(msg.contains("data"), "got: {msg}");
+
+        let duplicate_optional = write_file(
+            tmp.path(),
+            "duplicate_optional.yml",
+            r#"
+module:
+  name: duplicate_optional
+  inputs: [data]
+  inputs_optional: [cfg, cfg]
+  outputs: [out]
+
+nodes:
+  - id: worker
+    path: worker.py
+    inputs:
+      x: _mod/data
+    outputs:
+      - out
+"#,
+        );
+        let msg = check_module_file(&duplicate_optional)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("duplicate"), "got: {msg}");
+        assert!(msg.contains("inputs_optional"), "got: {msg}");
+        assert!(msg.contains("cfg"), "got: {msg}");
+
+        let duplicate_outputs = write_file(
+            tmp.path(),
+            "duplicate_outputs.yml",
+            r#"
+module:
+  name: duplicate_outputs
+  inputs: [data]
+  outputs: [out, out]
+
+nodes:
+  - id: worker
+    path: worker.py
+    inputs:
+      x: _mod/data
+    outputs:
+      - out
+"#,
+        );
+        let msg = check_module_file(&duplicate_outputs)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("duplicate"), "got: {msg}");
+        assert!(msg.contains("outputs"), "got: {msg}");
+        assert!(msg.contains("out"), "got: {msg}");
+    }
+
+    #[test]
     fn check_module_file_bad_output() {
         let tmp = TempDir::new().unwrap();
         let path = write_file(
@@ -1622,6 +3362,402 @@ nodes:
         let result = check_module_file(&path);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("missing"));
+    }
+
+    #[test]
+    fn check_module_file_rejects_ambiguous_declared_output() {
+        let tmp = TempDir::new().unwrap();
+        let path = write_file(
+            tmp.path(),
+            "ambiguous_output.yml",
+            r#"
+module:
+  name: ambiguous
+  inputs: []
+  outputs: [out]
+
+nodes:
+  - id: first
+    path: first.py
+    outputs:
+      - out
+  - id: second
+    path: second.py
+    outputs:
+      - out
+"#,
+        );
+
+        let result = check_module_file(&path);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("out"), "got: {msg}");
+        assert!(msg.contains("multiple"), "got: {msg}");
+        assert!(msg.contains("first"), "got: {msg}");
+        assert!(msg.contains("second"), "got: {msg}");
+    }
+
+    #[test]
+    fn check_module_file_rejects_unknown_module_header_field() {
+        let tmp = TempDir::new().unwrap();
+        let path = write_file(
+            tmp.path(),
+            "unknown_header_field.yml",
+            r#"
+module:
+  name: bad
+  inputz: [data]
+  outputs: [out]
+
+nodes:
+  - id: worker
+    path: worker.py
+    outputs:
+      - out
+"#,
+        );
+
+        let result = check_module_file(&path);
+        assert!(result.is_err());
+        let msg = format!("{:?}", result.unwrap_err());
+        assert!(msg.contains("inputz"), "got: {msg}");
+        assert!(msg.contains("unknown field"), "got: {msg}");
+    }
+
+    #[test]
+    fn check_module_file_rejects_duplicate_inner_node_ids() {
+        let tmp = TempDir::new().unwrap();
+        let path = write_file(
+            tmp.path(),
+            "duplicate_inner_nodes.yml",
+            r#"
+module:
+  name: duplicate_inner_nodes
+  inputs: []
+  outputs: [y]
+
+nodes:
+  - id: proc
+    path: a.py
+    outputs:
+      - y
+  - id: proc
+    path: b.py
+    outputs:
+      - z
+"#,
+        );
+
+        let err = check_module_file(&path).unwrap_err().to_string();
+        assert!(err.contains("duplicate node ID"), "{err}");
+        assert!(err.contains("proc"), "{err}");
+    }
+
+    #[test]
+    fn check_module_file_rejects_invalid_internal_wiring() {
+        let tmp = TempDir::new().unwrap();
+        let path = write_file(
+            tmp.path(),
+            "bad_internal_wiring.yml",
+            r#"
+module:
+  name: bad_internal_wiring
+  inputs: []
+  outputs: [y]
+
+nodes:
+  - id: preprocessor
+    path: preprocessor.py
+    outputs:
+      - cleaned
+  - id: producer
+    path: producer.py
+    inputs:
+      data: preprocessor/cleaned
+    outputs:
+      - y
+  - id: valid_consumer
+    path: valid_consumer.py
+    inputs:
+      data: producer/y
+    outputs:
+      - z
+  - id: consumer
+    path: consumer.py
+    inputs:
+      data: producer/missing
+  - id: independent
+    path: independent.py
+    outputs:
+      - side
+"#,
+        );
+
+        let err = check_module_file(&path).unwrap_err().to_string();
+        assert!(err.contains("producer/missing"), "{err}");
+    }
+
+    #[test]
+    fn check_module_file_rejects_nested_module_missing_required_input() {
+        let tmp = TempDir::new().unwrap();
+
+        write_file(
+            tmp.path(),
+            "leaf.yml",
+            r#"
+module:
+  name: leaf
+  inputs: [data]
+  outputs: [out]
+
+nodes:
+  - id: worker
+    path: worker.py
+    inputs:
+      x: _mod/data
+    outputs:
+      - out
+"#,
+        );
+
+        let path = write_file(
+            tmp.path(),
+            "outer.yml",
+            r#"
+module:
+  name: outer
+  inputs: []
+  outputs: [out]
+
+nodes:
+  - id: nested
+    module: leaf.yml
+"#,
+        );
+
+        let result = check_module_file(&path);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("leaf"), "got: {msg}");
+        assert!(msg.contains("data"), "got: {msg}");
+        assert!(msg.contains("nested"), "got: {msg}");
+    }
+
+    #[test]
+    fn check_module_file_rejects_invalid_nested_module() {
+        let tmp = TempDir::new().unwrap();
+
+        write_file(
+            tmp.path(),
+            "leaf.yml",
+            r#"
+module:
+  name: leaf
+  inputs: []
+  outputs: [out]
+
+nodes:
+  - id: worker
+    path: worker.py
+    outputs:
+      - other
+"#,
+        );
+
+        let path = write_file(
+            tmp.path(),
+            "outer.yml",
+            r#"
+module:
+  name: outer
+  inputs: []
+  outputs: [out]
+
+nodes:
+  - id: nested
+    module: leaf.yml
+"#,
+        );
+
+        let result = check_module_file(&path);
+        assert!(result.is_err());
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(msg.contains("leaf"), "got: {msg}");
+        assert!(msg.contains("out"), "got: {msg}");
+        assert!(msg.contains("no inner node produces it"), "got: {msg}");
+        // The breadcrumb must name the referencing node so a failure several
+        // levels down is findable.
+        assert!(msg.contains("nested"), "got: {msg}");
+    }
+
+    /// The `seen` set must reject a module that includes itself. Without the
+    /// `seen.insert` guard this recurses to the depth limit and reports a
+    /// misleading depth error instead of naming the cycle.
+    #[test]
+    fn check_module_file_rejects_self_referencing_module() {
+        let tmp = TempDir::new().unwrap();
+        let path = write_file(
+            tmp.path(),
+            "self.yml",
+            r#"
+module:
+  name: selfref
+  inputs: []
+  outputs: []
+
+nodes:
+  - id: me
+    module: self.yml
+"#,
+        );
+
+        let msg = format!("{:#}", check_module_file(&path).unwrap_err());
+        assert!(msg.contains("circular module reference"), "got: {msg}");
+    }
+
+    /// `seen.remove` on the success path must keep a diamond (`a -> b -> d`
+    /// and `a -> c -> d`) accepted. Drop that line and every shared nested
+    /// module starts failing as a false "circular reference".
+    #[test]
+    fn check_module_file_accepts_diamond_module_graph() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+
+        write_file(
+            base,
+            "d.yml",
+            r#"
+module:
+  name: d
+  inputs: []
+  outputs: [d_out]
+
+nodes:
+  - id: leaf
+    path: leaf.py
+    outputs:
+      - d_out
+"#,
+        );
+        for name in ["b.yml", "c.yml"] {
+            write_file(
+                base,
+                name,
+                r#"
+module:
+  name: mid
+  inputs: []
+  outputs: [d_out]
+
+nodes:
+  - id: node_d
+    module: d.yml
+"#,
+            );
+        }
+        let path = write_file(
+            base,
+            "a.yml",
+            r#"
+module:
+  name: a
+  inputs: []
+  outputs: []
+
+nodes:
+  - id: node_b
+    module: b.yml
+  - id: node_c
+    module: c.yml
+"#,
+        );
+
+        check_module_file(&path).unwrap();
+    }
+
+    #[test]
+    fn check_module_file_rejects_depth_limit() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+
+        for i in 0..=MAX_MODULE_DEPTH {
+            let next = if i < MAX_MODULE_DEPTH {
+                format!("  - id: inner\n    module: level{}_module.yml", i + 1)
+            } else {
+                "  - id: worker\n    path: worker.py\n    outputs:\n      - out".to_string()
+            };
+
+            write_file(
+                base,
+                &format!("level{i}_module.yml"),
+                &format!(
+                    r#"
+module:
+  name: level{i}
+  inputs: []
+  outputs: [out]
+
+nodes:
+{next}
+"#
+                ),
+            );
+        }
+
+        let result = check_module_file(&base.join("level0_module.yml"));
+        assert!(result.is_err());
+        // `{:#}` renders the whole context chain: the nested-module breadcrumb
+        // wraps the underlying depth-limit error.
+        assert!(format!("{:#}", result.unwrap_err()).contains("nesting exceeds depth limit"));
+    }
+
+    /// Regression test for #2851: `check_module_file` must accept a nested
+    /// module reference that points to a sibling directory inside the same
+    /// project (e.g. `../shared/base.yml`). The real expansion path
+    /// (`expand_module_node`) confines nested modules to the project root, not
+    /// to the referencing module's own directory, so such a reference is valid
+    /// and runnable -- the standalone linter must not spuriously reject it.
+    #[test]
+    fn check_module_file_accepts_cross_directory_nested_ref() {
+        let tmp = TempDir::new().unwrap();
+
+        // project/modules/shared/base.yml -- the nested module.
+        write_file(
+            tmp.path(),
+            "modules/shared/base.yml",
+            r#"
+module:
+  name: base
+  inputs: []
+  outputs: [y]
+
+nodes:
+  - id: inner
+    path: inner.py
+    outputs:
+      - y
+"#,
+        );
+
+        // project/modules/a/mod.yml -- references the sibling module via `..`.
+        let path = write_file(
+            tmp.path(),
+            "modules/a/mod.yml",
+            r#"
+module:
+  name: outer
+  inputs: []
+  outputs: [y]
+
+nodes:
+  - id: nested
+    module: ../shared/base.yml
+"#,
+        );
+
+        // Must pass: the nested reference leaves `modules/a/` but stays inside
+        // the project, exactly what real expansion accepts.
+        check_module_file(&path).unwrap();
     }
 
     // ---- Security tests ----
@@ -1664,6 +3800,323 @@ nodes:
         assert!(msg.contains("escapes"), "got: {msg}");
     }
 
+    // This test guards the fix for #3341: an in-tree module directory that is
+    // a symlink pointing outside the project root.
+    #[test]
+    fn expand_modules_accepts_symlinked_module_dir() {
+        let tmp = TempDir::new().unwrap();
+        let shared_dir = tmp.path().join("shared_modules");
+        std::fs::create_dir_all(&shared_dir).unwrap();
+        write_file(
+            &shared_dir,
+            "shared.yml",
+            r#"
+module:
+  name: shared
+  inputs: [in_val]
+  outputs: [out_val]
+
+nodes:
+  - id: worker
+    path: worker.py
+    inputs:
+      data: _mod/in_val
+    outputs:
+      - out_val
+"#,
+        );
+
+        let project_dir = tmp.path().join("project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let symlink_path = project_dir.join("modules");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&shared_dir, &symlink_path).unwrap();
+        #[cfg(windows)]
+        if let Err(e) = std::os::windows::fs::symlink_dir(&shared_dir, &symlink_path) {
+            eprintln!("skipping symlink test: {e}");
+            return;
+        }
+
+        let desc = parse_descriptor(
+            r#"
+nodes:
+  - id: m
+    module: modules/shared.yml
+    inputs:
+      in_val: source/data
+"#,
+        );
+
+        let expanded = expand_modules(&desc, &project_dir).unwrap();
+        assert_eq!(expanded.nodes.len(), 1);
+        assert_eq!(expanded.nodes[0].id.to_string(), "m.worker");
+        assert_eq!(
+            Path::new(expanded.nodes[0].path.as_ref().unwrap()),
+            Path::new("modules/worker.py")
+        );
+    }
+
+    #[test]
+    fn expand_modules_accepts_in_tree_symlink_with_dotdot() {
+        let tmp = TempDir::new().unwrap();
+        let project_dir = tmp.path().join("project");
+        let real_modules = project_dir.join("real_modules");
+        std::fs::create_dir_all(&real_modules).unwrap();
+
+        write_file(
+            &project_dir,
+            "top.yml",
+            r#"
+module:
+  name: top
+  inputs: [in_val]
+  outputs: [out_val]
+
+nodes:
+  - id: worker
+    path: worker.py
+    inputs:
+      data: _mod/in_val
+    outputs:
+      - out_val
+"#,
+        );
+
+        let symlink_path = project_dir.join("modules");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real_modules, &symlink_path).unwrap();
+        #[cfg(windows)]
+        if let Err(e) = std::os::windows::fs::symlink_dir(&real_modules, &symlink_path) {
+            eprintln!("skipping symlink test: {e}");
+            return;
+        }
+
+        // `modules/../top.yml` traverses `..` over the in-tree symlink `modules`.
+        // Lexically and physically, it resolves to `project/top.yml`, within
+        // the project directory and must be accepted.
+        let desc = parse_descriptor(
+            r#"
+nodes:
+  - id: m
+    module: modules/../top.yml
+    inputs:
+      in_val: source/data
+"#,
+        );
+
+        let expanded = expand_modules(&desc, &project_dir).unwrap();
+        assert_eq!(expanded.nodes.len(), 1);
+        assert_eq!(expanded.nodes[0].id.to_string(), "m.worker");
+        assert_eq!(
+            Path::new(expanded.nodes[0].path.as_ref().unwrap()),
+            Path::new("worker.py")
+        );
+    }
+
+    #[test]
+    fn reject_symlinked_module_dir_divergent_lexical_and_physical() {
+        let tmp = TempDir::new().unwrap();
+        let external_base = tmp.path().join("external");
+        let external_modules = external_base.join("modules");
+        let external_shared = external_base.join("shared");
+        std::fs::create_dir_all(&external_modules).unwrap();
+        std::fs::create_dir_all(&external_shared).unwrap();
+        write_file(
+            &external_shared,
+            "x.yml",
+            "module:\n  name: x\n  inputs: []\n  outputs: []\nnodes: []",
+        );
+
+        let project_dir = tmp.path().join("project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let symlink_path = project_dir.join("modules");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&external_modules, &symlink_path).unwrap();
+        #[cfg(windows)]
+        if let Err(e) = std::os::windows::fs::symlink_dir(&external_modules, &symlink_path) {
+            eprintln!("skipping symlink test: {e}");
+            return;
+        }
+
+        // Also create project/shared/x.yml so lexical resolution finds a file inside project
+        let project_shared = project_dir.join("shared");
+        std::fs::create_dir_all(&project_shared).unwrap();
+        write_file(
+            &project_shared,
+            "x.yml",
+            "module:\n  name: project_x\n  inputs: []\n  outputs: []\nnodes: []",
+        );
+
+        // `modules/../shared/x.yml`:
+        // Lexically resolves to `project/shared/x.yml`.
+        // Physically resolves to `external/shared/x.yml`.
+        // Lexical and physical resolutions diverge, so this must be rejected.
+        let desc = parse_descriptor(
+            r#"
+nodes:
+  - id: m
+    module: modules/../shared/x.yml
+"#,
+        );
+
+        let result = expand_modules(&desc, &project_dir);
+        assert!(result.is_err(), "expected error but succeeded");
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("escapes"), "got: {msg}");
+    }
+
+    #[test]
+    fn reject_symlinked_module_dir_dotdot_escape() {
+        let tmp = TempDir::new().unwrap();
+        let shared_base = tmp.path().join("shared_base");
+        let shared_dir = shared_base.join("shared_modules");
+        std::fs::create_dir_all(&shared_dir).unwrap();
+        write_file(
+            &shared_dir,
+            "shared.yml",
+            "module:\n  name: shared\n  inputs: []\n  outputs: []\nnodes: []",
+        );
+
+        // Place escape.yml outside the symlink target (in shared_base)
+        write_file(
+            &shared_base,
+            "escape.yml",
+            "module:\n  name: escape\n  inputs: []\n  outputs: []\nnodes: []",
+        );
+
+        let project_dir = tmp.path().join("project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let symlink_path = project_dir.join("modules");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&shared_dir, &symlink_path).unwrap();
+        #[cfg(windows)]
+        if let Err(e) = std::os::windows::fs::symlink_dir(&shared_dir, &symlink_path) {
+            eprintln!("skipping symlink test: {e}");
+            return;
+        }
+
+        // `modules/../escape.yml` uses a single `..`.
+        // Lexically, `project/modules/..` collapses to `project/`, which
+        // would pass a purely lexical containment check.
+        // Physically, `modules` dereferences to `shared_modules`, and `..`
+        // escapes into `shared_base/escape.yml`.
+        // This must be rejected as an escape.
+        let desc = parse_descriptor(
+            r#"
+nodes:
+  - id: m
+    module: modules/../escape.yml
+"#,
+        );
+
+        let result = expand_modules(&desc, &project_dir);
+        assert!(result.is_err(), "expected error but succeeded");
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("escapes"), "got: {msg}");
+    }
+
+    #[test]
+    fn expand_modules_accepts_dotdot_in_base_dir() {
+        let tmp = TempDir::new().unwrap();
+        let sub = tmp.path().join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let project_dir = sub.join("..").join("project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        write_file(
+            &project_dir,
+            "mod.yml",
+            r#"
+module:
+  name: inner
+  inputs: [in_val]
+  outputs: [out_val]
+
+nodes:
+  - id: worker
+    path: worker.py
+    inputs:
+      data: _mod/in_val
+    outputs:
+      - out_val
+"#,
+        );
+
+        let desc = parse_descriptor(
+            r#"
+nodes:
+  - id: m
+    module: mod.yml
+    inputs:
+      in_val: source/data
+"#,
+        );
+
+        let expanded = expand_modules(&desc, &project_dir).unwrap();
+        assert_eq!(expanded.nodes.len(), 1);
+        assert_eq!(expanded.nodes[0].id.to_string(), "m.worker");
+        assert_eq!(
+            Path::new(expanded.nodes[0].path.as_ref().unwrap()),
+            Path::new("worker.py")
+        );
+    }
+
+    /// A `git:` inner node's `path` names a file inside its clone, which is
+    /// the node's working dir at build and spawn. Re-rooting it to the module
+    /// directory made the daemon look for `<clone>/<module_dir>/<path>`.
+    #[test]
+    fn expand_keeps_git_inner_node_path_relative_to_the_clone() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+        std::fs::create_dir_all(base.join("modules")).unwrap();
+
+        write_file(
+            &base.join("modules"),
+            "git_module.yml",
+            r#"
+module:
+  name: git_module
+  outputs: [from_git, local]
+
+nodes:
+  - id: fromgit
+    git: https://github.com/example/x.git
+    path: ../bin/x
+    outputs:
+      - from_git
+  - id: sibling
+    path: worker.py
+    outputs:
+      - local
+"#,
+        );
+
+        let desc = parse_descriptor(
+            r#"
+nodes:
+  - id: m
+    module: modules/git_module.yml
+"#,
+        );
+
+        let expanded = expand_modules(&desc, base).unwrap();
+        let path_of = |id: &str| {
+            expanded
+                .nodes
+                .iter()
+                .find(|n| n.id.to_string() == id)
+                .and_then(|n| n.path.clone())
+                .unwrap()
+        };
+        assert_eq!(path_of("m.fromgit"), "../bin/x");
+        // A plain `path:` sibling is still re-rooted to the module directory.
+        assert_eq!(
+            Path::new(&path_of("m.sibling")),
+            Path::new("modules").join("worker.py")
+        );
+    }
+
     #[test]
     fn reject_inner_node_path_traversal_via_dotdot() {
         let tmp = TempDir::new().unwrap();
@@ -1691,6 +4144,105 @@ nodes:
 nodes:
   - id: m
     module: escape_node_module.yml
+"#,
+        );
+
+        let result = expand_modules(&desc, base);
+        assert!(result.is_err(), "expected error but got success");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("resolves outside the project directory"),
+            "got: {msg}"
+        );
+    }
+
+    /// A `dora/logs/<level>/<node>` input naming a sibling inside a module must
+    /// follow the sibling's prefixed id, or the daemon's exact node-id filter
+    /// matches nothing and the sink silently receives no logs.
+    #[test]
+    fn expand_prefixes_sibling_log_filter() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+
+        write_file(
+            base,
+            "logs_module.yml",
+            r#"
+module:
+  name: logs_module
+  outputs: []
+
+nodes:
+  - id: worker
+    path: worker.py
+  - id: sink
+    path: sink.py
+    inputs:
+      sibling: dora/logs/info/worker
+      external: dora/logs/warn/outside
+      all: dora/logs/info
+"#,
+        );
+
+        let desc = parse_descriptor(
+            r#"
+nodes:
+  - id: m
+    module: logs_module.yml
+  - id: outside
+    path: outside.py
+"#,
+        );
+
+        let expanded = expand_modules(&desc, base).unwrap();
+        let sink = expanded
+            .nodes
+            .iter()
+            .find(|n| n.id.to_string() == "m.sink")
+            .unwrap();
+        let filter_of = |input: &str| match &sink.inputs[&DataId::from(input.to_string())].mapping {
+            InputMapping::Logs(filter) => filter.clone(),
+            other => panic!("expected a logs mapping, got {other:?}"),
+        };
+
+        let sibling = filter_of("sibling");
+        assert_eq!(sibling.node_filter.unwrap().to_string(), "m.worker");
+        assert!(sibling.min_level.is_some(), "level must be preserved");
+        // A node outside the module and an unfiltered subscription are left as is.
+        assert_eq!(
+            filter_of("external").node_filter.unwrap().to_string(),
+            "outside"
+        );
+        assert!(filter_of("all").node_filter.is_none());
+    }
+
+    #[test]
+    fn reject_inner_operator_source_path_traversal_via_dotdot() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+
+        write_file(
+            base,
+            "escape_operator_module.yml",
+            r#"
+module:
+  name: escape_operator
+  inputs: []
+  outputs: []
+
+nodes:
+  - id: runtime
+    operators:
+      - id: evil
+        shared-library: ../../etc/evil-operator
+"#,
+        );
+
+        let desc = parse_descriptor(
+            r#"
+nodes:
+  - id: m
+    module: escape_operator_module.yml
 "#,
         );
 
@@ -1744,6 +4296,52 @@ nodes:
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("invalid param key"), "got: {msg}");
+    }
+
+    #[test]
+    fn reject_case_colliding_param_keys() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+
+        write_file(
+            base,
+            "param_mod.yml",
+            r#"
+module:
+  name: p
+  inputs: [x]
+  outputs: [y]
+
+nodes:
+  - id: n
+    path: n.py
+    inputs:
+      x: _mod/x
+    outputs: [y]
+"#,
+        );
+
+        // `mode` and `Mode` are both valid keys but both map to `PARAM_MODE`,
+        // so one would silently overwrite the other in the node env.
+        let desc = parse_descriptor(
+            r#"
+nodes:
+  - id: src
+    path: src.py
+    outputs: [v]
+  - id: m
+    module: param_mod.yml
+    inputs:
+      x: src/v
+    params:
+      mode: safe
+      Mode: turbo
+"#,
+        );
+        let result = expand_modules(&desc, base);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("PARAM_MODE"), "got: {msg}");
     }
 
     #[test]
@@ -1905,5 +4503,583 @@ nodes:
             env["PARAM_SPEED"],
             EnvValue::String("caller_value".to_string())
         );
+    }
+
+    /// Regression test for #2441: operator (runtime) inner nodes wire their
+    /// inputs through `config.inputs`, not the node-level `inputs` map, so
+    /// `_mod/` and sibling references inside an operator input must be
+    /// rewritten the same way as node-level inputs.
+    #[test]
+    fn expand_rewrites_operator_inputs() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+
+        write_file(
+            base,
+            "runtime_module.yml",
+            r#"
+module:
+  name: rt
+  inputs: [data]
+
+nodes:
+  - id: stage_a
+    path: a.py
+    outputs: [aux]
+
+  - id: runtime
+    operators:
+      - id: proc
+        shared-library: proc.so
+        inputs:
+          x: _mod/data
+          y: stage_a/aux
+        outputs:
+          - result
+"#,
+        );
+
+        let desc = parse_descriptor(
+            r#"
+nodes:
+  - id: src
+    path: src.py
+    outputs: [val]
+  - id: m
+    module: runtime_module.yml
+    inputs:
+      data: src/val
+"#,
+        );
+
+        let expanded = expand_modules(&desc, base).unwrap();
+
+        let runtime = expanded
+            .nodes
+            .iter()
+            .find(|n| n.id.to_string() == "m.runtime")
+            .unwrap();
+        let proc = runtime
+            .operators
+            .as_ref()
+            .unwrap()
+            .operators
+            .iter()
+            .find(|op| op.id.to_string() == "proc")
+            .unwrap();
+
+        let x = &proc.config.inputs[&DataId::from("x".to_string())];
+        match &x.mapping {
+            InputMapping::User(m) => {
+                assert_eq!(m.source.to_string(), "src");
+                assert_eq!(m.output.to_string(), "val");
+            }
+            _ => panic!("expected user mapping"),
+        }
+
+        let y = &proc.config.inputs[&DataId::from("y".to_string())];
+        match &y.mapping {
+            InputMapping::User(m) => {
+                assert_eq!(m.source.to_string(), "m.stage_a");
+                assert_eq!(m.output.to_string(), "aux");
+            }
+            _ => panic!("expected user mapping"),
+        }
+    }
+
+    /// Regression test for #2441: `check_module_file` must catch an invalid
+    /// `_mod/` reference inside an operator input, not just node-level inputs.
+    #[test]
+    fn check_module_file_rejects_invalid_mod_ref_in_operator_input() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+
+        let path = write_file(
+            base,
+            "bad_operator_module.yml",
+            r#"
+module:
+  name: bad
+  inputs: [data]
+  outputs: [result]
+
+nodes:
+  - id: runtime
+    operators:
+      - id: proc
+        shared-library: proc.so
+        inputs:
+          x: _mod/nonexistent
+        outputs:
+          - result
+"#,
+        );
+
+        let err = check_module_file(&path).unwrap_err();
+        assert!(err.to_string().contains("_mod/nonexistent"));
+    }
+
+    #[test]
+    fn expand_resolves_inner_operator_and_node_sources_relative_to_module_file() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+
+        write_file(
+            base,
+            "modules/nested/source_paths.yml",
+            r#"
+module:
+  name: source_paths
+  inputs: [data]
+  outputs: [from_runtime, from_operator, from_path]
+
+nodes:
+  - id: runtime
+    operators:
+      - id: proc
+        shared-library: libproc.so
+        inputs:
+          x: _mod/data
+        outputs:
+          - from_runtime
+
+  - id: single
+    operator:
+      python: single.py
+      inputs:
+        x: _mod/data
+      outputs:
+        - from_operator
+
+  - id: runner
+    path: runner.py
+    inputs:
+      x: _mod/data
+    outputs:
+      - from_path
+"#,
+        );
+
+        let desc = parse_descriptor(
+            r#"
+nodes:
+  - id: src
+    path: src.py
+    outputs: [val]
+  - id: m
+    module: modules/nested/source_paths.yml
+    inputs:
+      data: src/val
+"#,
+        );
+
+        let expanded = expand_modules(&desc, base).unwrap();
+        let runtime = expanded
+            .nodes
+            .iter()
+            .find(|n| n.id.to_string() == "m.runtime")
+            .unwrap();
+        let proc_source = &runtime
+            .operators
+            .as_ref()
+            .unwrap()
+            .operators
+            .first()
+            .unwrap()
+            .config
+            .source;
+        // `normalize_path` builds the rewritten path with `MAIN_SEPARATOR`,
+        // so on Windows these come back as `modules\\nested\\...`. Compare on a
+        // normalized form -- CI runs this suite on windows-latest nightly.
+        assert!(
+            matches!(proc_source, dora_message::descriptor::OperatorSource::SharedLibrary(path) if path.replace('\\', "/") == "modules/nested/libproc.so"),
+            "unexpected runtime operator source: {proc_source:?}"
+        );
+
+        let single = expanded
+            .nodes
+            .iter()
+            .find(|n| n.id.to_string() == "m.single")
+            .unwrap();
+        let single_source = &single.operator.as_ref().unwrap().config.source;
+        assert!(
+            matches!(single_source, dora_message::descriptor::OperatorSource::Python(source) if source.source.replace('\\', "/") == "modules/nested/single.py"),
+            "unexpected single operator source: {single_source:?}"
+        );
+
+        let runner = expanded
+            .nodes
+            .iter()
+            .find(|n| n.id.to_string() == "m.runner")
+            .unwrap();
+        assert_eq!(
+            runner
+                .path
+                .as_deref()
+                .map(|p| p.replace('\\', "/"))
+                .as_deref(),
+            Some("modules/nested/runner.py")
+        );
+    }
+
+    /// `path: dynamic` is a sentinel, not a file: the daemon matches it
+    /// verbatim to decide a node is externally spawned. Module expansion must
+    /// leave it alone, or a module in a subdirectory turns it into
+    /// `modules/nested/dynamic` and the node is spawned as a binary instead.
+    #[test]
+    fn expand_preserves_dynamic_source_sentinel() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+
+        write_file(
+            base,
+            "modules/nested/dynamic_source.yml",
+            r#"
+module:
+  name: dynamic_source
+  inputs: [data]
+  outputs: [result]
+
+nodes:
+  - id: dyn
+    path: dynamic
+    inputs:
+      x: _mod/data
+    outputs:
+      - result
+"#,
+        );
+
+        let desc = parse_descriptor(
+            r#"
+nodes:
+  - id: src
+    path: src.py
+    outputs: [val]
+  - id: m
+    module: modules/nested/dynamic_source.yml
+    inputs:
+      data: src/val
+"#,
+        );
+
+        let expanded = expand_modules(&desc, base).unwrap();
+        let dyn_node = expanded
+            .nodes
+            .iter()
+            .find(|n| n.id.to_string() == "m.dyn")
+            .unwrap();
+
+        assert_eq!(dyn_node.path.as_deref(), Some("dynamic"));
+    }
+
+    /// Same as the `dynamic` case: `path: shell` tells the daemon to run
+    /// `args` through a shell, so expansion must not rewrite it into a path.
+    #[test]
+    fn expand_preserves_shell_source_sentinel() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+
+        write_file(
+            base,
+            "modules/nested/shell_source.yml",
+            r#"
+module:
+  name: shell_source
+  inputs: [data]
+  outputs: [result]
+
+nodes:
+  - id: shell
+    path: shell
+    args: echo hi
+    inputs:
+      x: _mod/data
+    outputs:
+      - result
+"#,
+        );
+
+        let desc = parse_descriptor(
+            r#"
+nodes:
+  - id: src
+    path: src.py
+    outputs: [val]
+  - id: m
+    module: modules/nested/shell_source.yml
+    inputs:
+      data: src/val
+"#,
+        );
+
+        let expanded = expand_modules(&desc, base).unwrap();
+        let shell_node = expanded
+            .nodes
+            .iter()
+            .find(|n| n.id.to_string() == "m.shell")
+            .unwrap();
+
+        assert_eq!(shell_node.path.as_deref(), Some("shell"));
+    }
+
+    /// Expand a dataflow whose single module node `m` re-exports `result`, and
+    /// return the mapping the downstream `sink` node ends up with. Also asserts
+    /// that the expanded dataflow passes wiring validation, which is what
+    /// catches a producer reference that is syntactically plausible but wrong
+    /// for the producer's node kind (e.g. a missing operator segment).
+    fn expand_and_resolve_sink_input(base: &Path) -> UserInputMapping {
+        let desc = parse_descriptor(
+            r#"
+nodes:
+  - id: src
+    path: src.py
+    outputs: [val]
+  - id: m
+    module: mod.yml
+    inputs:
+      data: src/val
+  - id: sink
+    path: sink.py
+    inputs:
+      r: m/result
+"#,
+        );
+
+        let expanded = expand_modules(&desc, base).unwrap();
+        crate::descriptor::validate::check_wiring(&expanded).unwrap();
+
+        let sink = expanded
+            .nodes
+            .iter()
+            .find(|n| n.id.to_string() == "sink")
+            .unwrap();
+        match &sink.inputs[&DataId::from("r".to_string())].mapping {
+            InputMapping::User(m) => m.clone(),
+            _ => panic!("expected user mapping"),
+        }
+    }
+
+    /// Regression test for #2817: a module output produced by an operator of a
+    /// multi-operator runtime node must resolve. Consumers of a runtime node
+    /// address outputs as `<node>/<operator>/<output>`, so the rewritten
+    /// reference has to keep the `proc/` segment.
+    #[test]
+    fn expand_resolves_operator_produced_module_output() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+
+        write_file(
+            base,
+            "mod.yml",
+            r#"
+module:
+  name: rt
+  inputs: [data]
+  outputs: [result]
+
+nodes:
+  - id: runtime
+    operators:
+      - id: proc
+        shared-library: proc.so
+        inputs:
+          x: _mod/data
+        outputs:
+          - result
+"#,
+        );
+
+        let mapping = expand_and_resolve_sink_input(base);
+        assert_eq!(mapping.source.to_string(), "m.runtime");
+        assert_eq!(mapping.output.to_string(), "proc/result");
+    }
+
+    /// Regression test for #2817: same for a single `operator:` node. Here the
+    /// output stays bare — `resolve_aliases_and_set_defaults` injects the `op/`
+    /// prefix afterwards, so adding it during expansion would double it up.
+    #[test]
+    fn expand_resolves_single_operator_produced_module_output() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+
+        write_file(
+            base,
+            "mod.yml",
+            r#"
+module:
+  name: rt
+  inputs: [data]
+  outputs: [result]
+
+nodes:
+  - id: runtime
+    operator:
+      shared-library: proc.so
+      inputs:
+        x: _mod/data
+      outputs:
+        - result
+"#,
+        );
+
+        let mapping = expand_and_resolve_sink_input(base);
+        assert_eq!(mapping.source.to_string(), "m.runtime");
+        assert_eq!(mapping.output.to_string(), "result");
+    }
+
+    #[test]
+    fn expand_rejects_ambiguous_module_output() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+
+        write_file(
+            base,
+            "mod.yml",
+            r#"
+module:
+  name: ambiguous
+  inputs: []
+  outputs: [out]
+
+nodes:
+  - id: first
+    path: first.py
+    outputs:
+      - out
+  - id: second
+    path: second.py
+    outputs:
+      - out
+"#,
+        );
+
+        let desc = parse_descriptor(
+            r#"
+nodes:
+  - id: m
+    module: mod.yml
+  - id: sink
+    path: sink.py
+    inputs:
+      value: m/out
+"#,
+        );
+
+        let result = expand_modules(&desc, base);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("out"), "got: {msg}");
+        assert!(msg.contains("multiple"), "got: {msg}");
+        assert!(msg.contains("m.first"), "got: {msg}");
+        assert!(msg.contains("m.second"), "got: {msg}");
+    }
+
+    #[test]
+    fn expand_rejects_nested_module_private_output_export() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+
+        write_file(
+            base,
+            "leaf.yml",
+            r#"
+module:
+  name: leaf
+  inputs: []
+  outputs: [public]
+
+nodes:
+  - id: worker
+    path: worker.py
+    outputs:
+      - public
+      - private
+"#,
+        );
+
+        write_file(
+            base,
+            "outer.yml",
+            r#"
+module:
+  name: outer
+  inputs: []
+  outputs: [private]
+
+nodes:
+  - id: nested
+    module: leaf.yml
+"#,
+        );
+
+        let desc = parse_descriptor(
+            r#"
+nodes:
+  - id: m
+    module: outer.yml
+  - id: sink
+    path: sink.py
+    inputs:
+      value: m/private
+"#,
+        );
+
+        let result = expand_modules(&desc, base);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("private"), "got: {msg}");
+        assert!(msg.contains("no inner node produces it"), "got: {msg}");
+    }
+
+    /// Regression test for #2817: `check_module_file` must accept a declared
+    /// output produced by an operator inner node, and still reject one nothing
+    /// produces.
+    #[test]
+    fn check_module_file_accepts_operator_produced_outputs() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+
+        let path = write_file(
+            base,
+            "mixed_module.yml",
+            r#"
+module:
+  name: mixed
+  inputs: [data]
+  outputs: [from_operator]
+
+nodes:
+  - id: runtime
+    operators:
+      - id: proc
+        shared-library: proc.so
+        inputs:
+          x: _mod/data
+        outputs:
+          - from_operator
+"#,
+        );
+        check_module_file(&path).unwrap();
+
+        let missing = write_file(
+            base,
+            "missing_module.yml",
+            r#"
+module:
+  name: missing
+  outputs: [nobody_produces_this]
+
+nodes:
+  - id: runtime
+    operators:
+      - id: proc
+        shared-library: proc.so
+        outputs:
+          - something_else
+"#,
+        );
+        let err = check_module_file(&missing).unwrap_err().to_string();
+        assert!(err.contains("no inner node produces it"), "{err}");
     }
 }

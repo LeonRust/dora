@@ -40,8 +40,49 @@ nodes:
 | `strict_types` | bool | `false` | Treat type warnings as errors in `validate` and `build` |
 | `type_rules` | list | `[]` | User-defined type compatibility rules (see [Type Annotations](types.md#user-defined-compatibility-rules)) |
 | `health_check_interval` | float | `5.0` | Seconds between daemon health check sweeps. For each node with `health_check_timeout` set, the daemon checks whether the node has communicated within its timeout; if not, the node is killed and its `restart_policy` is evaluated |
-| `_unstable_deploy` | object | -- | Root-level deployment config (see [Deployment](#deployment)) |
-| `_unstable_debug` | object | -- | Debug options (see [Debug](#debug)) |
+| `exit_when_nodes_finish` | bool | `false` | Finish the dataflow once every node has, treating `dora/timer/...` inputs as a clock rather than as work. A timer input has no upstream node, so it never closes: by default a node consuming one is never told its inputs are done and the graph cannot end on its own. Overridden by `--exit-when-nodes-finish[=BOOL]` on `dora run` and `dora start` (see [Completion](#completion)) |
+| `deploy` | object | -- | Root-level deployment config (see [Deployment](#deployment)) |
+| `debug` | object | -- | Debug options (see [Debug](#debug)) |
+
+## Completion
+
+By default a dataflow ends when every node has exited. A node is told its
+inputs are closed only when *all* of them are, and a `dora/timer/...`
+input never closes -- it has no upstream node that could finish it. So a
+graph in which any node consumes a timer cannot end on its own, even
+after every node doing real work has exited:
+
+```yaml
+nodes:
+  - id: worker
+    path: ./worker
+    inputs:
+      data: producer/out
+      tick: dora/timer/millis/100   # never closes
+```
+
+Set `exit_when_nodes_finish` to make a node finish once its **data**
+inputs have closed, with the timer treated as a clock rather than as work:
+
+```yaml
+exit_when_nodes_finish: true
+```
+
+Off by default, and usually only wanted for batch-style runs: for a
+long-lived dataflow the timer is precisely what keeps it alive, and such
+a dataflow is normally ended with `dora stop`.
+
+Nodes with no data inputs at all -- timer-only sources, or nodes with no
+inputs -- are unaffected. They have no dependency that could finish, so
+they are treated as sources and are never told to stop.
+
+The command line overrides this field in either direction:
+
+```bash
+dora run flow.yml --exit-when-nodes-finish          # force on
+dora start flow.yml --exit-when-nodes-finish=false  # force off
+dora start flow.yml                                 # the YAML decides
+```
 
 ## Node Configuration
 
@@ -124,6 +165,28 @@ inputs:
 | `queue_size` | integer | `10` | Input buffer size |
 | `queue_policy` | string | `drop_oldest` | `drop_oldest`: drops oldest message when full. `backpressure`: buffers up to 10x `queue_size` without dropping (drops with ERROR log at hard cap) |
 | `input_timeout` | float | -- | Circuit breaker timeout in seconds. If no message arrives within this period, the daemon closes the input and the node receives an `InputClosed` event for graceful degradation |
+
+A `backpressure` input keeps its producer's output on the daemon path instead
+of the direct zenoh path. The direct path's callback drops at the receiver's
+shared ingress channel when that channel is full, so a timer or a busier input
+can discard the message before the per-input policy ever applies; the daemon
+path feeds the same channel with a blocking send, and when the receiver's
+per-node channel (1000 events) is full as well, the daemon holds the producer's
+send until there is room, so the producer's `send_output` blocks instead of the
+message being dropped. Two cases still drop, each logged and counted: a
+producer on another machine cannot be held, so a message forwarded across
+daemons to a full receiver is dropped; and a receiver that frees no room at all
+for 60 seconds (wedged, or blocked on its own producer in a backpressure cycle)
+stops holding the producer, which then loses that message, and every further
+message to that receiver's full channel is dropped the same way, without
+another 60-second hold, until the receiver takes an event again. The routing applies
+to the producer's entire output, so every consumer of
+that output leaves the zero-copy path, and the daemon path carries the 64 MiB
+per-message limit. A producer learns its routing when it starts, so
+`dora node add` and `dora node replace` refuse a `backpressure` input whose
+producer is already running with that output on the direct path. `dora replay`
+sets `backpressure` on every input without a policy, so replay dataflows run
+entirely on the daemon path. The scheduler's documented hard cap still applies.
 
 #### Built-in Timers
 
@@ -233,6 +296,18 @@ env:
 
 Environment variables apply to both `build` commands and node execution. Values support `$VAR` expansion syntax.
 
+Some names are reserved and are dropped (with a warning in the daemon log) when set on a node:
+
+| Reserved | Why |
+|----------|-----|
+| `DORA_NODE_CONFIG`, `DORA_RUNTIME_CONFIG` | The daemon's own handle to the node — dataflow id, node id, and how to reach the daemon |
+| `DORA_ZENOH_LISTEN`, `DORA_ZENOH_CONNECT`, `DORA_ZENOH_MULTICAST`, `ZENOH_CONFIG` | Node-to-node wiring. Overriding these produces a dataflow that starts cleanly and then exchanges nothing. Set `ZENOH_CONFIG` in the daemon's own environment instead — nodes inherit it |
+| `DORA_RUN_PARENT_PID` | Names the process whose death ends the node. `dora run` sets it so a hard-killed CLI cannot strand nodes; a descriptor-supplied value would be an arbitrary self-destruct trigger |
+| `LD_PRELOAD`, `LD_AUDIT`, `LD_LIBRARY_PATH`, `DYLD_INSERT_LIBRARIES`, `DYLD_LIBRARY_PATH` | Loader hijacking |
+| `DORA_AUTH_TOKEN`, `DORA_ALLOW_SHELL_NODES` | Daemon-level security settings |
+
+Names that are empty or contain `=`, whitespace, or NUL are rejected as well.
+
 ### Logging
 
 | Field | Type | Default | Description |
@@ -272,7 +347,8 @@ For a complete guide to all logging features, see [Logging](logging.md).
 | `restart_delay` | float | -- | Initial backoff in seconds. Doubles each attempt |
 | `max_restart_delay` | float | -- | Cap for exponential backoff |
 | `restart_window` | float | -- | Time window for counting restarts. The counter resets after this many seconds since the first restart in the current window. Enables "N restarts per M seconds" semantics with `max_restarts` |
-| `health_check_timeout` | float | -- | If the node does not communicate with the daemon (send outputs, subscribe, etc.) for this many seconds, the daemon kills the process and evaluates the `restart_policy` |
+| `health_check_timeout` | float | -- | Once the node has connected (subscribed to events), if it then does not communicate with the daemon (send outputs, acknowledge ticks, etc.) for this many seconds, the daemon kills the process and evaluates the `restart_policy`. Covers **post-connection** liveness only (see `startup_timeout` to bound startup time) |
+| `startup_timeout` | float | -- | If the node process fails to connect (subscribe to events) within this many seconds after process spawn, the daemon kills the process and evaluates the `restart_policy`. Bounds startup/initialization time. Evaluated on each `health_check_interval` tick (default 5s) |
 
 Restart policies:
 
@@ -326,18 +402,18 @@ The daemon applies `sched_setaffinity` before exec. Core indices must be less th
 
 ### Deployment
 
-Assign nodes to specific machines using `_unstable_deploy`:
+Assign nodes to specific machines using `deploy`:
 
 ```yaml
 - id: camera-driver
-  _unstable_deploy:
+  deploy:
     machine: robot-arm
   path: ./target/debug/camera
   outputs:
     - frames
 
 - id: ml-inference
-  _unstable_deploy:
+  deploy:
     machine: gpu-server
     labels:
       gpu: "true"
@@ -375,13 +451,14 @@ The `id` field is optional for single operators (defaults to the node `id`):
       - bbox
 ```
 
-### Multiple Operators
+### The `operators` List
 
-Each operator in `operators` **requires** a unique `id`:
+`operators` is the list form of `operator`. Its entry **requires** an `id`, which becomes part of every reference to its outputs (`<node>/<operator>/<output>`).
 
+A runtime node holds exactly one operator: the operator runtime refuses to start with zero or several, so validation rejects such a node. To run several operators, give each one its own node:
 
 ```yaml
-- id: runtime-node
+- id: preprocess
   operators:
     - id: preprocessor
       shared-library: ../../target/debug/libpreprocess
@@ -389,10 +466,12 @@ Each operator in `operators` **requires** a unique `id`:
         raw: sensor/data
       outputs:
         - processed
+- id: analyze
+  operators:
     - id: analyzer
       shared-library: ../../target/debug/libanalyze
       inputs:
-        data: runtime-node/preprocessor/processed
+        data: preprocess/preprocessor/processed
       outputs:
         - result
 ```
@@ -497,7 +576,7 @@ QoS can be set at the bridge level (applies to all topics) or per-topic:
 ## Debug
 
 ```yaml
-_unstable_debug:
+debug:
   enable_debug_inspection: true
 ```
 
@@ -519,7 +598,7 @@ See [Communication Patterns](../../../docs/patterns.md) for details and examples
 ```yaml
 health_check_interval: 10.0
 
-_unstable_debug:
+debug:
   enable_debug_inspection: true
 
 nodes:

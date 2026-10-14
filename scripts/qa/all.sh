@@ -5,32 +5,43 @@
 # Designed for local-first execution: same script runs locally and in CI.
 #
 # Modes (increasing thoroughness):
-#   --fast            ~1 min     pre-commit sanity (fmt, clippy, audit, unwrap, typos)
+#   --fast            ~1 min     pre-commit sanity (lockfile, fmt, clippy, audit,
+#                                unwrap, secret-files, typos, publish-graph,
+#                                package-includes, breaking-changes,
+#                                ci-reporting)
 #   --full            ~5-10 min  pre-push (fast + tests + coverage + optional adversarial)
 #   --deep            ~15 min    target Tier 1 gate, stronger than today's CI
-#                                (full + mutants on diff + semver; see strategy doc §5 for why the
+#                                (full + mutants on diff + breaking-changes; see strategy doc §5 for why the
 #                                extras are laptop-only)
 #   --tier1                      back-compat alias for --deep
 #   --nightly         ~3-4 hours   Full parity with .github/workflows/nightly.yml
 #                                (deep + proptest@1000 + miri + example-smoke +
 #                                hub-smoke + ci-nightly-jobs). nightly.yml has
-#                                19 test jobs: example-smoke covers 4
+#                                27 test jobs (source of truth; see CLAUDE.md
+#                                "Nightly CI"): example-smoke covers 4
 #                                (smoke-suite, log-sinks, service-action,
 #                                streaming); hub-smoke covers 1 (the Hub e2e);
-#                                ci-nightly-jobs.sh drives the 14
-#                                remaining with platform-aware dispatch
-#                                (record-replay, cluster-smoke, topic-and-top-smoke,
+#                                ci-nightly-jobs.sh drives 21 more
+#                                with platform-aware dispatch
+#                                (record-replay, cluster-smoke, cluster-e2e [Linux],
+#                                cluster-record-replay [Linux], topic-and-top-smoke,
 #                                cpu-affinity-smoke [Linux], redb-backend-smoke,
 #                                daemon-reconnect-smoke [Linux],
-#                                state-reconstruction-smoke, test-cross-platform,
-#                                examples, cli-tests, bench-example, cross-check,
-#                                ros2-bridge [Linux+ROS2], msrv). Green local
+#                                state-reconstruction-smoke,
+#                                multi-daemon-late-subscriber [Linux],
+#                                test-cross-platform, examples, cli-tests
+#                                (+cli-tests-python), bench-example, cross-check,
+#                                ros2-bridge [Linux], ros2-zenoh-humble,
+#                                ros2-zenoh-kilted, msrv, kani-proofs); wheel-smoke
+#                                has no local driver (needs maturin plus two
+#                                interpreters -- build the wheels by hand if
+#                                you need it). Green local
 #                                qa-nightly on platform X predicts a green CI
 #                                nightly for platform X's jobs.
 #                                Requires BOTH `uv` AND Python 3.12 (preflighted
 #                                with specific install hints; matches GHA's
 #                                actions/setup-python@3.12 + uv setup).
-#   --release-gate               Tier 3 automatable (deep + semver; audit+dogfood are human gates)
+#   --release-gate               Tier 3 automatable (deep + breaking-changes; audit+dogfood are human gates)
 #   --mutation-audit  ~10-18 hrs full-repo cargo-mutants across 6 critical crates
 #                                (1679+ mutants). Deliberate test-quality audit, not every nightly.
 #
@@ -39,6 +50,10 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."
+
+# shellcheck source=../cargo-target-dir.sh
+source scripts/cargo-target-dir.sh
+TARGET_DIR="$(cargo_target_dir "$PWD")"
 
 MODE="${1:---fast}"
 FAILED=()
@@ -97,11 +112,20 @@ print_overview() {
 ============================================================
 $header
 Will run:
-  1. fmt            -- cargo fmt --all -- --check
-  2. clippy         -- cargo clippy --all -- -D warnings (excluding Python)
-  3. audit          -- cargo-audit + cargo-deny on the dependency tree
-  4. unwrap-budget  -- count production .unwrap() / .expect( regressions
-  5. typos          -- spell-check against _typos.toml allowlist
+   1. lockfile         -- Cargo.lock satisfies every manifest (--locked builds)
+   2. fmt              -- cargo fmt --all -- --check
+   3. clippy           -- cargo clippy --all --all-targets -- -D warnings
+                          (excluding Python)
+   4. audit            -- cargo-audit + cargo-deny on the dependency tree
+   5. unwrap-budget    -- count production .unwrap() / .expect( regressions
+   6. secret-files     -- no credential-shaped filenames tracked by git
+   7. typos            -- spell-check against _typos.toml allowlist
+   8. publish-graph    -- crates.io publish order / no unpublished deps
+   9. package-includes -- include_str! targets ship with their crate
+  10. breaking-changes -- 1.x frozen surfaces vs the last release tag
+                          (C header, cxx bridge, YAML schema, wire format,
+                           CLI snapshot, Python floor; no build)
+  11. ci-reporting     -- nightly.yml failure-reporting wiring (no job unmonitored)
 ============================================================
 EOF
       ;;
@@ -111,10 +135,13 @@ EOF
 ============================================================
 $header
 Will run:
-  1-5. everything from qa-fast                  (fmt/clippy/audit/unwrap/typos)
-  6.   test         -- cargo test --all         (workspace test suite)
-  7.   coverage     -- cargo llvm-cov           (writes lcov.info)
-  8.   adversarial  -- codex/claude review      (optional; skipped if unavailable)
+  1-11. everything from qa-fast                 (lockfile/fmt/clippy/audit/
+                                                 unwrap/secret-files/typos/
+                                                 publish-graph/package-includes/
+                                                 breaking-changes/ci-reporting)
+  12.  test         -- cargo test --all         (workspace test suite)
+  13.  coverage     -- cargo llvm-cov           (writes lcov.info)
+  14.  adversarial  -- codex/claude review      (optional; skipped if unavailable)
 ============================================================
 EOF
       ;;
@@ -124,18 +151,22 @@ EOF
 ============================================================
 $header
 Today's CI PR gate only runs a subset of this: fmt, clippy, typos,
-audit, unwrap-budget, and the workspace test suite. qa-deep adds the
-planned Tier 1 extras (see docs/plan-agentic-qa-strategy.md §5) that
-are kept laptop-only today because they're too slow for every PR:
-coverage, adversarial review, diff-scoped mutation testing, semver.
+audit, unwrap-budget, secret-files, publish-graph, package-includes,
+lockfile, ci-reporting, and the workspace test suite.
+qa-deep adds the planned Tier 1 extras (see
+docs/plan-agentic-qa-strategy.md §5) that are kept laptop-only today
+because they're too slow for every PR: coverage, adversarial review,
+diff-scoped mutation testing, and the compile half of the
+compatibility gate.
 
 Will run:
-  1-5.  everything from qa-fast                 (in CI today)
-  6.    test         -- cargo test --all        (in CI today)
-  7.    coverage     -- cargo llvm-cov          (NOT in CI; laptop-only)
-  8.    adversarial  -- codex/claude review     (NOT in CI; skipped w/o tools)
-  9.    mutants      -- cargo-mutants on diff   (NOT in CI; laptop-only)
-  10.   semver       -- cargo-semver-checks     (NOT in CI; pre-release only)
+  1-11. everything from qa-fast                 (in CI today)
+  12.   test         -- cargo test --all        (in CI today)
+  13.   coverage     -- cargo llvm-cov          (NOT in CI; laptop-only)
+  14.   adversarial  -- codex/claude review     (NOT in CI; skipped w/o tools)
+  15.   mutants      -- cargo-mutants on diff   (NOT in CI; laptop-only)
+  16.   breaking-changes -- cargo-semver-checks + snapshot freshness
+                       (the no-compile half already ran in step 10)
 ============================================================
 EOF
       ;;
@@ -145,13 +176,13 @@ EOF
 ============================================================
 $header
 For overnight runs on a powerful machine. Will run:
-  1-5.  everything from qa-fast
-  6-8.  everything from qa-full                 (test, coverage, adversarial)
-  9.    mutants (diff-scoped)                   -- same as qa-deep
-  10.   semver                                  -- cargo-semver-checks vs last tag
-  11.   proptest @ 1000 cases per property      (vs 50 cases in Tier 1)
-  12.   miri                                    -- undefined-behavior check (SKIP if cargo +nightly miri missing)
-  13.   example-smoke                           -- tests/example-smoke.rs (52 tests;
+  1-11.  everything from qa-fast
+  12-14. everything from qa-full                (test, coverage, adversarial)
+  15.    mutants (diff-scoped)                  -- same as qa-deep
+  16.    breaking-changes                       -- cargo-semver-checks + snapshot freshness
+  17.    proptest @ 1000 cases per property     (vs 50 cases in Tier 1)
+  18.    miri                                   -- undefined-behavior check (SKIP if cargo +nightly miri missing)
+  19.    example-smoke                          -- tests/example-smoke.rs (52 tests;
                                                    covers GHA smoke-suite + log-sinks
                                                    + service-action + streaming).
                                                    Runs inside a scratch uv venv that
@@ -159,25 +190,30 @@ For overnight runs on a powerful machine. Will run:
                                                    matching the GHA Python setup exactly
                                                    (so workspace Python bindings are used,
                                                    NOT PyPI). Requires uv.
-  14.   hub-smoke                              -- tests/hub-smoke.rs -- the Hub
+  20.   hub-smoke                              -- tests/hub-smoke.rs -- the Hub
                                                    e2e (publish / build / run /
                                                    yank / outdated / --hub-override
                                                    / binary / identity). Hermetic
                                                    (local git fixture, no network),
                                                    Rust-only -- no venv. Runs
                                                    regardless of the uv/3.12 setup.
-  15.   ci-nightly-jobs                         -- scripts/qa/ci-nightly-jobs.sh
+  21.   ci-nightly-jobs                         -- scripts/qa/ci-nightly-jobs.sh
                                                    Platform-aware: runs the subset of GHA
                                                    nightly jobs that applies to the dev's OS.
                                                    Covers record-replay, cluster-smoke,
-                                                   topic-and-top, cpu-affinity [Linux],
+                                                   cluster-e2e [Linux], cluster-record-replay
+                                                   [Linux], topic-and-top, cpu-affinity [Linux],
                                                    redb-backend, daemon-reconnect [Linux],
-                                                   state-reconstruction, test-cross-platform,
-                                                   examples, cli-tests, bench-example, msrv,
-                                                   cross-check, ros2-bridge [Linux+ROS2].
+                                                   state-reconstruction,
+                                                   multi-daemon-late-subscriber [Linux],
+                                                   test-cross-platform, examples, cli-tests
+                                                   (+cli-tests-python), bench-example, msrv,
+                                                   kani-proofs, cross-check, ros2-bridge [Linux],
+                                                   ros2-zenoh-humble, ros2-zenoh-kilted.
 
-example-smoke + hub-smoke + ci-nightly-jobs together cover all 19 GHA
-nightly test jobs. A green
+example-smoke + hub-smoke + ci-nightly-jobs together cover 26 of the 27 GHA
+nightly test jobs; wheel-smoke has no local driver (needs maturin plus two
+interpreters -- build the wheels by hand if you need it). A green
 local qa-nightly on platform X predicts a green CI nightly schedule
 for platform X's jobs. (Cross-platform jobs that the dev's OS can't
 run -- e.g. ros2-bridge on macOS -- SKIP locally with a clear note.)
@@ -213,9 +249,9 @@ EOF
       cat <<EOF
 ============================================================
 $header
-Runs cargo-mutants --full on 6 critical crates: dora-core, dora-daemon,
-dora-coordinator, dora-message, dora-coordinator-store,
-shared-memory-server. About 1679 mutants last measured.
+Runs cargo-mutants --full on 5 critical crates: dora-core, dora-daemon,
+dora-coordinator, dora-message, dora-coordinator-store. About 1679
+mutants last measured.
 
 A test-quality audit, NOT a code gate. Run when:
   - Investigating low test coverage in a specific crate.
@@ -234,10 +270,10 @@ EOF
 ============================================================
 $header
 The automatable parts of the Tier 3 release gate. Will run:
-  1-5.   everything from qa-fast
-  6-8.   everything from qa-full                 (test, coverage, adversarial)
-  9.     mutants (diff-scoped)
-  10.    semver
+  1-11.   everything from qa-fast
+  12-14.  everything from qa-full                (test, coverage, adversarial)
+  15.     mutants (diff-scoped)
+  16.     breaking-changes                       -- every surface dora 1.x freezes
 Non-automatable Tier 3 gates (external security audit, 7-day dogfood
 campaign, migration validation on external repos) are human-gated --
 see docs/plan-agentic-qa-strategy.md §7.
@@ -250,15 +286,26 @@ EOF
 print_overview "$MODE"
 
 # ----- Always run (fast) -----
+# Must stay first: the cargo gates below repair a stale lock in place
+# before anything can report it (#3512).
+run "lockfile"      scripts/qa/lockfile.sh
 run "fmt"           cargo fmt --all -- --check
-run "clippy"        cargo clippy --all \
+run "clippy"        cargo clippy --all --all-targets \
                       --exclude dora-node-api-python \
                       --exclude dora-operator-api-python \
                       --exclude dora-ros2-bridge-python \
                       -- -D warnings
 run "audit"         scripts/qa/audit.sh
 run "unwrap-budget" scripts/qa/unwrap-budget.sh
+run "secret-files"  scripts/qa/secret-files.sh
 run "typos"         scripts/qa/typos.sh
+run "publish-graph" scripts/qa/publish-graph.sh
+run "package-includes" scripts/qa/package-includes.sh
+# The no-compile half of the 1.x compatibility gate: C header, cxx bridge,
+# YAML schema, wire format, CLI snapshot, Python floor. Seconds, so it
+# belongs in the per-commit tier -- the compile half runs in --deep.
+run "breaking-changes" scripts/qa/breaking-changes.sh --fast
+run "ci-reporting"  scripts/qa/ci-nightly-reporting.sh
 
 case "$MODE" in
   --fast)
@@ -269,6 +316,7 @@ case "$MODE" in
       --exclude dora-node-api-python \
       --exclude dora-operator-api-python \
       --exclude dora-ros2-bridge-python \
+      --exclude dora-runtime-python \
       --exclude dora-cli-api-python \
       --exclude dora-examples
     run "coverage" scripts/qa/coverage.sh
@@ -285,7 +333,9 @@ esac
 case "$MODE" in
   --deep|--nightly|--release-gate)
     run "mutants (diff-scoped)" scripts/qa/mutants.sh
-    run "semver"                scripts/qa/semver.sh
+    # Supersedes the bare `semver` step: this runs cargo-semver-checks (via
+    # semver.sh) *and* the surface checks rustdoc cannot see.
+    run "breaking-changes"      scripts/qa/breaking-changes.sh
     ;;
 esac
 
@@ -299,21 +349,25 @@ case "$MODE" in
       --exclude dora-node-api-python \
       --exclude dora-operator-api-python \
       --exclude dora-ros2-bridge-python \
+      --exclude dora-runtime-python \
       --exclude dora-cli-api-python \
       --exclude dora-examples \
       -- proptest
 
-    # miri requires nightly Rust + miri component. Skip (with note) if missing.
-    #
-    # Scoped to the `metadata::tests::` module only. Those tests were
-    # specifically written to exercise the unsafe pointer-arithmetic
-    # path in `ArrowTypeInfoExt::from_array` under miri (see the
-    # module doc comment and docs/plan-agentic-qa-strategy.md §T2.3).
-    # Running `cargo miri test -p dora-core` without a filter tries
-    # every test in the crate; most fail because they use `tempfile`
-    # or other filesystem ops that miri's isolation sandbox rejects.
-    run_optional "miri" "cargo +nightly miri --version" \
-      cargo +nightly miri test -p dora-core -- metadata::tests
+    # miri: the previous target — dora-core's `metadata::tests`, written to
+    # exercise the unsafe pointer arithmetic in `ArrowTypeInfoExt::from_array`
+    # — was removed when the `ArrowTypeInfo` sidecar was dropped for Arrow-IPC
+    # framing. `libraries/core/src/metadata.rs` no longer exists and dora-core
+    # now has zero `unsafe`, so `-- metadata::tests` matched no tests and the
+    # gate silently reported PASS while testing nothing (worse than an honest
+    # skip). The miri-worthy unsafe moved to `dora-node-api`'s IPC encode/
+    # decode paths (`arrow_utils/ipc_encode.rs`, `event_stream`), but that
+    # crate links zenoh + shared-memory-server (`shm_open`), which miri cannot
+    # run wholesale (same limitation as shared-memory-server itself). Pointing
+    # miri at a tightly-scoped, FFI-free subset of those tests needs a verified
+    # run first; until then, skip explicitly rather than fake-pass.
+    echo
+    echo "=== miri (SKIP: no miri-runnable unsafe target after metadata.rs removal) ==="
 
     # Ambient Python venv for example-smoke. CI smoke jobs all set one up
     # with `uv pip install -e apis/python/node` before running cargo test;
@@ -350,7 +404,7 @@ case "$MODE" in
     elif ! uv python find 3.12 > /dev/null 2>&1; then
       nightly_py_missing "Python 3.12"
     else
-      NIGHTLY_VENV="$(pwd)/target/qa-nightly-venv"
+      NIGHTLY_VENV="$TARGET_DIR/qa-nightly-venv"
       echo
       echo "=== preparing ambient Python venv at $NIGHTLY_VENV ==="
       echo "=== (matches GHA smoke-suite's 'uv pip install -e apis/python/node') ==="
@@ -378,11 +432,14 @@ case "$MODE" in
     # above; the `hub:` feature is nightly-tier, not per-PR.
     run "hub-smoke" cargo test -p dora-examples --test hub-smoke -- --test-threads=1
 
-    # Drive the 14 remaining GHA nightly jobs with platform-aware dispatch
-    # (record-replay, cluster-smoke, topic-and-top, cpu-affinity [Linux],
-    # redb-backend, daemon-reconnect [Linux], state-reconstruction,
-    # test-cross-platform, examples, cli-tests, bench-example, cross-check,
-    # ros2-bridge [Linux+ROS2], msrv). Jobs that can't run on the dev's OS
+    # Drive the 21 remaining GHA nightly jobs with platform-aware dispatch
+    # (record-replay, cluster-smoke, cluster-e2e [Linux], cluster-record-replay
+    # [Linux], topic-and-top, cpu-affinity [Linux], redb-backend,
+    # daemon-reconnect [Linux], state-reconstruction,
+    # multi-daemon-late-subscriber [Linux], test-cross-platform, examples,
+    # cli-tests (+cli-tests-python), bench-example, cross-check,
+    # ros2-bridge [Linux], ros2-zenoh-humble, ros2-zenoh-kilted, msrv,
+    # kani-proofs). Jobs that can't run on the dev's OS
     # SKIP cleanly. The script installs dora CLI into a scratch dir, so it
     # won't clobber the user's ~/.cargo/bin/dora. See #1707 + #1716 for the
     # alignment rationale.

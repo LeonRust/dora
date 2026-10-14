@@ -1,3 +1,13 @@
+//! **Internal to dora — not a public API.**
+//!
+//! This crate is published to crates.io only because cargo requires every
+//! dependency of a published crate to be published; `dora-node-api` and
+//! `dora-cli` depend on it. It is not covered by dora's 1.0 stability
+//! guarantee and may change in any release, including a patch.
+//!
+//! Depend on it directly at your own risk. See the "Stability scope at 1.0"
+//! section of `docs/api-rust.md`.
+//!
 use eyre::{Context, bail, eyre};
 use std::{
     env::consts::{DLL_PREFIX, DLL_SUFFIX},
@@ -9,10 +19,7 @@ pub use dora_message::{config, uhlc};
 #[cfg(feature = "build")]
 pub mod build;
 pub mod descriptor;
-#[cfg(feature = "type-inference")]
-pub mod inference;
 pub mod manifest;
-pub mod metadata;
 pub mod topics;
 pub mod types;
 
@@ -56,10 +63,13 @@ pub fn adjust_shared_library_path(path: &Path) -> Result<std::path::PathBuf, eyr
     Ok(path)
 }
 
-// Search for python binary.
-// 1. If `uv` is available, use `uv python find` to get the Python path
-// 2. Otherwise, try `python` and check it's not Python 2
-// 3. Fall back to `python3` if `python` is Python 2
+/// Locate a Python 3 interpreter, in order of preference:
+///
+/// 1. If `uv` is available, use `uv python find` to get the Python path.
+/// 2. Otherwise, try `python` and check it is not Python 2.
+/// 3. Fall back to `python3` if `python` is Python 2 (or absent).
+///
+/// Returns an error only if none of the above yields a usable Python 3.
 pub fn get_python_path() -> Result<std::path::PathBuf, eyre::ErrReport> {
     // First, try using uv if available
     if let Ok(uv_path) = get_uv_path() {
@@ -113,7 +123,8 @@ fn is_python2(python_path: &std::path::Path) -> bool {
     }
 }
 
-// Search for uv binary.
+/// Locate the `uv` binary on `PATH`, erroring with an install hint if it is
+/// not found.
 pub fn get_uv_path() -> Result<std::path::PathBuf, eyre::ErrReport> {
     which::which("uv")
         .context("failed to find `uv`. Make sure to install it using: https://docs.astral.sh/uv/getting-started/installation/")

@@ -143,9 +143,22 @@ pub enum ControlRequest {
     },
     CliAndDefaultDaemonOnSameMachine,
     GetNodeInfo,
+    /// Constructed through [`ControlRequest::topic_subscribe`], not by
+    /// literal: the variant is `#[non_exhaustive]` so that the *next* field
+    /// added here is a minor change rather than a 2.0 (see
+    /// [`RegisterResult::Ok`](crate::coordinator_to_daemon::RegisterResult::Ok)).
+    #[non_exhaustive]
     TopicSubscribe {
         dataflow_id: Uuid,
         topics: Vec<(NodeId, DataId)>,
+        /// Binary-frame encoding the client speaks, see
+        /// [`TOPIC_DATA_PROTOCOL_VERSION`](crate::TOPIC_DATA_PROTOCOL_VERSION).
+        ///
+        /// `None` means the client predates the handshake and therefore speaks
+        /// the bincode encoding; the coordinator rejects it rather than let it
+        /// misparse postcard frames.
+        #[serde(default)]
+        protocol_version: Option<u16>,
     },
     TopicUnsubscribe {
         subscription_id: Uuid,
@@ -213,6 +226,15 @@ pub enum ControlRequest {
         node_id: NodeId,
         grace_duration: Option<std::time::Duration>,
     },
+    /// Atomically replace a running node with a new definition under the
+    /// same id (dora-rs/dora#2927). The replacement must keep the node's
+    /// edges (same input mappings, outputs covering every mapped output);
+    /// a spawn failure leaves the current incarnation running.
+    ReplaceNode {
+        dataflow_id: Uuid,
+        node: crate::descriptor::Node,
+        grace_duration: Option<std::time::Duration>,
+    },
     /// Add a mapping (connection) between two nodes in a running dataflow.
     AddMapping {
         dataflow_id: Uuid,
@@ -251,6 +273,17 @@ impl ControlRequest {
             dora_version: crate::current_crate_version(),
         }
     }
+
+    /// Subscribe to `topics` of a running dataflow, stamped with the
+    /// binary-frame encoding this crate speaks
+    /// ([`TOPIC_DATA_PROTOCOL_VERSION`](crate::TOPIC_DATA_PROTOCOL_VERSION)).
+    pub fn topic_subscribe(dataflow_id: Uuid, topics: Vec<(NodeId, DataId)>) -> Self {
+        Self::TopicSubscribe {
+            dataflow_id,
+            topics,
+            protocol_version: Some(crate::TOPIC_DATA_PROTOCOL_VERSION),
+        }
+    }
 }
 
 /// Check whether a CLI-reported dora version is compatible with this
@@ -284,6 +317,38 @@ mod tests {
                 assert_eq!(dora_version, crate::current_crate_version());
             }
             other => panic!("expected Hello, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn topic_subscribe_stamps_current_protocol_version() {
+        assert!(matches!(
+            ControlRequest::topic_subscribe(Uuid::nil(), vec![]),
+            ControlRequest::TopicSubscribe {
+                protocol_version: Some(crate::TOPIC_DATA_PROTOCOL_VERSION),
+                ..
+            }
+        ));
+    }
+
+    /// The wire property the `#[non_exhaustive]` on `TopicSubscribe` is there
+    /// to let us rely on: a request from a *newer* CLI carrying a field this
+    /// coordinator does not know still decodes, and one from an *older* CLI
+    /// missing a `#[serde(default)]` field decodes too. Together they are what
+    /// make appending such a field a minor change.
+    #[test]
+    fn topic_subscribe_tolerates_unknown_and_missing_fields() {
+        let newer = r#"{"TopicSubscribe":{"dataflow_id":"00000000-0000-0000-0000-000000000000","topics":[],"protocol_version":2,"mode":"metadata-only"}}"#;
+        let older = r#"{"TopicSubscribe":{"dataflow_id":"00000000-0000-0000-0000-000000000000","topics":[]}}"#;
+        for (label, json, expected_version) in [("newer", newer, Some(2)), ("older", older, None)] {
+            let req: ControlRequest = serde_json::from_str(json)
+                .unwrap_or_else(|e| panic!("{label} peer's request must decode: {e}"));
+            match req {
+                ControlRequest::TopicSubscribe {
+                    protocol_version, ..
+                } => assert_eq!(protocol_version, expected_version, "{label}"),
+                other => panic!("expected TopicSubscribe, got {other:?}"),
+            }
         }
     }
 

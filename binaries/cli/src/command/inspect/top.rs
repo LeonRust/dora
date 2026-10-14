@@ -4,7 +4,7 @@ use std::{
 };
 
 use crate::common::{
-    CoordinatorOptions, connect_to_coordinator, expect_reply, send_control_request,
+    CoordinatorOptions, connect_to_coordinator, expect_reply, is_quit_key, send_control_request,
 };
 use clap::Args;
 use crossterm::{
@@ -30,7 +30,10 @@ use super::super::{Executable, default_tracing};
 /// so this works for distributed dataflows across multiple machines.
 ///
 /// Note:
-/// - Values are averaged over the last refresh period
+/// - Columns report over different time bases: CPU% is averaged over the last
+///   refresh interval and I/O READ and I/O WRITE are per-interval rates; MEMORY
+///   and QUEUE are instantaneous snapshots; NET TX, NET RX and RESTARTS are
+///   cumulative totals since the dataflow started
 /// - CPU percentage is of a single core (values can add to more than 100% if multiple cores are used)
 /// - Nodes can run on different machines with potentially different CPUs, so percentages are not comparable across machines
 #[derive(Debug, Args)]
@@ -284,14 +287,19 @@ fn run_app<B: Backend>(
 ) -> eyre::Result<()> {
     let mut app = App::new();
     let mut last_update = Instant::now();
+    // Set by the `r` key to force the next loop iteration to refresh. Using an
+    // explicit flag avoids back-dating `last_update` with an unchecked
+    // `Instant - Duration`, which panics on underflow when `refresh_duration`
+    // exceeds the monotonic clock (e.g. a large `--refresh-interval` on a
+    // low-uptime host).
+    let mut force_refresh = false;
 
     // Reuse coordinator connection
     let session = connect_to_coordinator(coordinator_addr)?;
 
     // Query node info once initially
     let reply = send_control_request(&session, &ControlRequest::GetNodeInfo)?;
-    let mut node_infos = expect_reply!(reply, NodeInfoList(infos))?;
-    app.update_stats(node_infos.clone());
+    app.update_stats(expect_reply!(reply, NodeInfoList(infos))?);
 
     loop {
         terminal
@@ -306,10 +314,10 @@ fn run_app<B: Backend>(
             && let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
         {
+            if is_quit_key(&key) {
+                return Ok(());
+            }
             match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => {
-                    return Ok(());
-                }
                 KeyCode::Down | KeyCode::Char('j') => {
                     app.next();
                 }
@@ -326,24 +334,38 @@ fn run_app<B: Backend>(
                     app.toggle_sort(SortColumn::Memory);
                 }
                 KeyCode::Char('r') => {
-                    // Force refresh by resetting last_update
-                    last_update = Instant::now() - refresh_duration;
+                    // Force the next iteration to refresh immediately.
+                    force_refresh = true;
                 }
                 _ => {}
             }
         }
 
-        // Update data if refresh interval has passed
-        if last_update.elapsed() >= refresh_duration {
+        // Update data if a refresh was forced or the refresh interval elapsed.
+        if should_refresh(force_refresh, last_update.elapsed(), refresh_duration) {
             // Query node info every refresh interval to get updated metrics
             let reply = send_control_request(&session, &ControlRequest::GetNodeInfo)?;
-            node_infos = expect_reply!(reply, NodeInfoList(infos))?;
 
             // Update stats with current node info
-            app.update_stats(node_infos.clone());
+            app.update_stats(expect_reply!(reply, NodeInfoList(infos))?);
             last_update = Instant::now();
+            force_refresh = false;
         }
     }
+}
+
+/// Decides whether node stats should be refreshed this loop iteration.
+///
+/// A refresh happens either because the user forced one (`r` key) or because
+/// `refresh_duration` has elapsed since the last update. This deliberately uses
+/// only `Duration` comparisons (no `Instant - Duration`) so it can never panic
+/// on underflow, regardless of how large `refresh_duration` is.
+fn should_refresh(
+    force_refresh: bool,
+    since_last_update: Duration,
+    refresh_duration: Duration,
+) -> bool {
+    force_refresh || since_last_update >= refresh_duration
 }
 
 fn ui(f: &mut Frame, app: &mut App, refresh_duration: Duration) {
@@ -438,7 +460,7 @@ fn ui(f: &mut Frame, app: &mut App, refresh_duration: Duration) {
     ];
 
     let title = format!(
-        " Dora Inspect Top - Refreshing every {}s (q: quit, n/c/m: sort, r: refresh nodes) ",
+        " Dora Inspect Top - Refreshing every {}s (q/Ctrl-C: quit, n/c/m: sort, r: refresh nodes) ",
         refresh_duration.as_secs()
     );
 
@@ -466,5 +488,63 @@ fn format_bytes(bytes: u64) -> String {
         format!("{:.1}MB", bytes as f64 / (1024.0 * 1024.0))
     } else {
         format!("{:.1}GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyEvent, KeyModifiers};
+
+    #[test]
+    fn ctrl_c_quits_instead_of_sorting() {
+        assert!(is_quit_key(&KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(is_quit_key(&KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::NONE
+        )));
+        assert!(is_quit_key(&KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE
+        )));
+        // A plain `c` is still the sort-by-CPU key.
+        assert!(!is_quit_key(&KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::NONE
+        )));
+    }
+
+    #[test]
+    fn force_refresh_triggers_regardless_of_elapsed() {
+        // Even with zero elapsed time and an enormous refresh interval, a
+        // forced refresh must fire and must not perform any `Instant`
+        // arithmetic that could underflow (regression test for #2681).
+        assert!(should_refresh(
+            true,
+            Duration::ZERO,
+            Duration::from_secs(u64::MAX),
+        ));
+    }
+
+    #[test]
+    fn refresh_waits_for_interval_when_not_forced() {
+        assert!(!should_refresh(
+            false,
+            Duration::from_millis(500),
+            Duration::from_secs(2),
+        ));
+        assert!(should_refresh(
+            false,
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        ));
+        assert!(should_refresh(
+            false,
+            Duration::from_secs(3),
+            Duration::from_secs(2),
+        ));
     }
 }

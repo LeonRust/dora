@@ -9,18 +9,30 @@ publish = false  # binary, delivered via `dora` CLI
 name = "dora-ros2-bridge-node"
 path = "src/main.rs"
 
+[features]
+default = ["ros2-humble"]
+# ROS distro, forwarded to the crates that link `ros2-client`. See
+# `dora-ros2-bridge`'s manifest for the chain semantics.
+ros2-humble = ["dora-ros2-bridge/ros2-humble", "dora-ros2-bridge-arrow/ros2-humble"]
+ros2-iron = ["dora-ros2-bridge/ros2-iron", "dora-ros2-bridge-arrow/ros2-iron"]
+ros2-jazzy = ["dora-ros2-bridge/ros2-jazzy", "dora-ros2-bridge-arrow/ros2-jazzy"]
+ros2-kilted = ["dora-ros2-bridge/ros2-kilted", "dora-ros2-bridge-arrow/ros2-kilted"]
+
 [dependencies]
-dora-node-api = { workspace = true }
-dora-ros2-bridge = { path = "../../libraries/extensions/ros2-bridge", default-features = false }
+dora-node-api = { workspace = true , features = ["arrow-v59"] }
+dora-ros2-bridge = { path = "../../libraries/extensions/ros2-bridge", default-features = false, features = ["rmw-zenoh"] }
 dora-ros2-bridge-arrow = { path = "../../libraries/extensions/ros2-bridge/arrow" }
 dora-ros2-bridge-msg-gen = { workspace = true }
 dora-message = { workspace = true }
 arrow = { workspace = true }
 eyre = { workspace = true }
-flume = "0.11"
+flume = "0.12"
 futures = { workspace = true }
 futures-timer = "3"
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = "0.3"
+
+[dev-dependencies]
+serde_yaml = { workspace = true }

@@ -1,25 +1,25 @@
 use std::{
     collections::HashMap,
-    io::{Read, Seek, Write},
+    io::{Read, Seek},
     path::{Path, PathBuf},
 };
 
 use super::{Executable, default_tracing};
+use crate::common::parse_duration;
 use crate::{
     common::{
-        CoordinatorOptions, expect_reply, resolve_dataflow_identifier_interactive,
-        send_control_request,
+        CoordinatorOptions, error_indicates_dataflow_finished, expect_reply,
+        resolve_dataflow_identifier_interactive, send_control_request,
     },
     output::{
-        LogFormat, LogOutputConfig, parse_jsonl_line, parse_log_filter, parse_log_level_str,
-        print_log_message,
+        LogFormat, LogOutputConfig, level_filter_is_active, message_passes_level_filter,
+        parse_jsonl_line, parse_log_filter, parse_log_level_str, print_log_message,
     },
     ws_client::WsSession,
 };
 use chrono::{DateTime, Utc};
 use clap::Args;
 use dora_message::{cli_to_coordinator::ControlRequest, common::LogMessage, id::NodeId};
-use duration_str::parse as parse_duration_str;
 use eyre::{Context, Result, bail};
 use uuid::Uuid;
 
@@ -32,7 +32,8 @@ pub struct LogsArgs {
     /// Deprecated positional node name. Use --node instead.
     #[clap(value_name = "NAME", hide = true, conflicts_with_all = ["node", "all_nodes"])]
     pub legacy_node: Option<NodeId>,
-    /// Show logs for the given node
+    /// Show logs for the given node.
+    /// Streams from coordinator by default, falls back to local out/ directory.
     #[clap(long, short = 'n', value_name = "NAME", conflicts_with = "all_nodes")]
     pub node: Option<NodeId>,
     /// Show logs from all nodes merged by timestamp.
@@ -50,11 +51,11 @@ pub struct LogsArgs {
     pub local: bool,
     /// Only show logs newer than this duration ago (e.g. "5m", "1h")
     #[clap(long, value_name = "DURATION")]
-    #[arg(value_parser = parse_duration_str)]
+    #[arg(value_parser = parse_duration)]
     pub since: Option<std::time::Duration>,
     /// Only show logs older than this duration ago (e.g. "5m", "1h")
     #[clap(long, value_name = "DURATION")]
-    #[arg(value_parser = parse_duration_str)]
+    #[arg(value_parser = parse_duration)]
     pub until: Option<std::time::Duration>,
     /// Minimum log level to display (error, warn, info, debug, trace, stdout)
     #[clap(
@@ -66,6 +67,8 @@ pub struct LogsArgs {
     #[arg(value_parser = parse_log_level_str)]
     pub level: dora_core::build::LogLevelOrStdout,
     /// Output format for log messages
+    ///
+    /// `json` emits JSON Lines (one object per log message).
     #[clap(long, default_value = "pretty", env = "DORA_LOG_FORMAT")]
     pub log_format: LogFormat,
     /// Per-node log level filter (e.g. "sensor=debug,processor=warn")
@@ -101,30 +104,36 @@ impl Executable for LogsArgs {
 
         // --local always uses local file path
         if self.local {
-            if self.follow {
-                return follow_local_logs(&self);
-            }
-            return read_local_logs(&self);
+            return dispatch_local_logs(&self);
         }
 
-        // Single node via coordinator
+        // Single node: try the coordinator first, then fall back to the local
+        // `out/` directory when it is unavailable. This mirrors the all-nodes
+        // path below so that after a plain `dora run` (which never binds a
+        // coordinator) `dora logs --node <N>` works without forcing the user to
+        // discover `--local`; the local readers already honor `--node` through
+        // `find_node_log_files`.
         if let Some(ref node) = self.node {
             let node = node.clone();
-            let config = build_log_config(&self)?;
-            let session = self.coordinator.connect()?;
-            let uuid = resolve_logs_dataflow_identifier(&session, self.dataflow.as_deref(), None)?;
-            return logs(
-                &session,
-                uuid,
-                node,
-                self.tail,
-                self.follow,
-                self.grep.as_deref(),
-                &self.level,
-                self.since,
-                self.until,
-                &config,
-            );
+            return match self.coordinator.connect() {
+                Ok(session) => {
+                    let config = build_log_config(&self)?;
+                    let uuid =
+                        resolve_logs_dataflow_identifier(&session, self.dataflow.as_deref(), None)?;
+                    logs(
+                        &session,
+                        uuid,
+                        node,
+                        self.tail,
+                        self.follow,
+                        self.grep.as_deref(),
+                        self.since,
+                        self.until,
+                        &config,
+                    )
+                }
+                Err(_) => dispatch_local_logs(&self),
+            };
         }
 
         // All nodes (explicit --all-nodes or no node specified):
@@ -137,10 +146,14 @@ impl Executable for LogsArgs {
                     legacy_positional_node(&self),
                 )?;
                 let config = build_log_config(&self)?;
+                all_nodes_logs_from_coordinator(&session, uuid, &self, &config)?;
+                if !self.follow {
+                    return Ok(());
+                }
                 stream_logs_from_coordinator(
                     &session,
                     uuid,
-                    &self.level,
+                    None,
                     self.since,
                     self.until,
                     self.grep.as_deref(),
@@ -149,9 +162,24 @@ impl Executable for LogsArgs {
             }
             Err(_) => {
                 // Coordinator unavailable, fall back to local
-                read_local_logs(&self)
+                dispatch_local_logs(&self)
             }
         }
+    }
+}
+
+/// Read logs from the local `out/` directory, streaming when `--follow` is set.
+///
+/// Shared by the explicit `--local` path and by every coordinator-unavailable
+/// fallback, so all three honor `--follow` identically. Only `follow_local_logs`
+/// streams; `read_local_logs` prints once and returns, so dispatching here (not
+/// calling `read_local_logs` directly) is what keeps `--follow` working on the
+/// fallback paths.
+fn dispatch_local_logs(args: &LogsArgs) -> Result<()> {
+    if args.follow {
+        follow_local_logs(args)
+    } else {
+        read_local_logs(args)
     }
 }
 
@@ -242,9 +270,15 @@ fn read_local_logs(args: &LogsArgs) -> Result<()> {
         all_messages.extend(read_log_file(path)?);
     }
     all_messages.sort_by_key(|a| a.timestamp);
-    let filtered = apply_time_filters(all_messages, args.since, args.until, now);
-    let grepped = apply_grep(filtered, args.grep.as_deref());
-    let display = apply_tail(grepped, args.tail);
+    let display = filter_and_tail(
+        all_messages,
+        args.since,
+        args.until,
+        args.grep.as_deref(),
+        &config,
+        args.tail,
+        now,
+    );
 
     for msg in display {
         print_log_message(msg, &config);
@@ -281,57 +315,429 @@ fn follow_local_logs(args: &LogsArgs) -> Result<()> {
         );
     }
 
-    // Print existing content with filters
+    // Print existing content with filters, tracking per-file follow state
+    // (offset already consumed + a head fingerprint to recognise the same file
+    // across a rotation rename) as we go. The state comes from the *same* read
+    // as the printed content, so a rotation in between cannot leave the rotated
+    // file untracked and make the first poll re-print it from the start.
     let mut all_messages: Vec<LogMessage> = Vec::new();
+    let mut follow_state: HashMap<PathBuf, FollowedFile> = HashMap::new();
     for path in &files {
-        all_messages.extend(read_log_file(path)?);
+        let (messages, state) = read_log_file_tracked(path)?;
+        all_messages.extend(messages);
+        follow_state.insert(path.clone(), state);
     }
     all_messages.sort_by_key(|a| a.timestamp);
-    let filtered = apply_time_filters(all_messages, args.since, args.until, now);
-    let grepped = apply_grep(filtered, args.grep.as_deref());
-    let display = apply_tail(grepped, args.tail);
+    let display = filter_and_tail(
+        all_messages,
+        args.since,
+        args.until,
+        args.grep.as_deref(),
+        &config,
+        args.tail,
+        now,
+    );
 
     for msg in display {
         print_log_message(msg, &config);
-    }
-
-    // Track file byte offsets (start after existing content)
-    let mut file_positions: HashMap<PathBuf, u64> = HashMap::new();
-    for path in &files {
-        let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-        file_positions.insert(path.clone(), len);
     }
 
     // Follow loop: poll for new content
     loop {
         std::thread::sleep(std::time::Duration::from_millis(200));
 
-        let mut new_messages = Vec::new();
-        for path in &files {
-            let pos = file_positions.get(path).copied().unwrap_or(0);
-            let current_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-            if current_size <= pos {
-                continue;
-            }
-            let mut file = std::fs::File::open(path)?;
-            file.seek(std::io::SeekFrom::Start(pos))?;
-            let mut buf = String::new();
-            file.read_to_string(&mut buf)?;
-            for line in buf.lines() {
-                if let Some(msg) = parse_jsonl_line(line) {
-                    new_messages.push(msg);
+        // Re-glob every poll so files that appear after the follow started —
+        // in particular a freshly rotated `log_<node>.1.jsonl` — are picked up.
+        // A transient read error just skips this poll and keeps the state.
+        let files = match &args.node {
+            Some(node) => find_node_log_files(&dataflow_dir, node),
+            None => find_log_files(&dataflow_dir),
+        };
+        let files = match files {
+            Ok(files) => files,
+            Err(_) => continue,
+        };
+
+        // Open each file once and observe its size and head fingerprint through
+        // that same handle, which is then reused for the append read. A rotation
+        // rename between the observation and the read therefore cannot make the
+        // two disagree, nor fail the read with `ENOENT`.
+        //
+        // This holds one descriptor per log file for the length of a poll —
+        // bounded by the dataflow's node count times the rotation depth, and
+        // released at the end of the iteration. If opening does fail (including
+        // `EMFILE`), that file is reported with an unknown size, which keeps its
+        // offset untouched and retries on the next poll.
+        let mut handles: HashMap<PathBuf, std::fs::File> = HashMap::new();
+        let snapshot: Vec<LogFileSnapshot> = files
+            .iter()
+            .map(|path| {
+                let (snapshot, handle) = open_log_snapshot(path);
+                if let Some(handle) = handle {
+                    handles.insert(path.clone(), handle);
                 }
-            }
-            file_positions.insert(path.clone(), current_size);
+                snapshot
+            })
+            .collect();
+
+        let mut new_messages = Vec::new();
+        let mut next_state: HashMap<PathBuf, FollowedFile> = HashMap::new();
+        let mut carried_from: Vec<PathBuf> = Vec::new();
+        for plan in plan_follow_reads(&follow_state, &snapshot) {
+            let has_new_bytes = plan.size.is_some_and(|size| size > plan.resume);
+            let handle = handles.get_mut(&plan.path).filter(|_| has_new_bytes);
+            // A failed read leaves the offset untouched so the bytes are retried
+            // on the next poll — it must never abort the follow session, which
+            // the daemon's rotation (rename + delete) would otherwise do.
+            let new_pos = match handle {
+                Some(file) => match read_appended_log_lines(file, &plan.path, plan.resume) {
+                    Ok((msgs, new_pos)) => {
+                        new_messages.extend(msgs);
+                        new_pos
+                    }
+                    Err(_) => plan.resume,
+                },
+                None => plan.resume,
+            };
+            carried_from.extend(plan.carried_from);
+            next_state.insert(
+                plan.path,
+                FollowedFile {
+                    offset: new_pos,
+                    head: plan.head,
+                    missed_polls: 0,
+                },
+            );
         }
+        retain_unlisted_state(&follow_state, &mut next_state, &carried_from);
+        follow_state = next_state;
 
         new_messages.sort_by_key(|a| a.timestamp);
-        for msg in new_messages {
-            if matches_grep(&msg, args.grep.as_deref()) {
-                print_log_message(msg, &config);
-            }
+        // Select the lines to print through the shared helper, so this poll
+        // applies the same `--since`/`--until` window as the initial batch and
+        // the coordinator follow path (see `select_follow_messages`).
+        for msg in select_follow_messages(
+            new_messages,
+            args.since,
+            args.until,
+            args.grep.as_deref(),
+            now,
+        ) {
+            print_log_message(msg, &config);
         }
     }
+}
+
+/// Select which of a follow poll's newly appended lines to print.
+///
+/// Mirrors the initial batch (`filter_and_tail`) and the coordinator follow
+/// path (`stream_logs_from_coordinator`): apply the `--since`/`--until` time
+/// window against `now` — the fixed reference captured at follow start — so
+/// `--until` (show only logs older than the cutoff) suppresses freshly appended
+/// lines instead of streaming them, then apply the `--grep` filter.
+///
+/// Extracted from [`follow_local_logs`] so the wiring is unit-testable: because
+/// the loop only *calls* `apply_time_filters` (which is itself unchanged), a
+/// regression that dropped the time window from the loop would otherwise pass
+/// every existing test. Testing this helper guards the actual selection the
+/// loop performs.
+fn select_follow_messages(
+    new_messages: Vec<LogMessage>,
+    since: Option<std::time::Duration>,
+    until: Option<std::time::Duration>,
+    grep: Option<&str>,
+    now: DateTime<Utc>,
+) -> Vec<LogMessage> {
+    apply_time_filters(new_messages, since, until, now)
+        .into_iter()
+        .filter(|msg| matches_grep(msg, grep))
+        .collect()
+}
+
+/// Number of leading bytes of a log file used as a rename/replacement
+/// fingerprint (see [`plan_follow_reads`]). Large enough to span the first
+/// JSONL line — whose timestamp makes it distinct per file — but small enough
+/// to read cheaply on every poll.
+///
+/// The daemon writes each line as `{"ts": …, "level": …, "node": …, …}` and the
+/// workspace enables serde_json's `preserve_order`, so `ts` really is the first
+/// key on disk. Even without it a complete first line still carries the node id
+/// and message; [`usable_fingerprint`] is what guarantees a head spans one.
+const LOG_HEAD_FINGERPRINT_LEN: usize = 256;
+
+/// How many consecutive polls a tracked file may be missing from the directory
+/// listing before its follow state is forgotten.
+const MAX_MISSED_POLLS: u32 = 5;
+
+/// Per-file follow state: the byte offset already consumed and a fingerprint of
+/// the file's leading bytes used to recognise the same file across a rotation
+/// rename.
+#[derive(Clone, Debug, PartialEq)]
+struct FollowedFile {
+    offset: u64,
+    head: Vec<u8>,
+    /// Consecutive polls whose directory listing did not report this path.
+    missed_polls: u32,
+}
+
+/// A poll-time observation of a log file.
+struct LogFileSnapshot {
+    path: PathBuf,
+    /// `None` if the file could not be opened or stat'd this poll. Distinct
+    /// from `Some(0)`: treating a failed stat as an empty file would clamp the
+    /// tracked offset to 0 and re-read the whole file on the next poll.
+    size: Option<u64>,
+    /// The file's leading bytes, or `None` if they could not be read. Also
+    /// distinct from `Some(short head)`, which is a real observation telling us
+    /// the file holds less than one complete line.
+    head: Option<Vec<u8>>,
+}
+
+/// A per-file decision produced by [`plan_follow_reads`].
+struct FollowPlan {
+    path: PathBuf,
+    /// Byte offset to resume reading from.
+    resume: u64,
+    size: Option<u64>,
+    head: Vec<u8>,
+    /// The previously tracked path whose offset was carried here across a
+    /// rotation rename, if any.
+    carried_from: Option<PathBuf>,
+}
+
+/// Open `path` and observe its size and head fingerprint through that one
+/// handle, which is handed back for the caller to reuse for the append read.
+/// Taking all three from a single handle keeps them consistent across a
+/// concurrent rotation rename, which would otherwise be able to slip between a
+/// separate `stat`, fingerprint and read of the same path.
+fn open_log_snapshot(path: &Path) -> (LogFileSnapshot, Option<std::fs::File>) {
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return (
+            LogFileSnapshot {
+                path: path.to_path_buf(),
+                size: None,
+                head: None,
+            },
+            None,
+        );
+    };
+    let size = file.metadata().map(|m| m.len()).ok();
+    let head = read_log_head(&mut file);
+    (
+        LogFileSnapshot {
+            path: path.to_path_buf(),
+            size,
+            head,
+        },
+        Some(file),
+    )
+}
+
+/// Read up to [`LOG_HEAD_FINGERPRINT_LEN`] leading bytes of `file` as a content
+/// fingerprint, or `None` if the read failed. Fills the buffer rather than
+/// trusting a single `read` call, which is free to return fewer bytes than
+/// asked for — a truncated head would be a prefix of unrelated log files.
+fn read_log_head(file: &mut std::fs::File) -> Option<Vec<u8>> {
+    let mut buf = Vec::with_capacity(LOG_HEAD_FINGERPRINT_LEN);
+    match Read::by_ref(file)
+        .take(LOG_HEAD_FINGERPRINT_LEN as u64)
+        .read_to_end(&mut buf)
+    {
+        Ok(_) => Some(buf),
+        Err(_) => None,
+    }
+}
+
+/// Whether a head is distinguishing enough to identify a file's content.
+///
+/// Every JSONL line starts with the same `{"ts":"<timestamp>` shape, so a head
+/// captured while only part of the first line had been written is a prefix of
+/// virtually every other log file — including the fresh file a rotation just
+/// created. Only a head spanning a complete first line (containing a newline),
+/// or filling the whole fingerprint window, carries enough content to tell two
+/// files apart.
+///
+/// Refusing to match short heads never strands a partially-read file: an offset
+/// only ever advances past a newline, so a file with a non-zero offset always
+/// has a usable head.
+fn usable_fingerprint(head: &[u8]) -> bool {
+    head.len() >= LOG_HEAD_FINGERPRINT_LEN || head.contains(&b'\n')
+}
+
+/// Whether two head fingerprints identify the same underlying file. A followed
+/// file only ever grows, extending its head, so a shorter recorded head that is
+/// a prefix of the current one is the same file; a rotated-in fresh file starts
+/// with a different first line. Heads that are not [`usable_fingerprint`]s
+/// never match — neither an unreadable head nor a bare `{"ts":"…` prefix may be
+/// mistaken for another file.
+fn same_log_file(a: &[u8], b: &[u8]) -> bool {
+    if !usable_fingerprint(a) || !usable_fingerprint(b) {
+        return false;
+    }
+    let n = a.len().min(b.len());
+    a[..n] == b[..n]
+}
+
+/// Decide, for each file in `snapshot`, the byte offset to resume reading from,
+/// given the previous poll's `prev` state.
+///
+/// The daemon rotates logs by *renaming* (`log_<node>.jsonl` ->
+/// `log_<node>.1.jsonl`, shifting older ones up) and creating a fresh current
+/// file — see `binaries/daemon/src/log.rs`. Two failure modes this avoids:
+///
+/// 1. A fresh file that grew past the stale offset within a single poll: a
+///    size-only check would seek into it mid-line and garble the output. The
+///    head fingerprint differs, so it is recognised as a new file and read
+///    from 0.
+/// 2. The rotated file's unread tail (bytes appended to the current file
+///    between the last poll and the rename) being dropped: the carried offset
+///    follows the content to its new path — matched by fingerprint — so the
+///    tail is drained exactly once before the fresh file is read from 0.
+fn plan_follow_reads(
+    prev: &HashMap<PathBuf, FollowedFile>,
+    snapshot: &[LogFileSnapshot],
+) -> Vec<FollowPlan> {
+    snapshot
+        .iter()
+        .map(|snap| {
+            let (resume, head, carried_from) = match (&snap.head, prev.get(&snap.path)) {
+                // Couldn't read the file at all this poll (transient error):
+                // assume the same file and keep both the offset and the recorded
+                // head, so a later poll can still match it — never re-read from
+                // 0 and duplicate. The unknown size stops any read this poll.
+                (None, Some(state)) => (state.offset, state.head.clone(), None),
+                (None, None) => (0, Vec::new(), None),
+                // Less than one complete line on disk: nothing complete to read
+                // and nothing distinguishing to match on. Resume from 0, which
+                // loses no progress — a tracked file with a non-zero offset
+                // always has a usable head, so this file has none consumed.
+                (Some(head), _) if !usable_fingerprint(head) => (0, head.clone(), None),
+                // Same file still at this path: resume where we left off, unless
+                // it was truncated in place (size shrank below the offset).
+                (Some(head), Some(state)) if same_log_file(&state.head, head) => {
+                    (clamp_to_size(state.offset, snap.size), head.clone(), None)
+                }
+                // A new path, or the content at this path changed (rotation).
+                // Follow the content by fingerprint from wherever it last was to
+                // drain its unread tail; otherwise it is genuinely new — read
+                // from the start.
+                (Some(head), _) => match carry_source(prev, &snap.path, head) {
+                    Some((from, offset)) => (
+                        clamp_to_size(offset, snap.size),
+                        head.clone(),
+                        Some(from.clone()),
+                    ),
+                    None => (0, head.clone(), None),
+                },
+            };
+            FollowPlan {
+                path: snap.path.clone(),
+                resume,
+                size: snap.size,
+                head,
+                carried_from,
+            }
+        })
+        .collect()
+}
+
+/// Clamp a resume offset to a known file size — a file that shrank below it was
+/// truncated in place. An unknown size leaves the offset alone: treating a
+/// failed `stat` as an empty file would rewind to 0 and re-print the whole file
+/// on the next successful poll.
+fn clamp_to_size(offset: u64, size: Option<u64>) -> u64 {
+    match size {
+        Some(size) => offset.min(size),
+        None => offset,
+    }
+}
+
+/// Find the tracked file, at a path other than `path`, whose content matches
+/// `head` — that is, the path this content was renamed from.
+///
+/// Ties are broken deterministically, and towards the most-advanced reader of
+/// that content: matching fingerprints mean identical bytes, so the largest
+/// offset is the furthest *correct* read and re-prints the least.
+fn carry_source<'a>(
+    prev: &'a HashMap<PathBuf, FollowedFile>,
+    path: &Path,
+    head: &[u8],
+) -> Option<(&'a PathBuf, u64)> {
+    prev.iter()
+        .filter(|(other, state)| other.as_path() != path && same_log_file(&state.head, head))
+        .max_by(|(a_path, a), (b_path, b)| {
+            a.head
+                .len()
+                .cmp(&b.head.len())
+                .then(a.offset.cmp(&b.offset))
+                .then(a_path.cmp(b_path))
+        })
+        .map(|(other, state)| (other, state.offset))
+}
+
+/// Carry forward the state of tracked files that this poll's directory listing
+/// did not report, up to [`MAX_MISSED_POLLS`] consecutive misses.
+///
+/// A `read_dir` racing the daemon's rotation — one delete and up to five
+/// renames, see `binaries/daemon/src/log.rs` — can miss an entry that still
+/// exists. Dropping its offset would re-print the file in full when it
+/// reappears. Paths whose content was carried to a new path are not retained:
+/// that content is accounted for at its new home, and a second entry for it
+/// would make a later carry ambiguous.
+fn retain_unlisted_state(
+    prev: &HashMap<PathBuf, FollowedFile>,
+    next: &mut HashMap<PathBuf, FollowedFile>,
+    carried_from: &[PathBuf],
+) {
+    for (path, state) in prev {
+        if next.contains_key(path) || carried_from.contains(path) {
+            continue;
+        }
+        let missed_polls = state.missed_polls + 1;
+        if missed_polls < MAX_MISSED_POLLS {
+            next.insert(
+                path.clone(),
+                FollowedFile {
+                    missed_polls,
+                    ..state.clone()
+                },
+            );
+        }
+    }
+}
+
+/// Read log lines appended to the already-open `file` after byte offset `pos`,
+/// returning the parsed messages and the new byte offset.
+///
+/// Takes an open handle rather than a path so the read cannot fail — or land on
+/// different content — because the daemon renamed or deleted the file between
+/// the caller's observation of it and this read.
+///
+/// Only *complete* (newline-terminated) lines are consumed. A trailing partial
+/// line — the daemon may be mid-write — is left unconsumed so it is re-read once
+/// completed, rather than being parsed as a broken JSON line and dropped. The
+/// returned offset advances only past the bytes actually consumed, never past
+/// the (racily larger) file size, so nothing is re-read and duplicated on the
+/// next poll. Bytes are decoded lossily so a read that ends inside a multibyte
+/// UTF-8 sequence cannot abort the follow session.
+fn read_appended_log_lines(
+    file: &mut std::fs::File,
+    path: &Path,
+    pos: u64,
+) -> Result<(Vec<LogMessage>, u64)> {
+    file.seek(std::io::SeekFrom::Start(pos))?;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf)?;
+    let consumed = match buf.iter().rposition(|&b| b == b'\n') {
+        Some(idx) => idx + 1,
+        None => return Ok((Vec::new(), pos)),
+    };
+    let text = String::from_utf8_lossy(&buf[..consumed]);
+    // Route through the same per-file parser as the initial read so raw lines
+    // appended to a legacy `.txt` file are surfaced rather than silently
+    // dropped (they parse as `None` under `parse_jsonl_line`).
+    let messages = parse_log_content(path, &text);
+    Ok((messages, pos + consumed as u64))
 }
 
 fn find_dataflow_dir(out_dir: &Path, dataflow_id: Option<&str>) -> Result<PathBuf> {
@@ -407,9 +813,13 @@ fn find_log_files(dataflow_dir: &Path) -> Result<Vec<PathBuf>> {
 /// Extract rotation index from a log filename. Current file returns 0, `.1.jsonl` returns 1, etc.
 fn rotation_index(path: &Path) -> u32 {
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    // Pattern: log_<node>.<N>.jsonl
+    // Pattern: log_<node>.<N>.<ext>, where <ext> is `jsonl` or the legacy
+    // `txt`. `find_log_files` collects both extensions, so both must be handled
+    // here or a rotated `.txt` file sorts as if it were the current file.
     if let Some(rest) = name.strip_prefix("log_")
-        && let Some(rest) = rest.strip_suffix(".jsonl")
+        && let Some(rest) = rest
+            .strip_suffix(".jsonl")
+            .or_else(|| rest.strip_suffix(".txt"))
     {
         // Check if the last segment after the last '.' is a number
         if let Some(dot_pos) = rest.rfind('.')
@@ -419,6 +829,29 @@ fn rotation_index(path: &Path) -> u32 {
         }
     }
     0 // current file
+}
+
+/// Whether the remainder left after stripping `log_<node>` from a filename is a
+/// valid log-file suffix: exactly `.jsonl`/`.txt`, or a rotated
+/// `.<index>.jsonl`/`.<index>.txt`.
+///
+/// A bare `starts_with('.') && ends_with(".jsonl")` check is not enough: a node
+/// id may contain non-leading dots (`validate_node_id` allows `cam.left`), so
+/// stripping `log_cam` from `log_cam.left.jsonl` yields `.left.jsonl`, which
+/// would otherwise be wrongly attributed to node `cam`. Requiring the remainder
+/// to be an exact suffix keeps a dot-prefix sibling's logs from leaking through.
+fn is_node_log_suffix(rest: &str) -> bool {
+    let Some(inner) = rest
+        .strip_suffix(".jsonl")
+        .or_else(|| rest.strip_suffix(".txt"))
+    else {
+        return false;
+    };
+    // `inner` is now "" for the current file, or ".<index>" for a rotated one.
+    inner.is_empty()
+        || inner
+            .strip_prefix('.')
+            .is_some_and(|idx| !idx.is_empty() && idx.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Find all log files for a node (including rotated), oldest first.
@@ -437,7 +870,7 @@ fn find_node_log_files(dataflow_dir: &Path, node: &NodeId) -> Result<Vec<PathBuf
             Some(rest) => rest,
             None => continue,
         };
-        if rest.starts_with('.') && (rest.ends_with(".jsonl") || rest.ends_with(".txt")) {
+        if is_node_log_suffix(rest) {
             files.push(entry.path());
         }
     }
@@ -461,39 +894,114 @@ fn find_node_log_files(dataflow_dir: &Path, node: &NodeId) -> Result<Vec<PathBuf
 }
 
 fn read_log_file(path: &Path) -> Result<Vec<LogMessage>> {
-    let content = std::fs::read_to_string(path)
-        .wrap_err_with(|| format!("failed to read {}", path.display()))?;
+    // Decode lossily, like `read_log_file_tracked`: a file whose tail ends
+    // inside a multi-byte UTF-8 sequence (a line the daemon is still writing,
+    // or one cut short by a crash) or a legacy `.txt` log holding raw console
+    // bytes must not make every log of the dataflow unreadable.
+    let bytes =
+        std::fs::read(path).wrap_err_with(|| format!("failed to read {}", path.display()))?;
+    Ok(parse_log_content(path, &String::from_utf8_lossy(&bytes)))
+}
 
-    let is_jsonl = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e == "jsonl")
-        .unwrap_or(false);
+/// Read a log file for follow mode: the messages to print plus the follow state
+/// (bytes consumed and head fingerprint) derived from that same read.
+///
+/// Deriving both from one read closes the window in which a rotation between
+/// the initial print pass and a separate fingerprint pass would leave the
+/// rotated file untracked, so the first poll would treat it as brand new and
+/// re-print content already on screen.
+///
+/// Only complete (newline-terminated) lines are consumed, matching
+/// [`read_appended_log_lines`], so a line the daemon is part-way through
+/// writing is printed once — by a later poll — rather than twice or never.
+fn read_log_file_tracked(path: &Path) -> Result<(Vec<LogMessage>, FollowedFile)> {
+    // Read raw bytes and decode lossily, mirroring `read_appended_log_lines`:
+    // if this initial read races the daemon and the tail ends inside a
+    // multi-byte UTF-8 sequence, strict decoding (`read_to_string`) would abort
+    // the whole follow session — the very race the poll loop is written to
+    // survive. `head`, `consumed`, and the stored `offset` are derived from the
+    // raw buffer so the byte offset later polls seek to stays correct (a lossy
+    // `String`'s U+FFFD replacements would shift those offsets).
+    let bytes =
+        std::fs::read(path).wrap_err_with(|| format!("failed to read {}", path.display()))?;
+    let head = bytes[..bytes.len().min(LOG_HEAD_FINGERPRINT_LEN)].to_vec();
+    let consumed = match bytes.iter().rposition(|&b| b == b'\n') {
+        Some(idx) => idx + 1,
+        None => 0,
+    };
+    // Only the newline-terminated prefix is parsed; a partial trailing line is
+    // left for a later poll. Decoding lossily cannot abort here.
+    let content = String::from_utf8_lossy(&bytes[..consumed]);
+    let messages = parse_log_content(path, &content);
+    Ok((
+        messages,
+        FollowedFile {
+            offset: consumed as u64,
+            head,
+            missed_polls: 0,
+        },
+    ))
+}
 
-    if is_jsonl {
-        Ok(content
+/// Whether `path` is the structured `.jsonl` format the daemon writes today,
+/// as opposed to a legacy raw-text `.txt` file. A non-JSON line in a `.jsonl`
+/// file is a corrupt record and is skipped; a non-JSON line in a `.txt` file is
+/// real console output and is preserved as a raw [`LogMessage`].
+fn is_jsonl_log_file(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()) == Some("jsonl")
+}
+
+/// Wrap a raw (non-JSON) log line as a synthetic [`LogMessage`] so it flows
+/// through the same filter → sort → print pipeline as structured logs, instead
+/// of being written to stdout verbatim (which bypassed `--grep`/`--tail`/
+/// `--since`/`--until` and printed out of timestamp order).
+///
+/// Raw lines carry no timestamp or level, so they follow a defined policy: the
+/// `Stdout` channel — untyped console output, which passes the default level
+/// filter — and the Unix epoch as timestamp, so they sort ahead of timestamped
+/// records and are treated as the oldest possible line by `--since`/`--until`.
+fn raw_text_log_message(line: &str) -> LogMessage {
+    LogMessage {
+        build_id: None,
+        dataflow_id: None,
+        node_id: None,
+        daemon_id: None,
+        level: dora_message::common::LogLevelOrStdout::Stdout,
+        target: None,
+        module_path: None,
+        file: None,
+        line: None,
+        message: line.to_string(),
+        // Unix epoch. `from_timestamp_nanos` is infallible, so this keeps the
+        // production unwrap/expect budget clean.
+        timestamp: DateTime::from_timestamp_nanos(0),
+        fields: None,
+    }
+}
+
+/// Parse one line of a legacy `.txt` log file: a structured record if it parses
+/// as JSON, otherwise the raw line wrapped via [`raw_text_log_message`]. Blank
+/// lines yield `None`, matching the `.jsonl` path.
+fn parse_txt_log_line(line: &str) -> Option<LogMessage> {
+    if line.trim().is_empty() {
+        return None;
+    }
+    Some(parse_jsonl_line(line).unwrap_or_else(|| raw_text_log_message(line)))
+}
+
+/// Parse log file `content` into messages. `.jsonl` files keep only structured
+/// records; legacy `.txt` files preserve raw (non-JSON) lines as synthetic
+/// [`LogMessage`]s so they filter and sort alongside structured logs (including
+/// the raw lines of a mixed-content file, which used to be dropped).
+fn parse_log_content(path: &Path, content: &str) -> Vec<LogMessage> {
+    if is_jsonl_log_file(path) {
+        content
             .lines()
             .filter(|line| !line.trim().is_empty())
             .filter_map(parse_jsonl_line)
-            .collect())
+            .collect()
     } else {
-        // Legacy .txt files: try to parse each line as JSON (LogMessage)
-        // If that fails, treat as raw text
-        let messages: Vec<LogMessage> = content
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .filter_map(parse_jsonl_line)
-            .collect();
-
-        if messages.is_empty() {
-            // Raw text file, just print it directly
-            std::io::stdout()
-                .write_all(content.as_bytes())
-                .wrap_err("failed to write to stdout")?;
-            Ok(Vec::new())
-        } else {
-            Ok(messages)
-        }
+        content.lines().filter_map(parse_txt_log_line).collect()
     }
 }
 
@@ -536,6 +1044,18 @@ fn apply_grep(messages: Vec<LogMessage>, pattern: Option<&str>) -> Vec<LogMessag
         .collect()
 }
 
+/// Drop messages that the configured minimum-level / per-node level filters
+/// would suppress. This must run *before* `apply_tail` so that `--tail N`
+/// counts only lines that will actually be displayed; otherwise `print_log_message`
+/// applies the level filter after tailing and the visible output can be shorter
+/// than `N` (or empty), even when far more matching lines exist.
+fn apply_level_filter(messages: Vec<LogMessage>, config: &LogOutputConfig) -> Vec<LogMessage> {
+    messages
+        .into_iter()
+        .filter(|msg| message_passes_level_filter(msg, config))
+        .collect()
+}
+
 fn apply_tail(messages: Vec<LogMessage>, tail: Option<usize>) -> Vec<LogMessage> {
     match tail {
         Some(n) => messages
@@ -548,6 +1068,29 @@ fn apply_tail(messages: Vec<LogMessage>, tail: Option<usize>) -> Vec<LogMessage>
             .collect(),
         None => messages,
     }
+}
+
+/// The shared client-side display pipeline used by every non-follow log path:
+/// time filter → grep → level filter → tail, in that order.
+///
+/// `apply_level_filter` MUST come before `apply_tail` so that `--tail N` counts
+/// only lines that will actually be displayed (otherwise the level filter, which
+/// `print_log_message` applies last, can shrink the output below `N` or to
+/// nothing). Routing all four call sites through this single helper keeps that
+/// ordering from drifting apart between them.
+fn filter_and_tail(
+    messages: Vec<LogMessage>,
+    since: Option<std::time::Duration>,
+    until: Option<std::time::Duration>,
+    grep: Option<&str>,
+    config: &LogOutputConfig,
+    tail: Option<usize>,
+    now: DateTime<Utc>,
+) -> Vec<LogMessage> {
+    let filtered = apply_time_filters(messages, since, until, now);
+    let grepped = apply_grep(filtered, grep);
+    let leveled = apply_level_filter(grepped, config);
+    apply_tail(leveled, tail)
 }
 
 fn matches_grep(msg: &LogMessage, pattern: Option<&str>) -> bool {
@@ -570,33 +1113,179 @@ fn matches_grep(msg: &LogMessage, pattern: Option<&str>) -> bool {
 }
 
 /// Subscribe to coordinator log stream with time/grep filtering.
+/// Fetches historical logs of every node in the dataflow, merges them by
+/// timestamp, and prints them through the shared filter pipeline.
+fn all_nodes_logs_from_coordinator(
+    session: &WsSession,
+    uuid: Uuid,
+    args: &LogsArgs,
+    config: &LogOutputConfig,
+) -> Result<()> {
+    let reply = send_control_request(session, &ControlRequest::GetNodeInfo)?;
+    let nodes = expect_reply!(reply, NodeInfoList(data))?;
+    let node_ids: Vec<NodeId> = nodes
+        .into_iter()
+        .filter(|info| info.dataflow_id == uuid)
+        .map(|info| info.node_id)
+        .collect();
+
+    // GetNodeInfo only covers *running* dataflows. For a finished/archived
+    // dataflow the node list is empty — try the descriptor of a still-running
+    // dataflow first, otherwise fall back to the local out/ directory (the
+    // same fallback used when no coordinator is reachable) so post-mortem
+    // `dora logs` still shows something instead of silently printing nothing.
+    let node_ids = if node_ids.is_empty() {
+        let info = send_control_request(
+            session,
+            &ControlRequest::Info {
+                dataflow_uuid: uuid,
+            },
+        )
+        .and_then(|reply| expect_reply!(reply, DataflowInfo { descriptor }));
+        match info {
+            Ok(descriptor) => descriptor.nodes.into_iter().map(|node| node.id).collect(),
+            Err(_) => {
+                eprintln!(
+                    "note: dataflow `{uuid}` is not running — reading logs from the local out/ \
+                     directory.\n  hint: the coordinator still serves archived logs per node: \
+                     `dora logs {uuid} --node <NAME>`"
+                );
+                return read_local_logs(args);
+            }
+        }
+    } else {
+        node_ids
+    };
+
+    let mut messages = Vec::new();
+    for node in node_ids {
+        // One unreachable node (e.g. a disconnected daemon in a multi-machine
+        // dataflow) must not discard the logs of the healthy nodes.
+        let logs = send_control_request(
+            session,
+            &ControlRequest::Logs {
+                uuid: Some(uuid),
+                name: None,
+                node: node.to_string(),
+                // Tail must apply to the merged stream, so fetch everything
+                // per node and trim after sorting.
+                tail: None,
+            },
+        )
+        .and_then(|reply| expect_reply!(reply, Logs(data)));
+        match logs {
+            Ok(logs) => {
+                let content = String::from_utf8_lossy(&logs);
+                messages.extend(content.lines().filter_map(parse_jsonl_line));
+            }
+            Err(err) => {
+                eprintln!("warning: could not fetch logs for node `{node}`: {err}");
+            }
+        }
+    }
+    messages.sort_by_key(|msg| msg.timestamp);
+
+    let now = Utc::now();
+    let display = filter_and_tail(
+        messages,
+        args.since,
+        args.until,
+        args.grep.as_deref(),
+        config,
+        args.tail,
+        now,
+    );
+    for msg in display {
+        print_log_message(msg, config);
+    }
+    Ok(())
+}
+
+/// Returns whether a log message should be kept given an optional node filter.
+/// `None` means no filtering (messages from every node pass); `Some(want)`
+/// keeps only messages whose node id equals `want`.
+fn matches_node_filter(msg_node: Option<&str>, want: Option<&str>) -> bool {
+    match want {
+        None => true,
+        Some(want) => msg_node == Some(want),
+    }
+}
+
+/// The level to subscribe the coordinator log stream at when following: the
+/// most verbose (highest) filter across the global `level` and every per-node
+/// `--log-filter` override.
+///
+/// The coordinator drops any message strictly more verbose than the
+/// subscription level, so the stream must be opened at least as verbosely as
+/// the loosest filter the client might display; the precise per-node decision
+/// is left to the client-side `should_display`. `Stdout` maps to `Trace` (the
+/// most permissive filter), matching how the coordinator treats it.
+fn follow_subscription_level(
+    level: &dora_core::build::LogLevelOrStdout,
+    node_filters: &HashMap<String, dora_core::build::LogLevelOrStdout>,
+) -> log::LevelFilter {
+    fn as_filter(level: &dora_core::build::LogLevelOrStdout) -> log::LevelFilter {
+        match level {
+            dora_core::build::LogLevelOrStdout::Stdout => log::LevelFilter::Trace,
+            dora_core::build::LogLevelOrStdout::LogLevel(l) => l.to_level_filter(),
+        }
+    }
+    node_filters
+        .values()
+        .map(as_filter)
+        .fold(as_filter(level), std::cmp::max)
+}
+
+/// Subscribe to coordinator log stream with time/grep/node filtering.
+///
+/// `node`, when set, restricts the stream to messages from that single node —
+/// mirroring the node scoping already applied to the historical fetch in
+/// [`logs`]. Without this, `--node <N> --follow` would show history for `N`
+/// but then stream live logs from every node once following began.
 fn stream_logs_from_coordinator(
     session: &WsSession,
     uuid: Uuid,
-    level: &dora_core::build::LogLevelOrStdout,
+    node: Option<&NodeId>,
     since: Option<std::time::Duration>,
     until: Option<std::time::Duration>,
     grep: Option<&str>,
     config: &LogOutputConfig,
 ) -> Result<()> {
-    let log_level = match level {
-        dora_core::build::LogLevelOrStdout::Stdout => log::LevelFilter::Trace,
-        dora_core::build::LogLevelOrStdout::LogLevel(l) => l.to_level_filter(),
-    };
+    // Subscribe at the most verbose level requested by *any* active filter --
+    // the global `--level` and every per-node `--log-filter` override. The
+    // coordinator drops messages more verbose than the subscription level
+    // (`LogSubscriber::send_message`), so subscribing at only the global level
+    // would starve a per-node filter that is more verbose than the global one:
+    // the historical dump (fetched unfiltered, filtered client-side) would show
+    // those lines but the live `--follow` stream never would. The precise
+    // per-node filtering is then applied client-side by `print_log_message`.
+    //
+    // Both the subscription width and the client-side display filter read from
+    // the same `config`, so they cannot drift apart.
+    let log_level = follow_subscription_level(&config.min_level, &config.node_filters);
 
     let now = Utc::now();
     let since_threshold =
         since.and_then(|d| chrono::TimeDelta::from_std(d).ok().map(|td| now - td));
     let until_threshold =
         until.and_then(|d| chrono::TimeDelta::from_std(d).ok().map(|td| now - td));
+    let want_node = node.map(|n| n.as_ref());
 
-    let log_rx = session.subscribe_logs(
-        &serde_json::to_vec(&ControlRequest::LogSubscribe {
-            dataflow_id: uuid,
-            level: log_level,
-        })
-        .wrap_err("failed to serialize message")?,
-    )?;
+    let request = serde_json::to_vec(&ControlRequest::LogSubscribe {
+        dataflow_id: uuid,
+        level: log_level,
+    })
+    .wrap_err("failed to serialize message")?;
+    let log_rx = match session.subscribe_logs(&request) {
+        Ok(rx) => rx,
+        // The dataflow finished (and was dropped from the running table)
+        // before the live subscription was accepted. The historical logs
+        // have already been printed by `logs`, so this is a clean end of
+        // stream, not an error — mirror `wait_until_dataflow_started`, which
+        // tolerates the same race for sub-second dataflows.
+        Err(err) if error_indicates_dataflow_finished(&err.to_string()) => return Ok(()),
+        Err(err) => return Err(err).wrap_err("failed to subscribe to logs"),
+    };
 
     while let Ok(raw) = log_rx.recv() {
         let raw = match raw {
@@ -610,6 +1299,10 @@ fn stream_logs_from_coordinator(
             serde_json::from_slice(&raw).context("failed to parse log message");
         match parsed {
             Ok(log_message) => {
+                if !matches_node_filter(log_message.node_id.as_ref().map(|n| n.as_ref()), want_node)
+                {
+                    continue;
+                }
                 if let Some(threshold) = since_threshold
                     && log_message.timestamp < threshold
                 {
@@ -641,7 +1334,6 @@ pub fn logs(
     tail: Option<usize>,
     follow: bool,
     grep: Option<&str>,
-    level: &dora_core::build::LogLevelOrStdout,
     since: Option<std::time::Duration>,
     until: Option<std::time::Duration>,
     config: &LogOutputConfig,
@@ -653,8 +1345,16 @@ pub fn logs(
                 uuid: Some(uuid),
                 name: None,
                 node: node.to_string(),
-                tail: if since.is_some() || until.is_some() || grep.is_some() {
-                    // Fetch all logs when filtering client-side, apply tail after
+                tail: if since.is_some()
+                    || until.is_some()
+                    || grep.is_some()
+                    || level_filter_is_active(config)
+                {
+                    // Fetch all logs when filtering client-side, apply tail after.
+                    // The level filter counts here too: pre-tailing at the
+                    // coordinator would trim older matching lines before the
+                    // level filter runs, so `--tail N --level error` could show
+                    // fewer than N (or zero) errors even when many exist.
                     None
                 } else {
                     tail
@@ -668,9 +1368,7 @@ pub fn logs(
     let now = Utc::now();
     let content = String::from_utf8_lossy(&logs);
     let messages: Vec<LogMessage> = content.lines().filter_map(parse_jsonl_line).collect();
-    let filtered = apply_time_filters(messages, since, until, now);
-    let grepped = apply_grep(filtered, grep);
-    let display = apply_tail(grepped, tail);
+    let display = filter_and_tail(messages, since, until, grep, config, tail, now);
     for msg in display {
         print_log_message(msg, config);
     }
@@ -679,13 +1377,14 @@ pub fn logs(
         return Ok(());
     }
 
-    stream_logs_from_coordinator(session, uuid, level, since, until, grep, config)
+    stream_logs_from_coordinator(session, uuid, Some(&node), since, until, grep, config)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use dora_message::common::LogLevelOrStdout;
+    use std::io::Write;
     use std::path::PathBuf;
 
     fn make_msg(
@@ -730,6 +1429,15 @@ mod tests {
     #[test]
     fn rotation_index_txt_file() {
         assert_eq!(rotation_index(&PathBuf::from("log_sensor.txt")), 0);
+    }
+
+    #[test]
+    fn rotation_index_rotated_txt_file() {
+        // `find_log_files` collects rotated legacy `.txt` files too, so their
+        // index must be parsed like `.jsonl`. Before the fix this returned 0
+        // (treated as the current file) and sorted out of order.
+        assert_eq!(rotation_index(&PathBuf::from("log_sensor.1.txt")), 1);
+        assert_eq!(rotation_index(&PathBuf::from("log_sensor.3.txt")), 3);
     }
 
     // --- apply_time_filters ---
@@ -794,6 +1502,40 @@ mod tests {
         );
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].message, "mid");
+    }
+
+    // Regression for the local `--follow` wiring (not just `apply_time_filters`
+    // in isolation): `follow_local_logs` selects each poll's lines through
+    // `select_follow_messages`, which must apply the `--since`/`--until` window —
+    // like the initial batch and the coordinator follow path — in addition to
+    // `--grep`. A line appended "now" is newer than the `--until` cutoff and must
+    // be dropped while an older line survives; if the loop regressed to
+    // grep-only, the fresh line would leak and this test would fail.
+    #[test]
+    fn follow_selection_applies_until_window_and_grep() {
+        let now = Utc::now();
+        let just_appended = now - chrono::TimeDelta::seconds(1);
+        let old = now - chrono::TimeDelta::hours(2);
+        let msgs = vec![
+            make_msg("live", None, None, just_appended),
+            make_msg("old", None, None, old),
+        ];
+        // until=5m -> only lines older than 5 minutes survive.
+        let until = Some(std::time::Duration::from_secs(300));
+        let result = select_follow_messages(msgs.clone(), None, until, None, now);
+        assert_eq!(
+            result.len(),
+            1,
+            "a fresh follow line must be suppressed by --until, the old line kept"
+        );
+        assert_eq!(result[0].message, "old");
+
+        // `--grep` is applied on top of the time window.
+        let result = select_follow_messages(msgs, None, until, Some("nomatch"), now);
+        assert!(
+            result.is_empty(),
+            "grep must further filter the time-windowed selection"
+        );
     }
 
     // --- apply_grep ---
@@ -904,6 +1646,30 @@ mod tests {
         assert!(!matches_grep(&msg, Some("zzz_missing")));
     }
 
+    // --- matches_node_filter ---
+
+    #[test]
+    fn node_filter_none_passes_everything() {
+        assert!(matches_node_filter(Some("sensor"), None));
+        assert!(matches_node_filter(None, None));
+    }
+
+    #[test]
+    fn node_filter_matching_node_passes() {
+        assert!(matches_node_filter(Some("sensor"), Some("sensor")));
+    }
+
+    #[test]
+    fn node_filter_other_node_is_dropped() {
+        assert!(!matches_node_filter(Some("processor"), Some("sensor")));
+    }
+
+    #[test]
+    fn node_filter_system_message_is_dropped_when_node_requested() {
+        // System messages (no node_id) should not leak through a --node filter.
+        assert!(!matches_node_filter(None, Some("sensor")));
+    }
+
     #[test]
     fn find_node_log_files_does_not_match_prefix_sharing_nodes() {
         use std::fs::File;
@@ -912,11 +1678,689 @@ mod tests {
         let dir = tempdir().unwrap();
         File::create(dir.path().join("log_cam.jsonl")).unwrap();
         File::create(dir.path().join("log_cam_left.jsonl")).unwrap();
+        // A node id may contain a non-leading dot, so `cam.left` is a valid,
+        // distinct node whose log file must NOT be attributed to `cam`.
+        File::create(dir.path().join("log_cam.left.jsonl")).unwrap();
+        // A rotated file for the queried node still belongs to it.
+        File::create(dir.path().join("log_cam.1.jsonl")).unwrap();
 
         let node_id = NodeId::from("cam".to_string());
         let files = find_node_log_files(dir.path(), &node_id).unwrap();
 
-        assert_eq!(files.len(), 1);
-        assert!(files[0].file_name().unwrap() == "log_cam.jsonl");
+        let names: std::collections::HashSet<_> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            names,
+            ["log_cam.jsonl", "log_cam.1.jsonl"]
+                .into_iter()
+                .map(String::from)
+                .collect()
+        );
+    }
+
+    #[test]
+    fn is_node_log_suffix_accepts_only_exact_suffixes() {
+        // Current file and rotated variants for the queried node.
+        assert!(is_node_log_suffix(".jsonl"));
+        assert!(is_node_log_suffix(".txt"));
+        assert!(is_node_log_suffix(".1.jsonl"));
+        assert!(is_node_log_suffix(".42.txt"));
+        // A dot-prefix sibling (`log_cam.left.jsonl` stripped of `log_cam`).
+        assert!(!is_node_log_suffix(".left.jsonl"));
+        assert!(!is_node_log_suffix(".left.txt"));
+        // Non-numeric rotation segment and unrelated extensions.
+        assert!(!is_node_log_suffix(".x.jsonl"));
+        assert!(!is_node_log_suffix(".jsonl.bak"));
+        assert!(!is_node_log_suffix(""));
+    }
+
+    // --- follow-mode rotation planning (plan_follow_reads / same_log_file) ---
+
+    fn followed(offset: u64, head: &[u8]) -> FollowedFile {
+        FollowedFile {
+            offset,
+            head: head.to_vec(),
+            missed_polls: 0,
+        }
+    }
+
+    fn snap(path: &str, size: u64, head: &[u8]) -> LogFileSnapshot {
+        LogFileSnapshot {
+            path: PathBuf::from(path),
+            size: Some(size),
+            head: Some(head.to_vec()),
+        }
+    }
+
+    /// A complete JSONL line as it lands on disk, with a real trailing newline
+    /// (a raw byte string spells `\n` as two literal bytes, not a newline).
+    fn log_line(body: &str) -> Vec<u8> {
+        format!("{body}\n").into_bytes()
+    }
+
+    /// A file the poll could neither stat nor read (transient I/O failure).
+    fn snap_unreadable(path: &str) -> LogFileSnapshot {
+        LogFileSnapshot {
+            path: PathBuf::from(path),
+            size: None,
+            head: None,
+        }
+    }
+
+    fn read_appended_at(path: &Path, pos: u64) -> Result<(Vec<LogMessage>, u64)> {
+        let mut file = std::fs::File::open(path)?;
+        read_appended_log_lines(&mut file, path, pos)
+    }
+
+    fn resume_for<'a>(plans: &'a [FollowPlan], path: &str) -> &'a FollowPlan {
+        plans
+            .iter()
+            .find(|p| p.path == *Path::new(path))
+            .expect("plan for path")
+    }
+
+    #[test]
+    fn same_log_file_matches_growing_prefix_only() {
+        // A followed file only ever grows, extending its head — a recorded head
+        // that is a prefix of the current one is the same file.
+        assert!(same_log_file(b"line1\n", b"line1\nline2\n"));
+        assert!(same_log_file(b"line1\nline2\n", b"line1\n"));
+        // A rotated-in fresh file starts with a different first line.
+        assert!(!same_log_file(b"old-first\n", b"new-first\n"));
+        // Two unreadable (empty) fingerprints must never be treated as equal.
+        assert!(!same_log_file(b"", b""));
+    }
+
+    #[test]
+    fn partial_first_line_is_not_a_usable_fingerprint() {
+        // Every JSONL line opens with the same shape, so a head captured before
+        // the first line was fully written is a prefix of every other log file
+        // — including the fresh file a rotation just created. Matching on it
+        // would resume the fresh file at the stale offset and garble it.
+        let partial = br#"{"ts":"2026-07-29T03:37:5"#;
+        assert!(!usable_fingerprint(partial));
+        assert!(!same_log_file(
+            partial,
+            &log_line(r#"{"ts":"2026-07-29T03:37:55.123Z","msg":"b"}"#)
+        ));
+        // A complete first line is distinguishing, and so is a full window.
+        assert!(usable_fingerprint(b"{\"ts\":\"a\"}\n"));
+        assert!(usable_fingerprint(&vec![b'x'; LOG_HEAD_FINGERPRINT_LEN]));
+    }
+
+    #[test]
+    fn plan_resumes_from_offset_on_plain_append() {
+        let mut prev = HashMap::new();
+        prev.insert(PathBuf::from("log_n.jsonl"), followed(10, b"AAAA\n"));
+        let plans = plan_follow_reads(&prev, &[snap("log_n.jsonl", 25, b"AAAA\nmore")]);
+        assert_eq!(resume_for(&plans, "log_n.jsonl").resume, 10);
+    }
+
+    #[test]
+    fn plan_reads_brand_new_file_from_start() {
+        let prev = HashMap::new();
+        let plans = plan_follow_reads(&prev, &[snap("log_n.jsonl", 5, b"X\n")]);
+        assert_eq!(resume_for(&plans, "log_n.jsonl").resume, 0);
+    }
+
+    #[test]
+    fn plan_rotation_drains_tail_and_reads_fresh_file_from_zero() {
+        // Before: current file at offset 100 (head OLD). After rotation the old
+        // content is at `.1.jsonl` (grown to 150 as the final flush landed) and
+        // a fresh current file (head NEW) exists.
+        let mut prev = HashMap::new();
+        prev.insert(PathBuf::from("log_n.jsonl"), followed(100, b"OLDHEAD\n"));
+        let plans = plan_follow_reads(
+            &prev,
+            &[
+                snap("log_n.1.jsonl", 150, b"OLDHEAD\n"),
+                snap("log_n.jsonl", 40, b"NEWHEAD\n"),
+            ],
+        );
+        // The rotated file's unread tail [100..150) is drained exactly once.
+        assert_eq!(resume_for(&plans, "log_n.1.jsonl").resume, 100);
+        // The fresh file is read from the start, not the stale offset.
+        assert_eq!(resume_for(&plans, "log_n.jsonl").resume, 0);
+    }
+
+    #[test]
+    fn plan_fresh_file_grown_past_offset_is_not_garbled() {
+        // Residual gap #1: the fresh current file grew past the stale offset
+        // (200 > 100) within one poll. A size-only check would seek to 100 and
+        // start mid-line; the differing fingerprint makes it a new file at 0.
+        let mut prev = HashMap::new();
+        prev.insert(PathBuf::from("log_n.jsonl"), followed(100, b"OLDHEAD\n"));
+        let plans = plan_follow_reads(
+            &prev,
+            &[
+                snap("log_n.1.jsonl", 150, b"OLDHEAD\n"),
+                snap("log_n.jsonl", 200, b"NEWHEAD\n"),
+            ],
+        );
+        assert_eq!(resume_for(&plans, "log_n.jsonl").resume, 0);
+        assert_eq!(resume_for(&plans, "log_n.1.jsonl").resume, 100);
+    }
+
+    #[test]
+    fn plan_unreadable_head_keeps_offset_instead_of_rereading() {
+        // A transient failure to read the file must not reset a tracked file to
+        // 0 — that would re-read and duplicate its whole body. Nor may the
+        // failed `stat` be taken as "size 0" and clamp the offset down to 0.
+        let mut prev = HashMap::new();
+        prev.insert(PathBuf::from("log_n.jsonl"), followed(80, b"OLDHEAD\n"));
+        let plans = plan_follow_reads(&prev, &[snap_unreadable("log_n.jsonl")]);
+        let plan = resume_for(&plans, "log_n.jsonl");
+        assert_eq!(plan.resume, 80);
+        // The recorded head is retained so the next poll can still match it.
+        assert_eq!(plan.head, b"OLDHEAD\n");
+        // Unknown size ⇒ the caller reads nothing this poll.
+        assert_eq!(plan.size, None);
+
+        // The next successful poll resumes at 80, not at 0.
+        let next: HashMap<_, _> = [(
+            plan.path.clone(),
+            FollowedFile {
+                offset: plan.resume,
+                head: plan.head.clone(),
+                missed_polls: 0,
+            },
+        )]
+        .into();
+        let plans = plan_follow_reads(&next, &[snap("log_n.jsonl", 120, b"OLDHEAD\nmore")]);
+        assert_eq!(resume_for(&plans, "log_n.jsonl").resume, 80);
+    }
+
+    #[test]
+    fn plan_partial_fresh_file_is_not_resumed_at_the_stale_offset() {
+        // Rotation, observed while the fresh current file holds only part of its
+        // first line: its head shares the `{"ts":"<same millisecond>` prefix of
+        // the file that just rotated away, so a prefix match would resume it at
+        // the stale offset and garble it. It must start at 0 instead.
+        let old = log_line(r#"{"ts":"2026-07-29T03:37:55.100Z","msg":"old"}"#);
+        let mut prev = HashMap::new();
+        prev.insert(PathBuf::from("log_n.jsonl"), followed(100, &old));
+        let plans = plan_follow_reads(
+            &prev,
+            &[
+                snap("log_n.1.jsonl", 150, &old),
+                snap("log_n.jsonl", 24, br#"{"ts":"2026-07-29T03:37:5"#),
+            ],
+        );
+        assert_eq!(resume_for(&plans, "log_n.jsonl").resume, 0);
+        assert_eq!(resume_for(&plans, "log_n.1.jsonl").resume, 100);
+    }
+
+    #[test]
+    fn plan_short_head_is_never_carried_from_an_unrelated_file() {
+        // The shared `{"ts":"` opening must not let one node's offset be carried
+        // onto another node's brand-new file.
+        let mut prev = HashMap::new();
+        prev.insert(
+            PathBuf::from("log_a.jsonl"),
+            followed(
+                500,
+                &log_line(r#"{"ts":"2026-07-29T03:37:55.100Z","node":"a"}"#),
+            ),
+        );
+        let plans = plan_follow_reads(&prev, &[snap("log_b.jsonl", 7, br#"{"ts":"#)]);
+        assert_eq!(resume_for(&plans, "log_b.jsonl").resume, 0);
+    }
+
+    #[test]
+    fn carry_source_prefers_the_furthest_read_of_identical_content() {
+        // Two tracked entries can end up holding the same fingerprint (e.g. a
+        // carry plus a poll that could not re-read the origin path). Matching
+        // fingerprints mean identical bytes, so the largest offset is the
+        // furthest correct read — and the choice must not depend on hash order.
+        let mut prev = HashMap::new();
+        prev.insert(PathBuf::from("log_n.1.jsonl"), followed(150, b"OLDHEAD\n"));
+        prev.insert(PathBuf::from("log_n.jsonl"), followed(100, b"OLDHEAD\n"));
+        for _ in 0..8 {
+            let plans = plan_follow_reads(&prev, &[snap("log_n.2.jsonl", 150, b"OLDHEAD\n")]);
+            let plan = resume_for(&plans, "log_n.2.jsonl");
+            assert_eq!(plan.resume, 150);
+            assert_eq!(plan.carried_from, Some(PathBuf::from("log_n.1.jsonl")));
+        }
+    }
+
+    #[test]
+    fn unlisted_file_keeps_its_offset_across_a_missing_poll() {
+        // A `read_dir` racing the daemon's rotation renames can miss an entry
+        // that still exists; forgetting its offset would re-print it in full.
+        let mut prev = HashMap::new();
+        prev.insert(PathBuf::from("log_n.1.jsonl"), followed(150, b"OLDHEAD\n"));
+        let mut next = HashMap::new();
+        retain_unlisted_state(&prev, &mut next, &[]);
+        let carried = next
+            .get(Path::new("log_n.1.jsonl"))
+            .expect("state retained");
+        assert_eq!(carried.offset, 150);
+        assert_eq!(carried.missed_polls, 1);
+
+        // The file reappears at the same path: resumed, not re-read.
+        let plans = plan_follow_reads(&next, &[snap("log_n.1.jsonl", 150, b"OLDHEAD\n")]);
+        assert_eq!(resume_for(&plans, "log_n.1.jsonl").resume, 150);
+    }
+
+    #[test]
+    fn unlisted_file_state_is_forgotten_after_repeated_misses() {
+        let mut prev = HashMap::new();
+        prev.insert(PathBuf::from("log_n.5.jsonl"), followed(150, b"OLDHEAD\n"));
+        for expected in 1..MAX_MISSED_POLLS {
+            let mut next = HashMap::new();
+            retain_unlisted_state(&prev, &mut next, &[]);
+            assert_eq!(
+                next["log_n.5.jsonl".as_ref() as &Path].missed_polls,
+                expected
+            );
+            prev = next;
+        }
+        // A file deleted by rotation is eventually dropped rather than tracked
+        // forever.
+        let mut next = HashMap::new();
+        retain_unlisted_state(&prev, &mut next, &[]);
+        assert!(next.is_empty());
+    }
+
+    #[test]
+    fn carried_away_path_is_not_retained() {
+        // The content moved to a new path; keeping a second entry for it would
+        // make a later carry ambiguous.
+        let mut prev = HashMap::new();
+        prev.insert(PathBuf::from("log_n.jsonl"), followed(100, b"OLDHEAD\n"));
+        let mut next = HashMap::new();
+        retain_unlisted_state(&prev, &mut next, &[PathBuf::from("log_n.jsonl")]);
+        assert!(next.is_empty());
+    }
+
+    #[test]
+    fn read_log_file_tracked_reports_the_offset_and_head_it_consumed() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("log_n.jsonl");
+        let complete = format!("{}{}", jsonl("a"), jsonl("b"));
+        // A third line the daemon is still writing.
+        let partial = format!("{complete}{{\"ts\":\"2026");
+        std::fs::write(&path, &partial).unwrap();
+
+        let (msgs, state) = read_log_file_tracked(&path).unwrap();
+        // The partial line is left for a later poll rather than printed now and
+        // printed again once complete.
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(state.offset, complete.len() as u64);
+        assert_eq!(
+            state.head,
+            partial.as_bytes()[..partial.len().min(LOG_HEAD_FINGERPRINT_LEN)].to_vec()
+        );
+
+        // A rotation right after this read strands nothing: the content is
+        // recognised at its new path and only its unread tail is drained.
+        let plans = plan_follow_reads(
+            &[(path.clone(), state)].into_iter().collect(),
+            &[
+                snap_from(&dir.path().join("log_n.1.jsonl"), 999, &partial),
+                snap_from(&path, 0, ""),
+            ],
+        );
+        let rotated = plans
+            .iter()
+            .find(|p| p.path.ends_with("log_n.1.jsonl"))
+            .unwrap();
+        assert_eq!(rotated.resume, complete.len() as u64);
+    }
+
+    #[test]
+    fn read_log_file_tracked_tolerates_a_partial_multibyte_tail() {
+        // Regression (dora-rs/dora#3257): the initial follow read must not abort
+        // when it races the daemon and the file's tail ends inside a multi-byte
+        // UTF-8 sequence — the same partial-write race `read_appended_log_lines`
+        // is written to survive on every later poll.
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("log_n.jsonl");
+        let complete = jsonl("日本語");
+        // A partial next line whose bytes end inside a 3-byte UTF-8 character
+        // (`你` = E4 BD A0), truncated to `E4 BD` — invalid UTF-8 at EOF.
+        let mut raw = complete.clone().into_bytes();
+        raw.extend_from_slice(b"{\"ts\":\"\xe4\xbd");
+        std::fs::write(&path, &raw).unwrap();
+
+        // Strict whole-buffer decoding would fail; the fix reads raw bytes and
+        // decodes only the consumed (newline-terminated) prefix lossily.
+        assert!(std::fs::read_to_string(&path).is_err());
+
+        let (msgs, state) = read_log_file_tracked(&path).unwrap();
+        assert_eq!(msgs.len(), 1);
+        // Only the newline-terminated prefix is consumed; the partial tail waits
+        // for a later poll, and the stored offset is the raw byte offset.
+        assert_eq!(state.offset, complete.len() as u64);
+    }
+
+    #[test]
+    fn read_log_file_tolerates_invalid_utf8() {
+        // `dora logs` without `--follow` used strict decoding, so one partial
+        // multi-byte character made the whole command fail.
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("log_n.jsonl");
+        let mut raw = jsonl("日本語").into_bytes();
+        raw.extend_from_slice(b"{\"ts\":\"\xe4\xbd");
+        std::fs::write(&path, &raw).unwrap();
+        let msgs = read_log_file(&path).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].message, "日本語");
+
+        // A legacy raw-text log keeps its lines, with the bad byte replaced.
+        let path = dir.path().join("log_n.txt");
+        std::fs::write(&path, b"before\nbad \xff byte\nafter").unwrap();
+        let msgs = read_log_file(&path).unwrap();
+        let lines: Vec<_> = msgs.iter().map(|m| m.message.as_str()).collect();
+        assert_eq!(lines, ["before", "bad \u{fffd} byte", "after"]);
+    }
+
+    fn snap_from(path: &Path, size: u64, content: &str) -> LogFileSnapshot {
+        let bytes = content.as_bytes();
+        LogFileSnapshot {
+            path: path.to_path_buf(),
+            size: Some(size),
+            head: Some(bytes[..bytes.len().min(LOG_HEAD_FINGERPRINT_LEN)].to_vec()),
+        }
+    }
+
+    #[test]
+    fn plan_already_read_rotated_file_is_not_reread_on_shift() {
+        // A `.1.jsonl` we had fully read (offset == len) shifts to `.2.jsonl`.
+        // The carried offset follows it, so nothing is re-read.
+        let mut prev = HashMap::new();
+        prev.insert(PathBuf::from("log_n.1.jsonl"), followed(150, b"OLDHEAD\n"));
+        let plans = plan_follow_reads(&prev, &[snap("log_n.2.jsonl", 150, b"OLDHEAD\n")]);
+        let plan = resume_for(&plans, "log_n.2.jsonl");
+        assert_eq!(plan.resume, 150);
+        assert_eq!(plan.size, Some(150)); // resume == size ⇒ nothing to read
+    }
+
+    // --- read_appended_log_lines (follow-mode offset tracking) ---
+
+    fn jsonl(message: &str) -> String {
+        let mut line = serde_json::to_string(&make_msg(message, None, None, Utc::now())).unwrap();
+        line.push('\n');
+        line
+    }
+
+    #[test]
+    fn read_appended_reads_complete_lines_and_advances_to_end() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("log.jsonl");
+        let content = format!("{}{}", jsonl("a"), jsonl("b"));
+        std::fs::write(&path, &content).unwrap();
+
+        let (msgs, new_pos) = read_appended_at(&path, 0).unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].message, "a");
+        assert_eq!(msgs[1].message, "b");
+        // Offset advances to exactly the bytes consumed (whole file here).
+        assert_eq!(new_pos, content.len() as u64);
+
+        // A follow-up read from the returned offset yields nothing and does not
+        // move the offset (no duplication).
+        let (msgs, pos2) = read_appended_at(&path, new_pos).unwrap();
+        assert!(msgs.is_empty());
+        assert_eq!(pos2, new_pos);
+    }
+
+    #[test]
+    fn read_appended_leaves_trailing_partial_line_for_next_poll() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("log.jsonl");
+
+        // First line complete, second line still being written (no newline).
+        let complete = jsonl("first");
+        let partial = {
+            let mut p = complete.clone();
+            let second =
+                serde_json::to_string(&make_msg("second", None, None, Utc::now())).unwrap();
+            p.push_str(&second); // no trailing '\n' yet
+            p
+        };
+        std::fs::write(&path, &partial).unwrap();
+
+        let (msgs, new_pos) = read_appended_at(&path, 0).unwrap();
+        assert_eq!(msgs.len(), 1, "partial line must not be parsed/emitted");
+        assert_eq!(msgs[0].message, "first");
+        // Offset stops at the last newline, not the (larger) file size.
+        assert_eq!(new_pos, complete.len() as u64);
+
+        // Daemon finishes the second line; re-reading from the saved offset now
+        // yields exactly that line — the first line is not duplicated.
+        std::fs::write(&path, format!("{complete}{}", jsonl("second"))).unwrap();
+        let (msgs, _pos) = read_appended_at(&path, new_pos).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].message, "second");
+    }
+
+    #[test]
+    fn read_appended_does_not_abort_on_split_multibyte_utf8() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("log.jsonl");
+
+        // One complete line, then a lone leading byte of a multibyte UTF-8
+        // sequence with no newline (a write caught mid-flush). `read_to_string`
+        // would return an InvalidData error here; the lossy path must not.
+        let complete = jsonl("ok");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(complete.as_bytes()).unwrap();
+        f.write_all(&[0xE2]).unwrap(); // first byte of a 3-byte char, no newline
+        drop(f);
+
+        let (msgs, new_pos) = read_appended_at(&path, 0).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].message, "ok");
+        // The dangling partial byte is left unconsumed.
+        assert_eq!(new_pos, complete.len() as u64);
+    }
+
+    // --- legacy raw-text (.txt) handling (#3312) ---
+
+    #[test]
+    fn parse_txt_wraps_raw_lines_as_stdout_messages() {
+        // A pure raw-text `.txt` file: every line becomes a synthetic message
+        // (Stdout channel, epoch timestamp) instead of being dumped verbatim, so
+        // it can flow through the filter/sort/print pipeline.
+        let path = PathBuf::from("log_node.txt");
+        let msgs = parse_log_content(&path, "hello\nworld\n");
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].message, "hello");
+        assert_eq!(msgs[1].message, "world");
+        assert!(msgs.iter().all(|m| m.level == LogLevelOrStdout::Stdout));
+        assert_eq!(msgs[0].timestamp, DateTime::from_timestamp_nanos(0));
+    }
+
+    #[test]
+    fn parse_txt_preserves_mixed_json_and_raw_lines() {
+        // Regression: a mixed-content `.txt` used to return only the JSON lines
+        // and silently drop the raw ones. Both must survive now.
+        let structured = serde_json::to_string(&msg_with_level("json", log::Level::Error, 5))
+            .expect("serialize LogMessage");
+        let content = format!("raw before\n{structured}\nraw after\n");
+        let msgs = parse_log_content(&PathBuf::from("log_node.txt"), &content);
+
+        let rendered: Vec<&str> = msgs.iter().map(|m| m.message.as_str()).collect();
+        assert_eq!(rendered, vec!["raw before", "json", "raw after"]);
+        // The structured line keeps its parsed level; the raw ones are Stdout.
+        assert_eq!(msgs[0].level, LogLevelOrStdout::Stdout);
+        assert_eq!(msgs[1].level, LogLevelOrStdout::LogLevel(log::Level::Error));
+        assert_eq!(msgs[2].level, LogLevelOrStdout::Stdout);
+    }
+
+    #[test]
+    fn parse_jsonl_skips_non_json_lines() {
+        // In a `.jsonl` file a non-JSON line is a corrupt record, not raw text,
+        // so it is skipped rather than wrapped.
+        let structured = serde_json::to_string(&msg_with_level("ok", log::Level::Info, 1))
+            .expect("serialize LogMessage");
+        let msgs = parse_log_content(
+            &PathBuf::from("log_node.jsonl"),
+            &format!("{structured}\nnot json\n"),
+        );
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].message, "ok");
+    }
+
+    #[test]
+    fn raw_txt_lines_honor_grep_and_tail() {
+        // The core bug: raw `.txt` content bypassed every client-side filter.
+        // Routed through `filter_and_tail`, `--grep` and `--tail` now apply.
+        let msgs = parse_log_content(&PathBuf::from("log_node.txt"), "alpha\nbeta\nalpha again\n");
+        let config = LogOutputConfig::default();
+
+        let grepped = filter_and_tail(
+            msgs.clone(),
+            None,
+            None,
+            Some("alpha"),
+            &config,
+            None,
+            Utc::now(),
+        );
+        let grepped_msgs: Vec<&str> = grepped.iter().map(|m| m.message.as_str()).collect();
+        assert_eq!(grepped_msgs, vec!["alpha", "alpha again"]);
+
+        let tailed = filter_and_tail(msgs, None, None, None, &config, Some(1), Utc::now());
+        let tailed_msgs: Vec<&str> = tailed.iter().map(|m| m.message.as_str()).collect();
+        assert_eq!(tailed_msgs, vec!["alpha again"]);
+    }
+
+    #[test]
+    fn read_appended_txt_surfaces_raw_lines() {
+        use tempfile::tempdir;
+
+        // Follow mode: raw lines appended to a `.txt` file must be surfaced, not
+        // dropped (they parse as `None` under `parse_jsonl_line`).
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("log_node.txt");
+        std::fs::write(&path, "line one\nline two\n").unwrap();
+
+        let (msgs, _pos) = read_appended_at(&path, 0).unwrap();
+        let rendered: Vec<&str> = msgs.iter().map(|m| m.message.as_str()).collect();
+        assert_eq!(rendered, vec!["line one", "line two"]);
+    }
+
+    // --- level filter is applied before tail ---
+
+    fn msg_with_level(message: &str, level: log::Level, ts_secs: i64) -> LogMessage {
+        let mut m = make_msg(
+            message,
+            Some("n"),
+            None,
+            DateTime::from_timestamp(ts_secs, 0).unwrap(),
+        );
+        m.level = LogLevelOrStdout::LogLevel(level);
+        m
+    }
+
+    #[test]
+    fn tail_counts_only_level_filtered_lines() {
+        // A few early errors, then many later info lines — the classic case
+        // where a naive "tail then filter" drops every error.
+        let mut messages = vec![
+            msg_with_level("err1", log::Level::Error, 1),
+            msg_with_level("err2", log::Level::Error, 2),
+        ];
+        for i in 0..20 {
+            messages.push(msg_with_level("info", log::Level::Info, 100 + i));
+        }
+
+        let config = LogOutputConfig {
+            min_level: LogLevelOrStdout::LogLevel(log::Level::Error),
+            ..Default::default()
+        };
+
+        // Drive the *production* pipeline that all four log paths route through.
+        // If the level filter ran after the tail (the bug), `--tail 5` over these
+        // 22 lines — whose last 5 are all `info` — would display nothing. The two
+        // errors survive only because `filter_and_tail` levels before it tails, so
+        // this asserts the real ordering rather than an isolated composition.
+        let shown = filter_and_tail(messages, None, None, None, &config, Some(5), Utc::now());
+        let shown_msgs: Vec<_> = shown.iter().map(|m| m.message.as_str()).collect();
+        assert_eq!(shown_msgs, vec!["err1", "err2"]);
+    }
+
+    #[test]
+    fn level_filter_active_predicate() {
+        assert!(!level_filter_is_active(&LogOutputConfig::default()));
+        let restrictive = LogOutputConfig {
+            min_level: LogLevelOrStdout::LogLevel(log::Level::Error),
+            ..Default::default()
+        };
+        assert!(level_filter_is_active(&restrictive));
+    }
+
+    // --- follow_subscription_level ---
+
+    #[test]
+    fn follow_subscription_level_uses_global_when_no_node_filters() {
+        let level = LogLevelOrStdout::LogLevel(log::Level::Error);
+        assert_eq!(
+            follow_subscription_level(&level, &HashMap::new()),
+            log::LevelFilter::Error
+        );
+    }
+
+    #[test]
+    fn follow_subscription_level_widens_to_more_verbose_node_filter() {
+        // Global `error`, but node `x` is filtered at `debug`. The coordinator
+        // drops anything more verbose than the subscription level, so
+        // subscribing at `error` would never deliver `x`'s debug/info/warn
+        // lines even though the client would display them. The subscription
+        // must widen to `debug`.
+        let level = LogLevelOrStdout::LogLevel(log::Level::Error);
+        let mut node_filters = HashMap::new();
+        node_filters.insert(
+            "x".to_string(),
+            LogLevelOrStdout::LogLevel(log::Level::Debug),
+        );
+        assert_eq!(
+            follow_subscription_level(&level, &node_filters),
+            log::LevelFilter::Debug
+        );
+    }
+
+    #[test]
+    fn follow_subscription_level_keeps_global_when_node_filter_is_less_verbose() {
+        // Global `debug`, node `x` only wants `error`. The global level is the
+        // loosest, so the subscription stays at `debug` and the client filters
+        // `x` down to `error`.
+        let level = LogLevelOrStdout::LogLevel(log::Level::Debug);
+        let mut node_filters = HashMap::new();
+        node_filters.insert(
+            "x".to_string(),
+            LogLevelOrStdout::LogLevel(log::Level::Error),
+        );
+        assert_eq!(
+            follow_subscription_level(&level, &node_filters),
+            log::LevelFilter::Debug
+        );
+    }
+
+    #[test]
+    fn follow_subscription_level_stdout_filter_is_most_permissive() {
+        let level = LogLevelOrStdout::LogLevel(log::Level::Error);
+        let mut node_filters = HashMap::new();
+        node_filters.insert("x".to_string(), LogLevelOrStdout::Stdout);
+        assert_eq!(
+            follow_subscription_level(&level, &node_filters),
+            log::LevelFilter::Trace
+        );
     }
 }

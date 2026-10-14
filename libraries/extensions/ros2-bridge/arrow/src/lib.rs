@@ -3,6 +3,70 @@ use std::{borrow::Cow, cell::RefCell, collections::HashMap, sync::Arc};
 
 pub use serialize::TypedValue;
 
+const CDR_LE_ENCAPSULATION: [u8; 4] = [0, 1, 0, 0];
+
+pub fn serialize_cdr<T: serde::Serialize>(value: &T) -> eyre::Result<Vec<u8>> {
+    let body = cdr_encoding::to_vec::<_, byteorder::LittleEndian>(value)
+        .map_err(|error| eyre::eyre!("failed to serialize ROS2 CDR: {error}"))?;
+    let mut payload = Vec::with_capacity(CDR_LE_ENCAPSULATION.len() + body.len());
+    payload.extend_from_slice(&CDR_LE_ENCAPSULATION);
+    payload.extend_from_slice(&body);
+    Ok(payload)
+}
+
+pub fn deserialize_cdr<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> eyre::Result<T> {
+    let body = cdr_little_endian_body(bytes)?;
+    let (value, consumed) = cdr_encoding::from_bytes::<T, byteorder::LittleEndian>(body)
+        .map_err(|error| eyre::eyre!("failed to deserialize ROS2 CDR: {error}"))?;
+    if consumed != body.len() {
+        eyre::bail!(
+            "ROS2 CDR payload has {} trailing bytes",
+            body.len() - consumed
+        );
+    }
+    Ok(value)
+}
+
+pub fn serialize_raw_cdr(value: &TypedValue<'_>) -> eyre::Result<Vec<u8>> {
+    serialize_cdr(value)
+}
+
+pub fn deserialize_raw_cdr(
+    bytes: &[u8],
+    type_info: TypeInfo<'static>,
+    max_payload_size: usize,
+) -> eyre::Result<arrow::array::ArrayData> {
+    if bytes.len() > max_payload_size {
+        return Err(eyre::eyre!(
+            "ROS2 CDR payload is {} bytes, limit is {max_payload_size}",
+            bytes.len()
+        ));
+    }
+    let body = cdr_little_endian_body(bytes)?;
+    let seed = deserialize::StructDeserializer::new(Cow::Owned(type_info));
+    let mut deserializer = cdr_encoding::CdrDeserializer::<byteorder::LittleEndian>::new(body);
+    let value = serde::de::DeserializeSeed::deserialize(seed, &mut deserializer)
+        .map_err(|error| eyre::eyre!("failed to deserialize ROS2 CDR: {error}"))?;
+    let consumed = deserializer.bytes_consumed();
+    if consumed != body.len() {
+        return Err(eyre::eyre!(
+            "ROS2 CDR payload has {} trailing bytes",
+            body.len() - consumed
+        ));
+    }
+    Ok(value)
+}
+
+fn cdr_little_endian_body(bytes: &[u8]) -> eyre::Result<&[u8]> {
+    let header = bytes
+        .get(..CDR_LE_ENCAPSULATION.len())
+        .ok_or_else(|| eyre::eyre!("ROS2 CDR payload is missing its encapsulation header"))?;
+    if header != CDR_LE_ENCAPSULATION {
+        eyre::bail!("unsupported ROS2 CDR encapsulation header {header:02x?}");
+    }
+    Ok(&bytes[CDR_LE_ENCAPSULATION.len()..])
+}
+
 pub mod deserialize;
 pub mod serialize;
 
@@ -169,6 +233,237 @@ impl ros2_client::Service for BridgeServiceType {
 
     fn response_type_name(&self) -> &str {
         &self.response_type_name
+    }
+}
+
+#[cfg(test)]
+mod raw_cdr_tests {
+    use arrow::array::{ArrayRef, Int32Array, StructArray};
+    use arrow::datatypes::{DataType, Field, Fields};
+    use dora_ros2_bridge_msg_gen::types::{Member, Message, primitives::BasicType};
+    use std::{borrow::Cow, collections::HashMap, sync::Arc};
+
+    use super::{
+        CDR_LE_ENCAPSULATION, TypeInfo, TypedValue, deserialize_raw_cdr, serialize_raw_cdr,
+    };
+
+    fn fixture() -> (ArrayRef, TypeInfo<'static>) {
+        let message = Message {
+            package: "test_pkg".into(),
+            name: "Primitive".into(),
+            members: vec![Member {
+                name: "value".into(),
+                r#type: BasicType::I32.into(),
+                default: None,
+            }],
+            constants: vec![],
+        };
+        let mut package = HashMap::new();
+        package.insert("Primitive".into(), message);
+        let mut messages = HashMap::new();
+        messages.insert("test_pkg".into(), package);
+        let fields = Fields::from(vec![Field::new("value", DataType::Int32, true)]);
+        let value: ArrayRef = Arc::new(StructArray::new(
+            fields,
+            vec![Arc::new(Int32Array::from(vec![42]))],
+            None,
+        ));
+        (
+            value,
+            TypeInfo {
+                package_name: Cow::Borrowed("test_pkg"),
+                message_name: Cow::Borrowed("Primitive"),
+                messages: Arc::new(messages),
+            },
+        )
+    }
+
+    #[test]
+    fn raw_cdr_uses_rustdds_little_endian_layout() {
+        let (value, type_info) = fixture();
+        let bytes = serialize_raw_cdr(&TypedValue {
+            value: &value,
+            type_info: &type_info,
+        })
+        .unwrap();
+        assert_eq!(
+            bytes,
+            [CDR_LE_ENCAPSULATION.as_slice(), &42_i32.to_le_bytes()].concat()
+        );
+        let decoded = deserialize_raw_cdr(&bytes, type_info, 1024).unwrap();
+        assert_eq!(decoded, value.to_data());
+    }
+
+    #[test]
+    fn raw_cdr_rejects_payload_limit_truncation_and_trailing_bytes() {
+        let (_, type_info) = fixture();
+        assert!(deserialize_raw_cdr(&[0; 5], type_info.clone(), 4).is_err());
+        assert!(deserialize_raw_cdr(&[0; 3], type_info.clone(), 4).is_err());
+        assert!(deserialize_raw_cdr(&[0, 0, 0, 0, 42, 0, 0, 0], type_info.clone(), 8).is_err());
+        assert!(deserialize_raw_cdr(&[0, 1, 0, 0, 42, 0, 0, 0, 1], type_info, 9).is_err());
+    }
+
+    /// `{ uint8 tag; <element>[] data; uint32 after }`, for checking the byte
+    /// sequence wire layout including the alignment padding around it.
+    fn byte_sequence_fixture(element: BasicType) -> TypeInfo<'static> {
+        use dora_ros2_bridge_msg_gen::types::{
+            MemberType, primitives::NestableType, sequences::Sequence,
+        };
+        let message = Message {
+            package: "test_pkg".into(),
+            name: "Bytes".into(),
+            members: vec![
+                Member {
+                    name: "tag".into(),
+                    r#type: BasicType::U8.into(),
+                    default: None,
+                },
+                Member {
+                    name: "data".into(),
+                    r#type: MemberType::Sequence(Sequence {
+                        value_type: NestableType::BasicType(element),
+                    }),
+                    default: None,
+                },
+                Member {
+                    name: "after".into(),
+                    r#type: BasicType::U32.into(),
+                    default: None,
+                },
+            ],
+            constants: vec![],
+        };
+        let mut package = HashMap::new();
+        package.insert("Bytes".into(), message);
+        let mut messages = HashMap::new();
+        messages.insert("test_pkg".into(), package);
+        TypeInfo {
+            package_name: Cow::Borrowed("test_pkg"),
+            message_name: Cow::Borrowed("Bytes"),
+            messages: Arc::new(messages),
+        }
+    }
+
+    fn byte_sequence_value(data: ArrayRef) -> ArrayRef {
+        use arrow::array::{UInt8Array, UInt32Array};
+        let fields = Fields::from(vec![
+            Field::new("tag", DataType::UInt8, true),
+            Field::new("data", data.data_type().clone(), true),
+            Field::new("after", DataType::UInt32, true),
+        ]);
+        Arc::new(StructArray::new(
+            fields,
+            vec![
+                Arc::new(UInt8Array::from(vec![7])),
+                data,
+                Arc::new(UInt32Array::from(vec![0xAABBCCDD])),
+            ],
+            None,
+        ))
+    }
+
+    /// What rustdds / rmw put on the wire for the fixture with `data = [1..=5]`:
+    /// the odd length makes the `uint32` after it need 3 bytes of padding.
+    fn byte_sequence_wire() -> Vec<u8> {
+        [
+            CDR_LE_ENCAPSULATION.as_slice(),
+            &[7, 0, 0, 0],
+            &5u32.to_le_bytes(),
+            &[1, 2, 3, 4, 5, 0, 0, 0],
+            &0xAABBCCDDu32.to_le_bytes(),
+        ]
+        .concat()
+    }
+
+    #[test]
+    fn byte_sequences_keep_the_cdr_wire_layout() {
+        use arrow::array::{BinaryArray, ListBuilder, UInt8Builder};
+        for element in [BasicType::U8, BasicType::Byte, BasicType::Char] {
+            let type_info = byte_sequence_fixture(element);
+            let mut list = ListBuilder::new(UInt8Builder::new());
+            list.values().append_slice(&[1, 2, 3, 4, 5]);
+            list.append(true);
+            let value = byte_sequence_value(Arc::new(list.finish()));
+            let bytes = serialize_raw_cdr(&TypedValue {
+                value: &value,
+                type_info: &type_info,
+            })
+            .unwrap();
+            assert_eq!(bytes, byte_sequence_wire(), "{element:?} serialize");
+            let decoded = deserialize_raw_cdr(&bytes, type_info.clone(), 1024).unwrap();
+            assert_eq!(decoded, value.to_data(), "{element:?} round trip");
+
+            // A `binary` column (one row) encodes the same bytes.
+            let binary =
+                byte_sequence_value(Arc::new(BinaryArray::from(vec![&[1u8, 2, 3, 4, 5][..]])));
+            let bytes = serialize_raw_cdr(&TypedValue {
+                value: &binary,
+                type_info: &type_info,
+            })
+            .unwrap();
+            assert_eq!(bytes, byte_sequence_wire(), "{element:?} binary serialize");
+        }
+    }
+
+    #[test]
+    fn empty_byte_sequence_round_trips() {
+        use arrow::array::{ListBuilder, UInt8Builder};
+        let type_info = byte_sequence_fixture(BasicType::U8);
+        let mut list = ListBuilder::new(UInt8Builder::new());
+        list.append(true);
+        let value = byte_sequence_value(Arc::new(list.finish()));
+        let bytes = serialize_raw_cdr(&TypedValue {
+            value: &value,
+            type_info: &type_info,
+        })
+        .unwrap();
+        assert_eq!(
+            bytes,
+            [
+                CDR_LE_ENCAPSULATION.as_slice(),
+                &[7, 0, 0, 0],
+                &0u32.to_le_bytes(),
+                &0xAABBCCDDu32.to_le_bytes()
+            ]
+            .concat()
+        );
+        assert_eq!(
+            deserialize_raw_cdr(&bytes, type_info, 1024).unwrap(),
+            value.to_data()
+        );
+    }
+
+    /// Byte sequences go through `serialize_bytes` / `deserialize_bytes`; a
+    /// non-CDR format (the Python bridge round-trips through `serde_assert`)
+    /// must still get the same array back.
+    #[test]
+    fn byte_sequences_round_trip_through_a_token_format() {
+        use arrow::array::{ListBuilder, UInt8Builder};
+        use serde::{Serialize, de::DeserializeSeed};
+        let type_info = byte_sequence_fixture(BasicType::U8);
+        let mut list = ListBuilder::new(UInt8Builder::new());
+        list.values().append_slice(&[1, 2, 3, 4, 5]);
+        list.append(true);
+        let value = byte_sequence_value(Arc::new(list.finish()));
+        let tokens = TypedValue {
+            value: &value,
+            type_info: &type_info,
+        }
+        .serialize(&serde_assert::Serializer::builder().build())
+        .unwrap();
+        let mut deserializer = serde_assert::Deserializer::builder(tokens).build();
+        let decoded = crate::deserialize::StructDeserializer::new(Cow::Owned(type_info))
+            .deserialize(&mut deserializer)
+            .unwrap();
+        assert_eq!(decoded, value.to_data());
+    }
+
+    #[test]
+    fn byte_sequence_length_beyond_the_payload_is_rejected() {
+        let type_info = byte_sequence_fixture(BasicType::U8);
+        let mut bytes = byte_sequence_wire();
+        bytes[8..12].copy_from_slice(&1_000u32.to_le_bytes());
+        assert!(deserialize_raw_cdr(&bytes, type_info, 1 << 20).is_err());
     }
 }
 

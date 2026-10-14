@@ -1,68 +1,23 @@
 import datetime
+import enum
 import typing
 
 import pyarrow
 
 import dora
 
-@typing.final
-class Enum:
-    """Create a collection of name/value pairs.
+class DoraStatus(enum.Enum):
+    """Dora status to indicate if operator `on_input` loop should be stopped.
 
-    Example enumeration:
+    Args:
+        Enum (u8): Status signaling to dora operator to
+        stop or continue the operator.
 
-    >>> class Color(Enum):
-    ...     RED = 1
-    ...     BLUE = 2
-    ...     GREEN = 3
+    """
 
-    Access them by:
-
-    - attribute access:
-
-    >>> Color.RED
-    <Color.RED: 1>
-
-    - value lookup:
-
-    >>> Color(1)
-    <Color.RED: 1>
-
-    - name lookup:
-
-    >>> Color['RED']
-    <Color.RED: 1>
-
-    Enumerations can be iterated over, and know how many members they have:
-
-    >>> len(Color)
-    3
-
-    >>> list(Color)
-    [<Color.RED: 1>, <Color.BLUE: 2>, <Color.GREEN: 3>]
-
-    Methods can be added to enumerations, and members can have their own
-    attributes -- see the documentation for details."""
-
-    @staticmethod
-    def __contains__(value: typing.Any) -> bool:
-        """Return True if `value` is in `cls`.
-
-        `value` is in `cls` if:
-        1) `value` is a member of `cls`, or
-        2) `value` is the value of one of the `cls`'s members."""
-
-    @staticmethod
-    def __getitem__(name: typing.Any) -> typing.Any:
-        """Return the member matching `name`."""
-
-    @staticmethod
-    def __iter__() -> typing.Any:
-        """Return members in definition order."""
-
-    @staticmethod
-    def __len__() -> int:
-        """Return the number of members (no aliases)"""
+    CONTINUE = 0
+    STOP = 1
+    STOP_ALL = 2
 
 @typing.final
 class Node:
@@ -154,9 +109,21 @@ class Node:
         """Returns the current timestamp from the node's Hybrid Logical Clock
         as a UTC datetime object."""
 
-    def merge_external_events(self, subscription: dora.Ros2Subscription) -> None:
+    def merge_external_events(
+        self, subscription: dora.Ros2Subscription, id: typing.Optional[str] = None
+    ) -> None:
         """Merge an external event stream with dora main loop.
-        This currently only work with ROS2."""
+        This currently only work with ROS2.
+
+        Events from the subscription arrive with ``kind`` set to
+        ``"external"`` and ``id`` set to the given ``id``, or to the
+        subscription's ROS2 topic name (e.g. ``"/turtle1/pose"``) when no
+        ``id`` is given. Call this once per subscription to handle several
+        topics in one node, and use ``event["id"]`` to tell them apart.
+
+        :type subscription: dora.Ros2Subscription
+        :type id: str, optional
+        :rtype: None"""
 
     def next(self, timeout: float = None) -> dict:
         """`.next()` gives you the next input that the node has received.
@@ -197,6 +164,28 @@ class Node:
 
         You can also iterate over the event stream with a loop"""
 
+    def drain(self) -> list[dict]:
+        """`.drain()` gives you all available inputs that the node has received.
+        It does not block until the next event becomes available.
+
+        ```python
+        events = node.drain()
+        for event in events:
+            print(event)
+        ```"""
+
+    def try_recv(self) -> typing.Optional[dict]:
+        """`.try_recv()` gives you the next input in the queue that the node has received.
+        It does not block until the next event becomes available, and returns
+        `None` when the queue is empty.
+
+        ```python
+        event = node.try_recv()
+        ```"""
+
+    def is_empty(self) -> bool:
+        """Check if there are any buffered events in the event stream."""
+
     def send_output(
         self, output_id: str, data: pyarrow.Array, metadata: dict = None
     ) -> None:
@@ -215,58 +204,100 @@ class Node:
         node.send_output("string", b"string", {"open_telemetry_context": "7632e76"})
         ```"""
 
-    def register_memory_pool(
+    def send_output_raw(
+        self, output_id: str, data_length: int, metadata: dict = None
+    ) -> "SampleHandler":
+        """`send_output_raw` send data from the node via a writable buffer (zero-copy).
+
+        Returns a :class:`SampleHandler` that pre-allocates `data_length` bytes.
+        Fill the buffer via Python's buffer protocol (`memoryview`,
+        `numpy.frombuffer`, `struct`, ...) and then call ``.send()`` — or use
+        the context-manager form, which sends on ``__exit__``.
+
+        Requires Python >= 3.11.
+
+        ```python
+        with node.send_output_raw("rgb_image", 1920 * 1080 * 3, {"width": 1920}) as buf:
+            numpy.frombuffer(buf, numpy.uint8).reshape(1080, 1920, 3)[:] = frame
+        ```"""
+
+    def send_service_request(
+        self,
+        output_id: str,
+        data: typing.Union[pyarrow.Array, bytes],
+        metadata: dict = None,
+    ) -> str:
+        """Send a service request, automatically injecting a ``request_id`` into
+        the metadata. Returns the generated request ID (UUID v7).
+
+        This is a convenience wrapper around :meth:`send_output` for the
+        request/reply pattern."""
+
+    def send_service_response(
+        self, output_id: str, data: typing.Union[pyarrow.Array, bytes], metadata: dict
+    ) -> None:
+        """Send a service response. Convenience wrapper around :meth:`send_output`
+        that passes through the ``request_id`` from the incoming request metadata,
+        which `metadata` must include."""
+
+    def register_tensor_pool(
         self, tensor_info: dict, device: str = "cpu"
     ) -> pyarrow.Array:
-        """Register a tensor's pinned memory as a shared memory pool and
-        return a persistent buffer_id (pyarrow string array).
+        """Register a tensor's memory as a shared pool for zero-copy transfer.
 
-        The tensor data is copied into page-locked shared memory (via DMA
-        if CUDA).  The returned buffer_id can be sent to another node,
-        which can call read_memory_pool() to get a zero-copy tensor_info
-        pointing to the same shared memory.
-
-        Args:
-            tensor_info: dict with keys "ptr", "size", "dtype", "shape", "device"
-            device: "cpu" or "cuda" — the receiver's device (controls DMA path)
-
-        Returns:
-            pyarrow string array containing the buffer_id
+        Only present when the wheel was built with the `tensor-pool` feature.
+        NOT covered by dora's 1.0 compatibility guarantees — see
+        libraries/extensions/tensor-pool/README.md.
         """
 
-    def write_memory_pool(
-        self, memory_pool_id: pyarrow.Array, tensor_info: dict
+    def write_tensor_pool(
+        self, tensor_pool_id: pyarrow.Array, tensor_info: dict
     ) -> None:
-        """Write new tensor data into an existing memory pool.
+        """Write tensor data into an existing tensor pool.
 
-        Fast path: DORADMA header read from shmem, then memcpy data.
-        Slow path: falls back to daemon RPC.
-
-        Args:
-            memory_pool_id: pyarrow string array from register_memory_pool
-            tensor_info: dict with keys "ptr", "size", "dtype", "shape", "device"
+        Extension method; see register_tensor_pool.
         """
 
-    def read_memory_pool(self, memory_pool_id: pyarrow.Array) -> dict:
-        """Read tensor metadata from a memory pool.
+    def read_tensor_pool(self, tensor_pool_id: pyarrow.Array) -> dict:
+        """Read tensor metadata from a tensor pool (zero-copy).
 
-        Fast path: DORADMA header read from shmem (zero-copy, no daemon).
-        Slow path: falls back to daemon RPC.
-
-        Returns a tensor_info dict with keys:
-            "ptr": int — pointer to the data
-            "size": int — data size in bytes
-            "dtype": str — e.g. "float32"
-            "shape": list[int] — tensor shape
-            "device": str — "cpu" or "cuda"
+        Extension method; see register_tensor_pool.
         """
 
-    def free_memory_pool(self, memory_pool_id: pyarrow.Array) -> None:
-        """Free a memory pool by removing it from the daemon's tracking table.
+    def free_tensor_pool(self, tensor_pool_id: pyarrow.Array) -> None:
+        """Free a tensor pool, releasing it for every node that touched it.
 
-        Args:
-            memory_pool_id: pyarrow string array from register_memory_pool
+        Extension method; see register_tensor_pool.
         """
+
+    def extension_store(self, namespace: str, key: str, value: bytes) -> None:
+        """Store an opaque value in the daemon's dataflow-scoped extension table.
+
+        The seam for transports maintained outside the dora tree. dora brokers
+        the value's lifetime and nothing else — it never interprets namespace,
+        key or value.
+
+        The daemon reclaims the entry when this node exits or the dataflow
+        finishes, and notifies every node that stored or read the key when it
+        is dropped (see drain_dropped_extension_keys).
+        """
+
+    def extension_load(
+        self, namespace: str, key: str, remove: bool = False
+    ) -> bytes | None:
+        """Read an opaque value back, or None if the key is absent.
+
+        With remove=True the entry is dropped in the same round trip.
+        """
+
+    def extension_drop(self, namespace: str, key: str) -> None:
+        """Drop an opaque value, notifying every node that stored or read it.
+
+        Dropping an absent key succeeds, so a retry is safe.
+        """
+
+    def drain_dropped_extension_keys(self, namespace: str) -> list[str]:
+        """Take the keys in `namespace` dropped since the last call."""
 
     def __iter__(self) -> typing.Any:
         """Implement iter(self)."""
@@ -279,6 +310,45 @@ class Node:
 
     def __str__(self) -> str:
         """Return str(self)."""
+
+# Not importable from `dora`: only obtained from :meth:`Node.send_output_raw`.
+@typing.final
+@typing.type_check_only
+class SampleHandler:
+    """Returned by :meth:`Node.send_output_raw`.
+
+    Holds a pre-allocated output sample. Write into it through
+    :meth:`as_buffer` or :meth:`as_memoryview`, then call :meth:`send`, or
+    use it as a context manager, which sends on a clean exit."""
+
+    def send(self) -> None:
+        """Manually send the sample (alternative to the context manager).
+
+        Raises if any buffer views are still open — release all `memoryview` /
+        numpy references first."""
+
+    def as_buffer(self) -> "SampleBuffer":
+        """Return a `SampleBuffer` exposing the pre-allocated memory via Python's
+        buffer protocol (writable, zero-copy). The same instance is returned on
+        every call."""
+
+    def as_memoryview(self) -> memoryview:
+        """Return a fresh writable `memoryview` over the pre-allocated memory
+        (zero-copy). Release it before calling :meth:`send`."""
+
+    def __enter__(self) -> "SampleBuffer": ...
+    def __exit__(
+        self, exc_type: typing.Any, exc_value: typing.Any, traceback: typing.Any
+    ) -> bool: ...
+
+# Not importable from `dora`: only obtained from :class:`SampleHandler`.
+@typing.final
+@typing.type_check_only
+class SampleBuffer:
+    """The pre-allocated memory of a :class:`SampleHandler`, exposed via the
+    buffer protocol (`memoryview(buf)`, `numpy.frombuffer(buf)`, ...)."""
+
+    def __buffer__(self, flags: int, /) -> memoryview: ...
 
 @typing.final
 class Ros2Context:
@@ -293,15 +363,22 @@ class Ros2Context:
 
     You can also use `ros_paths` if you don't want to use env variable.
 
+    The DDS domain id is taken from the `domain_id` argument; if omitted, from
+    the `ROS_DOMAIN_ID` environment variable; if neither is set, default to 0.
+    A `ROS_DOMAIN_ID` that is set but not a valid domain id raises an error.
+
     warning::
     Dora ROS2 bridge functionality is considered **unstable**. It may be changed
     at any point without it being considered a breaking change.
 
     ```python
-    context = Ros2Context()
+    context = Ros2Context(domain_id=1)   # explicit domain
+    context = Ros2Context()              # domain from ROS_DOMAIN_ID, else 0
     ```"""
 
-    def __init__(self, ros_paths: typing.List[str] = None) -> None:
+    def __init__(
+        self, ros_paths: typing.List[str] = None, domain_id: typing.Optional[int] = None
+    ) -> None:
         """ROS2 Context holding all messages definition for receiving and sending messages to ROS2.
 
         By default, Ros2Context will use env `AMENT_PREFIX_PATH` to search for message definition.
@@ -313,12 +390,17 @@ class Ros2Context:
 
         You can also use `ros_paths` if you don't want to use env variable.
 
+        The DDS domain id is taken from the `domain_id` argument; if omitted, from
+        the `ROS_DOMAIN_ID` environment variable; if neither is set, default to 0.
+        A `ROS_DOMAIN_ID` that is set but not a valid domain id raises an error.
+
         warning::
         Dora ROS2 bridge functionality is considered **unstable**. It may be changed
         at any point without it being considered a breaking change.
 
         ```python
-        context = Ros2Context()
+        context = Ros2Context(domain_id=1)   # explicit domain
+        context = Ros2Context()              # domain from ROS_DOMAIN_ID, else 0
         ```"""
 
     def new_node(

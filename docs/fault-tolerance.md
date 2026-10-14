@@ -7,7 +7,7 @@ Dora provides built-in fault tolerance for robotic and AI dataflows. Nodes can a
 | Feature | Scope | Config |
 |---------|-------|--------|
 | Restart policies | Per-node | `restart_policy`, `max_restarts`, `restart_delay`, ... |
-| Health monitoring | Per-node | `health_check_timeout`, `health_check_interval` (dataflow-level) |
+| Health monitoring | Per-node | `health_check_timeout`, `startup_timeout`, `health_check_interval` (dataflow-level) |
 | Input timeouts | Per-input | `input_timeout` |
 | Circuit breaker | Automatic | Triggered by `input_timeout`, auto-recovers |
 | NodeRestarted event | Downstream nodes | Automatic when upstream restarts |
@@ -139,11 +139,50 @@ Each `RunningNode` has a `last_activity: Arc<AtomicU64>` field storing the times
 The health check function (`check_node_health`) iterates all running nodes:
 
 1. Skip nodes without `health_check_timeout` set
-2. Skip nodes with `last_activity == 0` (not yet connected)
+2. Skip nodes that have not connected yet (not in `connected_nodes`)
 3. Compute `elapsed_ms = now - last_activity`
 4. If `elapsed_ms > timeout_ms`, log a warning and **kill** the node process
 
 After killing, the normal exit handling runs, which evaluates the restart policy. This means `health_check_timeout` combined with `restart_policy: on-failure` automatically recovers hung nodes.
+
+### Post-Connection Liveness Only
+
+Step 2 above means `health_check_timeout` bounds **post-connection** liveness, not
+total startup time. A node joins `connected_nodes` when it first subscribes to
+events (inside `Node::init` / `DoraNode::init_from_env`), and the timeout clock is
+only consulted from that point on.
+
+This is deliberate: `last_activity` is seeded to the spawn timestamp, so without
+the connection gate a node whose legitimate cold start (Python imports,
+model-weight loading) exceeds `health_check_timeout` would be SIGKILLed
+mid-startup -- and under `restart_policy: always`/`on-failure` that becomes an
+unescapable restart loop.
+
+The tradeoff is that a node that hangs **before** it ever subscribes -- a
+deadlock in import or init code that never reaches `Node::init` -- is not
+reaped by `health_check_timeout`. To bound startup time and recover from
+deadlocks before initialization, set `startup_timeout`.
+
+### Startup Deadline (`startup_timeout`)
+
+While `health_check_timeout` monitors nodes after they connect, `startup_timeout`
+bounds the time from process spawn until the node connects (subscribes to events)
+with the daemon.
+
+If an unconnected node process does not connect within `startup_timeout` seconds
+after being spawned, the daemon logs a warning, SIGKILLs the process, increments
+the `startup_timeout_kills` counter, and evaluates `restart_policy`.
+
+```yaml
+nodes:
+  - id: worker
+    path: ./target/debug/worker
+    startup_timeout: 10.0       # kill if not subscribed within 10s of spawn
+    health_check_timeout: 30.0  # kill if silent for 30s after connecting
+    restart_policy: on-failure
+```
+
+Like `health_check_timeout`, `startup_timeout` is evaluated on each `health_check_interval` tick.
 
 ### What Counts as "Activity"
 
@@ -283,11 +322,11 @@ while let Some(event) = events.recv() {
 `InputTracker` maintains two `HashMap`s:
 
 - `states: HashMap<DataId, InputState>` -- current state per input (Healthy or Closed)
-- `cache: HashMap<DataId, ArrowData>` -- last received value per input
+- `cache: HashMap<DataId, DoraArray>` -- last received value per input
 
 On `Event::Input`, both maps are updated (state = Healthy, cache = data clone). On `Event::InputClosed`, only state changes (cache is preserved). On `Event::InputRecovered`, state is set back to Healthy. The cache is never cleared, so `last_value()` always returns the most recent data even after the input closes.
 
-Note: `ArrowData` wraps `Arc<dyn arrow::array::Array>`, so the cache clone is reference-counted (cheap).
+Note: `DoraArray` wraps an `Arc`-backed Arrow array, so the cache clone is reference-counted (cheap).
 
 ### API Reference
 
@@ -297,7 +336,7 @@ Note: `ArrowData` wraps `Arc<dyn arrow::array::Array>`, so the cache clone is re
 | `process_event(&Event)` | `bool` | Update state. Returns true if event was relevant |
 | `state(&DataId)` | `Option<InputState>` | Current state (Healthy or Closed) |
 | `is_closed(&DataId)` | `bool` | Check if input is closed |
-| `last_value(&DataId)` | `Option<&ArrowData>` | Last received value (available even when closed) |
+| `last_value(&DataId)` | `Option<&DoraArray>` | Last received value (available even when closed) |
 | `closed_inputs()` | `Vec<&DataId>` | All currently closed inputs |
 | `any_closed()` | `bool` | True if any tracked input is closed |
 
@@ -313,6 +352,7 @@ The daemon tracks fault tolerance events with atomic counters (`FaultToleranceSt
 |---------|------|-----------------|
 | `restarts` | `AtomicU64` | A node restart is initiated (in spawn lifecycle) |
 | `health_check_kills` | `AtomicU64` | A node is killed by the health check (unresponsive) |
+| `startup_timeout_kills` | `AtomicU64` | A node is killed by the startup watchdog (failed to connect before init) |
 | `input_timeouts` | `AtomicU64` | An input timeout fires (circuit breaker trips) |
 | `circuit_breaker_recoveries` | `AtomicU64` | Data arrives on a broken input (auto-recovery) |
 
@@ -414,9 +454,9 @@ The store tracks three record types:
 |--------|-----|-----------------|
 | `DataflowRecord` | UUID (16 bytes) | uuid, name, descriptor (JSON), status, daemon IDs, generation counter, created/updated timestamps |
 | `BuildRecord` | UUID (16 bytes) | build ID, status, errors, created/updated timestamps |
-| `DaemonInfo` | DaemonId (bincode) | daemon ID, machine ID |
+| `DaemonInfo` | DaemonId (postcard) | daemon ID, machine ID |
 
-Records are serialized with [bincode](https://docs.rs/bincode/2) for compact, fast encoding.
+Records are serialized with [postcard](https://docs.rs/postcard) for compact, fast encoding.
 
 ### Dataflow Status Lifecycle
 
@@ -498,9 +538,9 @@ pub trait CoordinatorStore: Send + Sync {
 }
 ```
 
-The `RedbStore` implementation uses three redb tables (`daemons`, `dataflows`, `builds`) with UUID-based binary keys and bincode-serialized values. All operations are synchronous (redb is a synchronous library); the coordinator calls them directly from the async event loop since they are fast in-process operations.
+The `RedbStore` implementation uses three redb tables (`daemons`, `dataflows`, `builds`) with UUID-based binary keys and postcard-serialized values. All operations are synchronous (redb is a synchronous library); the coordinator calls them directly from the async event loop since they are fast in-process operations.
 
-A bincode deserialization limit of 64 MiB guards against corrupted data that could encode huge allocation sizes in length prefixes.
+A 64 MiB record-size limit is enforced symmetrically on both encode and decode, so a record can never be written that the reader would later refuse. postcard reads only from the slice it is handed and does not pre-allocate from a length prefix, so a corrupt row cannot drive a large allocation.
 
 ---
 

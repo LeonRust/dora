@@ -7,7 +7,7 @@ use dora_core::build::BuildInfo;
 use dora_message::{
     BuildId, SessionId,
     common::GitSource,
-    descriptor::{CoreNodeKind, NodeSource, OperatorSource, ResolvedNode},
+    descriptor::{CoreNodeKind, NodeSource, ResolvedNode},
     id::NodeId,
 };
 use eyre::{Context, ContextCompat};
@@ -71,12 +71,14 @@ impl DataflowSession {
     pub fn read_session(dataflow_path: &Path) -> eyre::Result<Self> {
         let session_file = session_file_path(dataflow_path)?;
         if session_file.exists() {
-            if let Ok(parsed) = deserialize(&session_file) {
-                return Ok(parsed);
-            } else {
-                tracing::warn!(
-                    "failed to read dataflow session file, regenerating (you might need to run `dora build` again)"
-                );
+            match deserialize(&session_file) {
+                Ok(parsed) => return Ok(parsed),
+                Err(err) => {
+                    tracing::warn!(
+                        "failed to read dataflow session file at {}: {err:#}, regenerating (you might need to run `dora build` again)",
+                        session_file.display()
+                    );
+                }
             }
         }
 
@@ -270,11 +272,7 @@ impl DataflowSession {
                         //
                         // Kind tag still flips when switching kinds (Python ->
                         // SharedLibrary etc.), which IS a build-system change.
-                        let kind_tag = match &op.config.source {
-                            OperatorSource::SharedLibrary(_) => "shared-library",
-                            OperatorSource::Python(_) => "python",
-                            OperatorSource::Wasm(_) => "wasm",
-                        };
+                        let kind_tag = op.config.source.runtime_name();
                         canonical.push_str("    source-kind:");
                         canonical.push_str(kind_tag);
                         canonical.push('\n');
@@ -357,14 +355,21 @@ fn fnv1a_64_hex(bytes: &[u8]) -> String {
 }
 
 fn deserialize(session_file: &Path) -> eyre::Result<DataflowSession> {
-    std::fs::read_to_string(session_file)
-        .context("failed to read DataflowSession file")
-        .and_then(|s| {
-            serde_yaml::from_str(&s).context("failed to deserialize DataflowSession file")
-        })
+    let s = std::fs::read_to_string(session_file).with_context(|| {
+        format!(
+            "failed to read DataflowSession file at {}",
+            session_file.display()
+        )
+    })?;
+    serde_yaml::from_str(&s).with_context(|| {
+        format!(
+            "failed to deserialize DataflowSession file at {}",
+            session_file.display()
+        )
+    })
 }
 
-fn session_file_path(dataflow_path: &Path) -> eyre::Result<PathBuf> {
+pub(crate) fn session_file_path(dataflow_path: &Path) -> eyre::Result<PathBuf> {
     let file_stem = dataflow_path
         .file_stem()
         .wrap_err("dataflow path has no file stem")?
@@ -607,7 +612,6 @@ nodes:
 
     #[test]
     fn session_roundtrip_backward_compatible_without_field() {
-        // Sessions written before this field existed must still deserialize.
         let legacy_yaml = "build_id: null\n\
              session_id: 00000000-0000-0000-0000-000000000000\n\
              git_sources: {}\n\
@@ -615,6 +619,28 @@ nodes:
         let parsed: DataflowSession =
             serde_yaml::from_str(legacy_yaml).expect("legacy session must deserialize");
         assert!(parsed.build_fingerprint.is_none());
+    }
+
+    #[test]
+    fn read_session_corrupt_file_regenerates_with_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let dataflow_path = dir.path().join("dataflow.yml");
+        std::fs::write(&dataflow_path, "nodes: []").unwrap();
+
+        let out_dir = dir.path().join("out");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let session_path = out_dir.join("dataflow.dora-session.yaml");
+        std::fs::write(&session_path, "invalid yaml syntax: : :").unwrap();
+
+        // `read_session` should catch the deserialization error, log a warning with path and error details,
+        // and safely regenerate a default session file.
+        let session = DataflowSession::read_session(&dataflow_path).unwrap();
+        assert!(session.build_id.is_none());
+        assert!(session_path.exists());
+
+        // The session file should now contain valid regenerated YAML.
+        let re_parsed = DataflowSession::read_session(&dataflow_path).unwrap();
+        assert_eq!(session.session_id, re_parsed.session_id);
     }
 
     // ---------------------------------------------------------------------
@@ -636,7 +662,7 @@ nodes:
   - id: a
     path: ./a
     build: cargo build
-    _unstable_deploy:
+    deploy:
       machine: machine-1
 ",
         );
@@ -646,7 +672,7 @@ nodes:
   - id: a
     path: ./a
     build: cargo build
-    _unstable_deploy:
+    deploy:
       machine: machine-2
 ",
         );
@@ -667,7 +693,7 @@ nodes:
   - id: a
     path: ./a
     build: cargo build
-    _unstable_deploy:
+    deploy:
       working_dir: /tmp/a
 ",
         );
@@ -677,7 +703,7 @@ nodes:
   - id: a
     path: ./a
     build: cargo build
-    _unstable_deploy:
+    deploy:
       working_dir: /tmp/b
 ",
         );
@@ -898,35 +924,40 @@ nodes:
     fn fingerprint_unchanged_when_only_operator_yaml_order_changes() {
         // Operators within a node are stored in a Vec (not a BTreeMap), so
         // the fingerprint code sorts them by `id` before canonicalizing.
-        // Verify reordering in YAML doesn't churn the fingerprint.
-        let ab = resolved(
+        // Verify reordering in YAML doesn't churn the fingerprint. Resolution
+        // rejects a runtime node with several operators, so the nodes are
+        // built directly; the sort still guards the fingerprint itself.
+        let runtime_node = |yaml: &str| {
+            let node: ResolvedNode =
+                serde_yaml::from_str(yaml).expect("yaml parses as ResolvedNode");
+            BTreeMap::from([(node.id.clone(), node)])
+        };
+        let ab = runtime_node(
             "\
-nodes:
-  - id: foo
-    operators:
-      - id: a
-        python: ./a.py
-        inputs: {}
-        outputs: []
-      - id: b
-        python: ./b.py
-        inputs: {}
-        outputs: []
+id: foo
+operators:
+  - id: a
+    python: ./a.py
+    inputs: {}
+    outputs: []
+  - id: b
+    python: ./b.py
+    inputs: {}
+    outputs: []
 ",
         );
-        let ba = resolved(
+        let ba = runtime_node(
             "\
-nodes:
-  - id: foo
-    operators:
-      - id: b
-        python: ./b.py
-        inputs: {}
-        outputs: []
-      - id: a
-        python: ./a.py
-        inputs: {}
-        outputs: []
+id: foo
+operators:
+  - id: b
+    python: ./b.py
+    inputs: {}
+    outputs: []
+  - id: a
+    python: ./a.py
+    inputs: {}
+    outputs: []
 ",
         );
         assert_eq!(

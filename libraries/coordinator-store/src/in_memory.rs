@@ -9,13 +9,13 @@ use dora_message::id::NodeId;
 
 use crate::{BuildRecord, CoordinatorStore, DaemonInfo, DataflowRecord, validate_param_limits};
 
+/// Composite key for node parameter storage: (dataflow_id, node_id, param_key).
+type ParamKey = (Uuid, NodeId, String);
+
 /// In-memory implementation of [`CoordinatorStore`].
 ///
 /// State lives only in-process and is lost on restart.
 /// This is the default store used by the coordinator.
-/// Composite key for node parameter storage: (dataflow_id, node_id, param_key).
-type ParamKey = (Uuid, NodeId, String);
-
 pub struct InMemoryStore {
     daemons: RwLock<BTreeMap<DaemonId, DaemonInfo>>,
     dataflows: RwLock<BTreeMap<Uuid, DataflowRecord>>,
@@ -278,6 +278,8 @@ mod tests {
             updated_at: 0,
             node_to_daemon: Default::default(),
             uv: false,
+            ready_barrier_released: false,
+            barrier_exited_before_subscribe: Vec::new(),
         };
 
         store.put_dataflow(&record).unwrap();
@@ -338,6 +340,17 @@ mod tests {
                 .is_none()
         );
         assert_eq!(store.list_node_params(&df, &node).unwrap().len(), 1);
+    }
+
+    /// A `\0`-containing param key must be rejected here just as the redb
+    /// backend rejects it (it reserves `\0` as a composite-key separator), so
+    /// the two backends agree on which input is valid.
+    #[test]
+    fn param_key_with_null_byte_is_rejected() {
+        let store = InMemoryStore::new();
+        let df = Uuid::new_v4();
+        let node: NodeId = "sensor".to_string().into();
+        assert!(store.put_node_param(&df, &node, "a\0b", b"v").is_err());
     }
 
     /// `delete_dataflow` must remove every node param tied to that

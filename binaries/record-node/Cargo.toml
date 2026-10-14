@@ -14,10 +14,16 @@ name = "dora-record-node"
 path = "src/main.rs"
 
 [dependencies]
-dora-node-api = { workspace = true, default-features = false }
+# `arrow-v59` (dora's internal Arrow major): `main.rs` names
+# `arrow_v59::datatypes::DataType` and calls `DoraArray::as_array`, both of
+# which the feature gates. Without it this crate only builds when some other
+# member of the workspace happens to unify the feature in.
+dora-node-api = { workspace = true, default-features = false, features = ["arrow-v59"] }
 dora-recording = { workspace = true }
 dora-message = { workspace = true }
 eyre = { workspace = true }
-aligned-vec = { version = "0.5.0", features = ["serde"] }
+aligned-vec = { version = "0.6.4", features = ["serde"] }
+base64 = "0.22"
+flate2 = "1.1"
 serde_json = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }

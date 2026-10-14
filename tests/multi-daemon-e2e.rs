@@ -1,0 +1,779 @@
+//! End-to-end regression test for dora-rs/dora#2938.
+//!
+//! On a multi-daemon dataflow the start barrier is resolved by the
+//! coordinator, which broadcasts `AllNodesReady` at most once per
+//! dataflow. The daemon used to treat that broadcast as the *only* thing
+//! that ever answers a parked subscribe request, so every node that
+//! subscribed afterwards — a runtime `dora node add`, a dynamic node,
+//! a restarted node — parked forever and never returned from `Node()`
+//! init. Single-machine dataflows were unaffected (they answer each
+//! subscribe inline), which is why this went unnoticed.
+//!
+//! The latch that fixed it landed in #2990, verified by unit test only —
+//! nothing in the suite covered subscribe-after-startup on the external
+//! path, and `tests/node-lifecycle-e2e.rs` is single-daemon throughout.
+//! This is that missing coverage: it fails on the parent of #2990 and
+//! passes with it.
+//!
+//! The test runs a real two-daemon deployment (coordinator + daemons `A`
+//! and `B` on loopback, all on ephemeral ports), starts a dataflow with
+//! a node on each machine, and then adds a node at runtime. The added
+//! node records its pid *after* `init_from_env()` returns, so that pid
+//! appearing is proof that its subscribe was answered.
+//!
+//! No cross-daemon *data* delivery is needed: the barrier travels over
+//! the coordinator's WebSocket, and the added node talks to its own
+//! local daemon. That keeps the test independent of the multicast/zenoh
+//! peering quirks of CI runners and dev containers.
+//!
+//! Heavyweight (spawns processes, ~30-60s). It lives in the
+//! `dora-examples` crate, which the fast PR `cargo test --all` step
+//! excludes; run it explicitly with
+//! `cargo test -p dora-examples --test multi-daemon-e2e`.
+
+use std::net::{SocketAddr, TcpStream};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::Once;
+use std::time::{Duration, Instant};
+
+use dora_cli::WsSession;
+use dora_message::{cli_to_coordinator::ControlRequest, coordinator_to_cli::ControlRequestReply};
+
+static BUILD: Once = Once::new();
+
+fn ensure_built() {
+    BUILD.call_once(|| {
+        let status = Command::new("cargo")
+            .args([
+                "build",
+                "-p",
+                "dora-cli",
+                "-p",
+                "reconnect-survivor-node",
+                // Producer/consumer pair for the cross-machine data test: the
+                // sink fails its node if no `random` value ever arrives, so a
+                // finished dataflow is proof of delivery.
+                "-p",
+                "multiple-daemons-example-node",
+                "-p",
+                "multiple-daemons-example-sink",
+            ])
+            .status()
+            .expect("failed to run cargo build");
+        assert!(status.success(), "failed to build test prerequisites");
+    });
+}
+
+/// The local address another machine would reach this host at, or `None` when
+/// there is no route out (an offline sandbox).
+///
+/// Derived by the same helper the daemon uses for its own zenoh bind address,
+/// so the test asks the routing table exactly the question the daemon would.
+/// It answers loopback when it learns nothing, which here means "cannot test".
+fn routable_local_addr() -> Option<std::net::IpAddr> {
+    let off_host = SocketAddr::from(([8, 8, 8, 8], 53));
+    let addr = dora_core::topics::zenoh_bind_address_for(off_host);
+    (!addr.is_loopback()).then_some(addr)
+}
+
+/// Wait for a child to exit, killing it if it outstays `timeout`.
+fn wait_for_exit(child: &mut Child, timeout: Duration) -> Option<std::process::ExitStatus> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) => std::thread::sleep(Duration::from_millis(200)),
+            Err(_) => return None,
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    None
+}
+
+fn target_dir() -> PathBuf {
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    std::env::var("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| Path::new(manifest).join("target"))
+}
+
+fn bin(name: &str) -> PathBuf {
+    let exe = format!("{name}{}", std::env::consts::EXE_SUFFIX);
+    let path = target_dir().join("debug").join(exe);
+    assert!(
+        path.exists(),
+        "binary not found: {} (did ensure_built run?)",
+        path.display()
+    );
+    path
+}
+
+/// Grab `n` currently-free, distinct TCP ports. There is a small TOCTOU
+/// window between closing these listeners and the servers binding them,
+/// but it is more than adequate to keep parallel test binaries off each
+/// other's ports. Held open until all `n` are picked, so the four
+/// servers here (coordinator, two daemons, zenoh rendezvous) can never
+/// be handed the same port twice.
+fn free_ports(n: usize) -> Vec<u16> {
+    let listeners: Vec<_> = (0..n)
+        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").expect("failed to bind ephemeral port"))
+        .collect();
+    listeners
+        .iter()
+        .map(|l| l.local_addr().expect("failed to read local addr").port())
+        .collect()
+}
+
+fn port_open(port: u16) -> bool {
+    TcpStream::connect(("127.0.0.1", port)).is_ok()
+}
+
+fn wait_until(mut f: impl FnMut() -> bool, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if f() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    false
+}
+
+/// Machine ids of the daemons currently registered with the coordinator.
+/// `Err` while the coordinator is not answering yet.
+fn connected_machines(coordinator_port: u16) -> eyre::Result<Vec<String>> {
+    let addr: SocketAddr = format!("127.0.0.1:{coordinator_port}").parse().unwrap();
+    let session = WsSession::connect(addr)?;
+    let data = serde_json::to_vec(&ControlRequest::ConnectedMachines)?;
+    let reply: ControlRequestReply = serde_json::from_slice(&session.request(&data)?)?;
+    match reply {
+        ControlRequestReply::ConnectedDaemons(daemons) => Ok(daemons
+            .into_iter()
+            .filter_map(|d| d.daemon_id.machine_id().map(ToOwned::to_owned))
+            .collect()),
+        other => eyre::bail!("unexpected reply to ConnectedMachines: {other:?}"),
+    }
+}
+
+/// The pid the `reconnect-survivor-node` fixture records once
+/// `init_from_env()` has returned — the signal that its subscribe was
+/// answered. Absent (or not yet written) while the node is still in init.
+fn recorded_pid(path: &Path) -> Option<u32> {
+    std::fs::read_to_string(path)
+        .ok()?
+        .lines()
+        .next()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// A bare descriptor for the `reconnect-survivor-node` fixture, which
+/// records its pid to `$DORA_TEST_PID_FILE` once `init_from_env()` has
+/// returned and then idles until it is stopped.
+fn node_yaml(id: &str, machine: Option<&str>, pid_file: &Path) -> String {
+    let deploy = match machine {
+        Some(machine) => format!("deploy:\n  machine: {machine}\n"),
+        None => String::new(),
+    };
+    format!(
+        "id: {id}\n\
+         {deploy}\
+         path: {path}\n\
+         inputs:\n  \
+         tick: dora/timer/millis/300\n\
+         env:\n  \
+         DORA_TEST_PID_FILE: {pid_file}\n",
+        path = bin("reconnect-survivor-node").display(),
+        pid_file = pid_file.display(),
+    )
+}
+
+/// Fold a bare node descriptor into an item of a `nodes:` list.
+fn as_list_item(node: &str) -> String {
+    let indented: String = node.lines().map(|line| format!("    {line}\n")).collect();
+    format!("  - {}", indented.trim_start())
+}
+
+struct Deployment {
+    dora: PathBuf,
+    coordinator_port: u16,
+    children: Vec<Child>,
+    logs: Vec<PathBuf>,
+}
+
+impl Deployment {
+    /// Fail the test with every process log attached — a hang here is
+    /// only diagnosable from the daemon and coordinator output.
+    fn fail(&self, message: impl std::fmt::Display) -> ! {
+        for path in &self.logs {
+            eprintln!("--- {} ---", path.display());
+            eprintln!("{}", std::fs::read_to_string(path).unwrap_or_default());
+        }
+        panic!("{message}");
+    }
+}
+
+/// Best-effort teardown that always runs, even on panic. `destroy` goes
+/// first so the daemons stop their own node processes; killing the
+/// daemons outright would leave those nodes behind.
+impl Drop for Deployment {
+    fn drop(&mut self) {
+        let _ = Command::new(&self.dora)
+            .arg("destroy")
+            .arg("--coordinator-port")
+            .arg(self.coordinator_port.to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        for child in &mut self.children {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// A node added to a *running distributed* dataflow must come up, i.e.
+/// its subscribe must be answered even though the coordinator's one-shot
+/// `AllNodesReady` broadcast is long past. Regression test for
+/// dora-rs/dora#2938.
+#[test]
+fn node_added_to_distributed_dataflow_finishes_init() {
+    ensure_built();
+
+    let dora = bin("dora");
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let pid_a = tmp.path().join("node-a.pid");
+    let pid_b = tmp.path().join("node-b.pid");
+    let pid_late = tmp.path().join("late-joiner.pid");
+    let dataflow_yml = tmp.path().join("dataflow.yml");
+    let late_node_yml = tmp.path().join("late-joiner.yml");
+
+    // One node per machine, so both daemons see the dataflow as
+    // distributed (`external_nodes`) and the barrier becomes the
+    // coordinator's to resolve.
+    std::fs::write(
+        &dataflow_yml,
+        format!(
+            "nodes:\n{}{}",
+            as_list_item(&node_yaml("node-a", Some("A"), &pid_a)),
+            as_list_item(&node_yaml("node-b", Some("B"), &pid_b)),
+        ),
+    )
+    .expect("write dataflow yml");
+    // `dora node add --from-yaml` takes a single bare node, and places
+    // it itself — either daemon exercises the same barrier.
+    std::fs::write(&late_node_yml, node_yaml("late-joiner", None, &pid_late))
+        .expect("write late-joiner yml");
+
+    let ports = free_ports(4);
+    let (coordinator_port, zenoh_port) = (ports[0], ports[1]);
+    let mut daemon_listen_ports = [ports[2], ports[3]].into_iter();
+    let zenoh_peer = format!("tcp/127.0.0.1:{zenoh_port}");
+    let coord_log = tmp.path().join("coordinator.log");
+    let coord_out = std::fs::File::create(&coord_log).expect("create coordinator log");
+    let coord_err = coord_out.try_clone().expect("clone coordinator log");
+
+    let mut deployment = Deployment {
+        dora: dora.clone(),
+        coordinator_port,
+        children: vec![
+            Command::new(&dora)
+                .arg("coordinator")
+                .arg("--port")
+                .arg(coordinator_port.to_string())
+                .arg("--store")
+                .arg(format!(
+                    "redb:{}",
+                    tmp.path().join("coordinator.redb").display()
+                ))
+                .stdout(Stdio::from(coord_out))
+                .stderr(Stdio::from(coord_err))
+                .spawn()
+                .expect("failed to spawn coordinator"),
+        ],
+        logs: vec![coord_log],
+    };
+    if !wait_until(|| port_open(coordinator_port), Duration::from_secs(20)) {
+        deployment.fail("coordinator did not accept connections within 20s");
+    }
+
+    // Two named daemons on one host: distinct local listen ports, and an
+    // explicit zenoh rendezvous endpoint so they find each other without
+    // multicast (CI runners and dev containers have none).
+    for machine in ["A", "B"] {
+        let log = tmp.path().join(format!("daemon-{machine}.log"));
+        let out = std::fs::File::create(&log).expect("create daemon log");
+        let err = out.try_clone().expect("clone daemon log");
+        deployment.children.push(
+            Command::new(&dora)
+                .arg("daemon")
+                .arg("--machine-id")
+                .arg(machine)
+                .arg("--coordinator-port")
+                .arg(coordinator_port.to_string())
+                .arg("--local-listen-port")
+                .arg(
+                    daemon_listen_ports
+                        .next()
+                        .expect("one listen port per daemon")
+                        .to_string(),
+                )
+                .arg("--zenoh-peer")
+                .arg(&zenoh_peer)
+                .stdout(Stdio::from(out))
+                .stderr(Stdio::from(err))
+                .spawn()
+                .expect("failed to spawn daemon"),
+        );
+        deployment.logs.push(log);
+    }
+
+    // `dora start` rejects a `deploy.machine` whose daemon has
+    // not registered yet, so wait for both rather than race them.
+    if !wait_until(
+        || {
+            connected_machines(coordinator_port)
+                .map(|m| m.iter().any(|id| id == "A") && m.iter().any(|id| id == "B"))
+                .unwrap_or(false)
+        },
+        Duration::from_secs(30),
+    ) {
+        deployment.fail("daemons A and B did not both register within 30s");
+    }
+
+    let start = Command::new(&dora)
+        .arg("start")
+        .arg(&dataflow_yml)
+        .arg("--name")
+        .arg("multi-daemon-late-join")
+        .arg("--detach")
+        .arg("--coordinator-port")
+        .arg(coordinator_port.to_string())
+        .output()
+        .expect("failed to run dora start");
+    if !start.status.success() {
+        deployment.fail(format!(
+            "dora start failed: {}",
+            String::from_utf8_lossy(&start.stderr)
+        ));
+    }
+
+    // Both descriptor nodes past init means the coordinator's one-shot
+    // broadcast has fired, which is the precondition under test.
+    if !wait_until(
+        || recorded_pid(&pid_a).is_some() && recorded_pid(&pid_b).is_some(),
+        Duration::from_secs(60),
+    ) {
+        deployment.fail("distributed dataflow did not start within 60s");
+    }
+
+    let add = Command::new(&dora)
+        .arg("node")
+        .arg("add")
+        .arg("--from-yaml")
+        .arg(&late_node_yml)
+        .arg("--dataflow")
+        .arg("multi-daemon-late-join")
+        .arg("--coordinator-port")
+        .arg(coordinator_port.to_string())
+        .output()
+        .expect("failed to run dora node add");
+    if !add.status.success() {
+        deployment.fail(format!(
+            "dora node add failed: {}",
+            String::from_utf8_lossy(&add.stderr)
+        ));
+    }
+
+    if !wait_until(
+        || recorded_pid(&pid_late).is_some(),
+        Duration::from_secs(45),
+    ) {
+        deployment.fail(
+            "the node added at runtime never finished `Node()` init: its \
+             subscribe was parked with nothing left to answer it \
+             (dora-rs/dora#2938)",
+        );
+    }
+}
+
+/// A cross-machine edge must survive being wired as an explicit zenoh mesh
+/// with multicast off — the deployment shape a mesh VPN forces — and the
+/// daemons must trade their nodes' endpoints over it, which is what lets the
+/// producer and consumer link up directly instead of relaying through both
+/// daemons.
+///
+/// Delivery is asserted by construction: `multiple-daemons-example-sink` fails
+/// its node if no `random` value ever arrives, so a dataflow that finishes
+/// successfully is proof that the cross-machine edge carried data. The daemon
+/// log then shows *how*: machine B resolved machine A's node endpoint, so the
+/// two node processes had a direct link rather than two daemon hops.
+#[test]
+fn cross_machine_nodes_link_directly_over_an_explicit_mesh() {
+    ensure_built();
+
+    // The endpoint a remote consumer dials has to be one it can reach, and dora
+    // refuses to advertise loopback for that (it would point the peer at its
+    // own machine). Without a routable address there is nothing to test.
+    let Some(routable) = routable_local_addr() else {
+        eprintln!("skipping: no routable local address on this host");
+        return;
+    };
+
+    let dora = bin("dora");
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let dataflow_yml = tmp.path().join("dataflow.yml");
+
+    // Producer on A, consumer on B, and no same-machine consumer for `random` —
+    // so the only path from producer to sink is the cross-machine one.
+    std::fs::write(
+        &dataflow_yml,
+        format!(
+            "nodes:\n  \
+             - id: producer\n    \
+               deploy:\n      machine: A\n    \
+               path: {producer}\n    \
+               inputs:\n      tick: dora/timer/millis/10\n    \
+               outputs:\n      - random\n  \
+             - id: sink\n    \
+               deploy:\n      machine: B\n    \
+               path: {sink}\n    \
+               inputs:\n      random: producer/random\n",
+            producer = bin("multiple-daemons-example-node").display(),
+            sink = bin("multiple-daemons-example-sink").display(),
+        ),
+    )
+    .expect("write dataflow yml");
+
+    let ports = free_ports(4);
+    let (coordinator_port, zenoh_a, zenoh_b) = (ports[0], ports[1], ports[2]);
+    // Only one daemon can hold the default node-listen port on a shared host.
+    let node_listen_ports = [None, Some(ports[3])];
+    let coord_log = tmp.path().join("coordinator.log");
+    let coord_out = std::fs::File::create(&coord_log).expect("create coordinator log");
+    let coord_err = coord_out.try_clone().expect("clone coordinator log");
+
+    let mut deployment = Deployment {
+        dora: dora.clone(),
+        coordinator_port,
+        children: vec![
+            Command::new(&dora)
+                .arg("coordinator")
+                .arg("--port")
+                .arg(coordinator_port.to_string())
+                .arg("--store")
+                .arg(format!(
+                    "redb:{}",
+                    tmp.path().join("coordinator.redb").display()
+                ))
+                .stdout(Stdio::from(coord_out))
+                .stderr(Stdio::from(coord_err))
+                .spawn()
+                .expect("failed to spawn coordinator"),
+        ],
+        logs: vec![coord_log],
+    };
+    if !wait_until(|| port_open(coordinator_port), Duration::from_secs(20)) {
+        deployment.fail("coordinator did not accept connections within 20s");
+    }
+
+    // The mesh: each daemon listens on a port its peer can predict and dials
+    // the other one, with multicast off. No rendezvous, no gossip — the shape
+    // `dora cluster up` derives from a cluster.yml.
+    let daemon_log = |machine: &str| tmp.path().join(format!("daemon-{machine}.log"));
+    let daemons = [("A", zenoh_a, zenoh_b), ("B", zenoh_b, zenoh_a)];
+    for ((machine, listen, connect), node_listen_port) in daemons.into_iter().zip(node_listen_ports)
+    {
+        let log = daemon_log(machine);
+        let out = std::fs::File::create(&log).expect("create daemon log");
+        let err = out.try_clone().expect("clone daemon log");
+        let mut command = Command::new(&dora);
+        command
+            .arg("daemon")
+            .arg("--machine-id")
+            .arg(machine)
+            .arg("--coordinator-port")
+            .arg(coordinator_port.to_string())
+            .arg("--zenoh-listen")
+            .arg(format!("{routable}:{listen}"))
+            .arg("--zenoh-connect")
+            .arg(format!("tcp/{routable}:{connect}"))
+            .arg("--zenoh-no-multicast")
+            // The endpoint exchange logs its result at debug, and the daemon's
+            // own filter pins `dora_daemon=info` unless RUST_LOG names it.
+            .env("RUST_LOG", "dora_daemon=debug")
+            .stdout(Stdio::from(out))
+            .stderr(Stdio::from(err));
+        if let Some(port) = node_listen_port {
+            command.arg("--local-listen-port").arg(port.to_string());
+        }
+        deployment
+            .children
+            .push(command.spawn().expect("failed to spawn daemon"));
+        deployment.logs.push(log);
+    }
+
+    if !wait_until(
+        || {
+            connected_machines(coordinator_port)
+                .map(|m| m.iter().any(|id| id == "A") && m.iter().any(|id| id == "B"))
+                .unwrap_or(false)
+        },
+        Duration::from_secs(30),
+    ) {
+        deployment.fail("daemons A and B did not both register within 30s");
+    }
+
+    // `--attach` explicitly: without it `dora start` decides by whether stdin is
+    // a terminal, and under `cargo test` it is not — so the command would
+    // detach, return success the moment the dataflow was accepted, and the
+    // status checked below would say nothing at all about delivery. Attached,
+    // it waits for the dataflow to finish and carries its result, and the sink
+    // bails if it never received a cross-machine value.
+    let mut start = Command::new(&dora)
+        .arg("start")
+        .arg(&dataflow_yml)
+        .arg("--attach")
+        .arg("--name")
+        .arg("cross-machine-direct")
+        .arg("--coordinator-port")
+        .arg(coordinator_port.to_string())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to run dora start");
+    let Some(status) = wait_for_exit(&mut start, Duration::from_secs(120)) else {
+        deployment.fail("the cross-machine dataflow did not finish within 120s");
+    };
+    if !status.success() {
+        deployment.fail(format!(
+            "the cross-machine dataflow failed ({status}); the sink fails its \
+             node when no `random` value arrives, so this is a delivery failure"
+        ));
+    }
+
+    // Delivery is proven above; this is the *how*. Machine B resolving A's node
+    // endpoint is what gives the sink something to dial, so without it the edge
+    // would have quietly fallen back to two daemon hops.
+    let log_b = std::fs::read_to_string(daemon_log("B")).unwrap_or_default();
+    if !log_b.contains("remote node zenoh endpoints") {
+        deployment.fail(
+            "daemon B never resolved a remote node endpoint: the cross-machine \
+             edge fell back to daemon forwarding instead of a direct node link",
+        );
+    }
+}
+
+/// Two daemons must find each other with **no zenoh configuration at all** —
+/// no `--zenoh-listen`, no `--zenoh-connect`, no `--zenoh-peer` — given only
+/// the coordinator's address.
+///
+/// This is the deployment shape the 1.0 docs promise: start a coordinator, then
+/// start daemons pointing at it. Each daemon derives the address its peers
+/// should dial from `--coordinator-addr` (`zenoh_bind_address_for`), reports it
+/// to the coordinator once its listener is confirmed bound, and receives the
+/// endpoints of the daemons that registered before it in its register reply.
+/// Every daemon dialing the ones that preceded it builds the full clique, which
+/// is what zenoh 1.9 requires of a peer region since it stopped relaying.
+///
+/// **Multicast is explicitly disabled on both daemons**, so it cannot be the
+/// explanation for them finding each other. That is deliberate on two counts:
+/// it makes the test assert the coordinator registry specifically, and it makes
+/// the test runnable where multicast is unavailable (dev containers, most CI
+/// runners) — which is exactly where the previous multi-daemon coverage had to
+/// fall back to naming endpoints by hand.
+///
+/// Delivery is asserted by construction, as in the mesh test above: the sink
+/// fails its node when no `random` value arrives, so a dataflow that finishes
+/// is proof the cross-machine edge carried data.
+#[test]
+fn daemons_discover_each_other_through_the_coordinator_without_zenoh_config() {
+    // The daemons derive their zenoh bind from the coordinator address, so a
+    // routable one is needed for them to bind a routable listener. Without one
+    // there is nothing to test here (the loopback case is the test below).
+    let Some(routable) = routable_local_addr() else {
+        eprintln!("skipping: no routable local address on this host");
+        return;
+    };
+    // Wildcard so the daemons can reach it at `routable` while the test's own
+    // helpers keep using loopback — the same bind `dora cluster up` uses.
+    two_daemons_link_through_the_coordinator("0.0.0.0", routable, "zero-config-discovery");
+}
+
+/// The same-host shape of the test above: coordinator and both daemons on
+/// loopback, as with `dora up` plus a second `dora daemon --machine-id`.
+///
+/// A daemon bound to loopback used to report no endpoint at all, so two of
+/// them on one machine met only through multicast scouting — and with
+/// multicast off, as here, never: the dataflow hung. The coordinator now hands
+/// a loopback listener to daemons that also reached it over loopback.
+#[test]
+fn same_host_daemons_link_through_the_coordinator_without_multicast() {
+    two_daemons_link_through_the_coordinator(
+        "127.0.0.1",
+        std::net::Ipv4Addr::LOCALHOST.into(),
+        "same-host-discovery",
+    );
+}
+
+/// Coordinator on `interface`, daemons `A` and `B` pointed at it at
+/// `coordinator_addr` with multicast off and no zenoh flags, and a dataflow
+/// whose only producer→sink edge crosses from A to B. Fails unless it finishes.
+fn two_daemons_link_through_the_coordinator(
+    interface: &str,
+    coordinator_addr: std::net::IpAddr,
+    name: &str,
+) {
+    ensure_built();
+
+    let dora = bin("dora");
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let dataflow_yml = tmp.path().join("dataflow.yml");
+
+    // Producer on A, consumer on B, with no same-machine consumer for `random`,
+    // so the only path from producer to sink crosses the daemon boundary.
+    std::fs::write(
+        &dataflow_yml,
+        format!(
+            "nodes:\n  \
+             - id: producer\n    \
+               deploy:\n      machine: A\n    \
+               path: {producer}\n    \
+               inputs:\n      tick: dora/timer/millis/10\n    \
+               outputs:\n      - random\n  \
+             - id: sink\n    \
+               deploy:\n      machine: B\n    \
+               path: {sink}\n    \
+               inputs:\n      random: producer/random\n",
+            producer = bin("multiple-daemons-example-node").display(),
+            sink = bin("multiple-daemons-example-sink").display(),
+        ),
+    )
+    .expect("write dataflow yml");
+
+    let ports = free_ports(2);
+    let coordinator_port = ports[0];
+    // Only one daemon can hold the default node-listen port on a shared host.
+    let node_listen_ports = [None, Some(ports[1])];
+    let coord_log = tmp.path().join("coordinator.log");
+    let coord_out = std::fs::File::create(&coord_log).expect("create coordinator log");
+    let coord_err = coord_out.try_clone().expect("clone coordinator log");
+
+    let mut deployment = Deployment {
+        dora: dora.clone(),
+        coordinator_port,
+        children: vec![
+            Command::new(&dora)
+                .arg("coordinator")
+                .arg("--interface")
+                .arg(interface)
+                .arg("--port")
+                .arg(coordinator_port.to_string())
+                .arg("--store")
+                .arg(format!(
+                    "redb:{}",
+                    tmp.path().join("coordinator.redb").display()
+                ))
+                .stdout(Stdio::from(coord_out))
+                .stderr(Stdio::from(coord_err))
+                .spawn()
+                .expect("failed to spawn coordinator"),
+        ],
+        logs: vec![coord_log],
+    };
+    if !wait_until(|| port_open(coordinator_port), Duration::from_secs(20)) {
+        deployment.fail("coordinator did not accept connections within 20s");
+    }
+
+    // Started **concurrently**, with no wait between them, which is the case
+    // the registry has to get right: each daemon advertises its endpoint in its
+    // own register request, and the coordinator handles registrations one at a
+    // time on its event loop, so whichever is second is handed the first one's
+    // endpoint no matter how close together they start.
+    //
+    // This is the regression guard for the window that existed while daemons
+    // reported their endpoint only *after* opening their zenoh session: two
+    // daemons registering inside it were each handed a list without the other,
+    // and — since zenoh reads `connect/endpoints` once — neither could act on
+    // the other's later report. With multicast off, as here, that pair stayed
+    // partitioned for the life of the process.
+    let daemon_log = |machine: &str| tmp.path().join(format!("daemon-{machine}.log"));
+    for (machine, node_listen_port) in ["A", "B"].into_iter().zip(node_listen_ports) {
+        let log = daemon_log(machine);
+        let out = std::fs::File::create(&log).expect("create daemon log");
+        let err = out.try_clone().expect("clone daemon log");
+        let mut command = Command::new(&dora);
+        command
+            .arg("daemon")
+            .arg("--machine-id")
+            .arg(machine)
+            // The *only* address configured anywhere. Everything zenoh needs is
+            // derived from it or learned from the coordinator.
+            .arg("--coordinator-addr")
+            .arg(coordinator_addr.to_string())
+            .arg("--coordinator-port")
+            .arg(coordinator_port.to_string())
+            // Proves the coordinator registry did the wiring: with scouting off
+            // there is no other way for these two to find each other.
+            .arg("--zenoh-no-multicast")
+            // The endpoint exchange logs its result at debug, and the daemon's
+            // own filter pins `dora_daemon=info` unless RUST_LOG names it.
+            .env("RUST_LOG", "dora_daemon=debug")
+            .stdout(Stdio::from(out))
+            .stderr(Stdio::from(err));
+        if let Some(port) = node_listen_port {
+            command.arg("--local-listen-port").arg(port.to_string());
+        }
+        deployment
+            .children
+            .push(command.spawn().expect("failed to spawn daemon"));
+        deployment.logs.push(log);
+    }
+
+    if !wait_until(
+        || {
+            connected_machines(coordinator_port)
+                .map(|m| m.iter().any(|id| id == "A") && m.iter().any(|id| id == "B"))
+                .unwrap_or(false)
+        },
+        Duration::from_secs(30),
+    ) {
+        deployment.fail("daemons A and B did not both register within 30s");
+    }
+
+    // `--attach` explicitly: without it `dora start` decides by whether stdin is
+    // a terminal, and under `cargo test` it is not — so the command would
+    // detach, return success the moment the dataflow was accepted, and the
+    // status checked below would say nothing at all about delivery. Attached,
+    // it waits for the dataflow to finish and carries its result, and the sink
+    // bails if it never received a cross-machine value.
+    let mut start = Command::new(&dora)
+        .arg("start")
+        .arg(&dataflow_yml)
+        .arg("--attach")
+        .arg("--name")
+        .arg(name)
+        .arg("--coordinator-port")
+        .arg(coordinator_port.to_string())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to run dora start");
+    let Some(status) = wait_for_exit(&mut start, Duration::from_secs(120)) else {
+        deployment.fail("the cross-machine dataflow did not finish within 120s");
+    };
+    if !status.success() {
+        deployment.fail(format!(
+            "the cross-machine dataflow failed ({status}); with multicast off and \
+             no zenoh flags, the daemons had only the coordinator's endpoint \
+             registry to find each other by"
+        ));
+    }
+}
+
+// Run the #2721 dynamic-join regressions in the existing multi-daemon nightly lane.
+#[path = "multi_daemon/dynamic_peering.rs"]
+mod dynamic_peering;

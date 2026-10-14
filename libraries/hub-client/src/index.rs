@@ -5,7 +5,7 @@
 //! verbatim and a source pointer; resolution picks the highest non-yanked
 //! version satisfying a requirement.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use dora_core::{manifest::NodeManifest, types::edit_distance};
 use eyre::Context;
@@ -191,17 +191,55 @@ impl IndexCatalog {
     }
 
     /// Reject a path that, after following symlinks, resolves outside the
-    /// catalog root. A non-existent path is fine — nothing is read, and the
-    /// caller handles `NotFound`.
+    /// catalog root. Safe for a not-yet-existing leaf (e.g. a version entry a
+    /// caller is about to write): intermediate symlinks are still resolved, so
+    /// a write can't land outside the root through a symlinked parent.
     fn confine(&self, path: &Path) -> eyre::Result<()> {
-        match path.canonicalize() {
-            Ok(real) if real.starts_with(&self.canonical_root) => Ok(()),
-            Ok(_) => eyre::bail!(
+        let escapes = || {
+            eyre::eyre!(
                 "index path `{}` escapes the catalog root (symlink?)",
                 path.display()
-            ),
-            Err(_) => Ok(()),
+            )
+        };
+        // Fast path: a fully existing path canonicalizes directly.
+        if let Ok(real) = path.canonicalize() {
+            return real
+                .starts_with(&self.canonical_root)
+                .then_some(())
+                .ok_or_else(escapes);
         }
+        // The leaf (or some tail component) doesn't exist yet, so
+        // `canonicalize` failed on the whole path without resolving
+        // intermediate symlinks. Resolve component by component under the
+        // canonical root, rejecting any existing component that redirects
+        // outside it. Once we reach a component that doesn't exist, the
+        // remaining ones are the (validated) names the caller will create,
+        // which stay under the already-confined `current`.
+        let relative = path.strip_prefix(&self.root).map_err(|_| escapes())?;
+        let mut current = self.canonical_root.clone();
+        for component in relative.components() {
+            let Component::Normal(part) = component else {
+                // `namespace`/`name` are validated and versions are semver, so
+                // no `.`/`..`/root components ever reach here; reject anything
+                // unexpected defensively.
+                return Err(escapes());
+            };
+            let next = current.join(part);
+            match next.symlink_metadata() {
+                Ok(meta) if meta.file_type().is_symlink() => {
+                    let real = next.canonicalize().map_err(|_| escapes())?;
+                    if !real.starts_with(&self.canonical_root) {
+                        return Err(escapes());
+                    }
+                    current = real;
+                }
+                // A regular entry inside an already-confined directory, or a
+                // not-yet-created component: either way it stays under
+                // `current`, which is inside the root.
+                Ok(_) | Err(_) => current = next,
+            }
+        }
+        Ok(())
     }
 
     fn package_dir(&self, namespace: &str, name: &str) -> eyre::Result<PathBuf> {
@@ -324,8 +362,36 @@ impl IndexCatalog {
         // versions() returns ascending order; walk highest-first, skipping
         // yanked versions
         let mut had_yanked_match = false;
+        let mut unreadable: Option<eyre::Report> = None;
         for version in matching.iter().rev() {
-            let entry = self.entry(&reference.namespace, &reference.name, version)?;
+            // A single malformed entry file — a typo, or a version published by
+            // a newer index schema this client can't parse (entries use
+            // `deny_unknown_fields`) — must not sink the whole resolution when a
+            // lower matching version is perfectly installable. Skip an
+            // unreadable entry the same way a yanked one is skipped, and only
+            // surface the parse error if nothing else satisfies the
+            // requirement. This also matches the "available versions" hint
+            // below, which already tolerates a per-entry parse error.
+            //
+            // Warn on every skip, though: when a lower version then resolves we
+            // `return` before the post-loop error block, so without this log a
+            // corrupt highest entry would silently downgrade the user to an
+            // older version with no indication of why. `get_or_insert` keeps the
+            // *first* error seen — the highest matching version, since the loop
+            // walks highest-first — which is the one someone asking "why didn't
+            // I get the newest?" actually needs, rather than overwriting it with
+            // a lower version's error.
+            let entry = match self.entry(&reference.namespace, &reference.name, version) {
+                Ok(entry) => entry,
+                Err(err) => {
+                    tracing::warn!(
+                        "skipping unreadable index entry for `{}` {version}: {err:#}",
+                        reference.key()
+                    );
+                    unreadable.get_or_insert(err);
+                    continue;
+                }
+            };
             if entry.yanked {
                 had_yanked_match = true;
                 continue;
@@ -333,6 +399,22 @@ impl IndexCatalog {
             return Ok(ResolvedVersion {
                 version: (*version).clone(),
                 entry,
+            });
+        }
+        // A matching version whose entry couldn't be read is surfaced before
+        // the yanked case: it's an actionable index bug rather than a
+        // deliberate state, and reporting "yanked" first would be inaccurate
+        // when the unreadable version isn't itself the yanked one (e.g. a
+        // range that matched one yanked and one corrupt version). This also
+        // beats the misleading "no version satisfies" below, which would list
+        // only the *other*, non-matching versions.
+        if let Some(err) = unreadable {
+            return Err(err).with_context(|| {
+                format!(
+                    "could not read an index entry for `{}` matching `{}`",
+                    reference.key(),
+                    reference.requirement
+                )
             });
         }
         // distinguish "your range matched only yanked versions" from "no
@@ -439,14 +521,19 @@ fn read_capped(path: &Path) -> eyre::Result<String> {
     use std::io::Read as _;
     let file = std::fs::File::open(path)
         .with_context(|| format!("no index entry at `{}`", path.display()))?;
-    let mut raw = String::new();
+    // Read raw bytes and check the size cap *before* validating UTF-8. Reading
+    // straight into a `String` validates UTF-8 over the `MAX_ENTRY_SIZE + 1`
+    // bytes we deliberately over-read to detect oversize files; if that extra
+    // byte lands mid-way through a multi-byte sequence, the caller would see a
+    // confusing "invalid UTF-8" error instead of the intended "too large" one.
+    let mut raw = Vec::new();
     file.take(MAX_ENTRY_SIZE + 1)
-        .read_to_string(&mut raw)
+        .read_to_end(&mut raw)
         .with_context(|| format!("failed to read `{}`", path.display()))?;
     if raw.len() as u64 > MAX_ENTRY_SIZE {
         eyre::bail!("index file `{}` too large", path.display());
     }
-    Ok(raw)
+    String::from_utf8(raw).with_context(|| format!("`{}` is not valid UTF-8", path.display()))
 }
 
 #[cfg(test)]
@@ -509,6 +596,83 @@ mod tests {
         assert_eq!(rev, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
     }
 
+    #[test]
+    fn resolve_skips_an_unreadable_higher_entry_and_falls_back() {
+        // A single corrupt entry — a typo, or a version file written by a
+        // newer index schema this client can't parse — for a *higher* version
+        // must not break installation when a lower matching version is
+        // installable.
+        let (tmp, _catalog) = fixture();
+        let pkg = tmp.path().join("dora-rs/dora-yolo");
+        // 0.5.3 is the highest match for ^0.5, but its entry is unparseable
+        // (missing the required `manifest`/`source` fields).
+        std::fs::write(pkg.join("0.5.3.yml"), "bogus: true\n").unwrap();
+        let catalog = IndexCatalog::open(tmp.path()).unwrap();
+        let resolved = catalog.resolve(&parse_ref("dora-yolo@^0.5")).unwrap();
+        assert_eq!(resolved.version, Version::parse("0.5.2").unwrap());
+    }
+
+    #[test]
+    fn resolve_surfaces_the_parse_error_when_every_match_is_unreadable() {
+        // If the *only* version satisfying the requirement is unreadable, the
+        // parse error must be surfaced rather than a misleading "no version
+        // satisfies" that would list only non-matching versions.
+        let (tmp, _catalog) = fixture();
+        let pkg = tmp.path().join("dora-rs/dora-yolo");
+        std::fs::write(pkg.join("0.7.0.yml"), "bogus: true\n").unwrap();
+        let catalog = IndexCatalog::open(tmp.path()).unwrap();
+        let err = catalog.resolve(&parse_ref("dora-yolo@^0.7")).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("could not read an index entry"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn resolve_surfaces_the_highest_unreadable_entry_when_several_are_corrupt() {
+        // When more than one matching version is unreadable (and none is
+        // installable), the surfaced error must name the *highest* corrupt
+        // version — the one a user asking "why didn't I get the newest?" cares
+        // about — not a lower one. Guards the `get_or_insert` (keep-first, since
+        // the loop walks highest-first) over a plain overwrite.
+        let (tmp, _catalog) = fixture();
+        let pkg = tmp.path().join("dora-rs/dora-yolo");
+        std::fs::write(pkg.join("0.7.0.yml"), "bogus: true\n").unwrap();
+        std::fs::write(pkg.join("0.7.1.yml"), "bogus: true\n").unwrap();
+        let catalog = IndexCatalog::open(tmp.path()).unwrap();
+        let err = catalog.resolve(&parse_ref("dora-yolo@^0.7")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("0.7.1.yml"),
+            "expected the highest corrupt version in the error, got: {msg}"
+        );
+        assert!(
+            !msg.contains("0.7.0.yml"),
+            "the lower corrupt version's error should not be the surfaced one: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_reports_the_unreadable_entry_not_yanked_when_the_range_has_both() {
+        // A range that matches one yanked version and one unreadable version
+        // (with no installable one) must report the unreadable entry — the
+        // actionable index bug — rather than claim "every version has been
+        // yanked", which is false when the unreadable version isn't yanked.
+        let (tmp, _catalog) = fixture();
+        let pkg = tmp.path().join("dora-rs/dora-yolo");
+        // fixture already has 0.6.0 yanked; add a corrupt 0.6.1.
+        std::fs::write(pkg.join("0.6.1.yml"), "bogus: true\n").unwrap();
+        let catalog = IndexCatalog::open(tmp.path()).unwrap();
+        // A plain requirement never matches a prerelease, and ^0.6 spans both
+        // 0.6.0 (yanked) and 0.6.1 (corrupt).
+        let err = catalog.resolve(&parse_ref("dora-yolo@^0.6")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("could not read an index entry"),
+            "unexpected error: {msg}"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn reads_reject_symlinked_package_dir_escaping_the_catalog() {
@@ -533,6 +697,42 @@ mod tests {
                 .is_err()
         );
         assert!(catalog.package_meta("acme", "escape").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn version_entry_path_rejects_symlinked_dir_for_a_nonexistent_leaf() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        // a real directory OUTSIDE the catalog root, with no entry file yet
+        let real = outside.path().join("evil");
+        std::fs::create_dir_all(&real).unwrap();
+        // inside the catalog, a package dir that is a symlink pointing there
+        let ns = tmp.path().join("acme");
+        std::fs::create_dir_all(&ns).unwrap();
+        std::os::unix::fs::symlink(&real, ns.join("lidar")).unwrap();
+        let catalog = IndexCatalog::open(tmp.path()).unwrap();
+        // the leaf `1.0.0.yml` does not exist, but the parent is a symlink out
+        // of the root, so handing back a writable path would let the caller's
+        // write land in `outside` — confine must refuse it.
+        let err = catalog
+            .version_entry_path("acme", "lidar", &Version::parse("1.0.0").unwrap())
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("escapes the catalog root"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn version_entry_path_allows_a_new_leaf_under_the_root() {
+        let (_tmp, catalog) = fixture();
+        // a version file that does not exist yet under a legitimate package
+        // must still resolve to a writable in-root path.
+        let path = catalog
+            .version_entry_path("dora-rs", "dora-yolo", &Version::parse("0.7.0").unwrap())
+            .unwrap();
+        assert!(path.ends_with("dora-rs/dora-yolo/0.7.0.yml"));
     }
 
     #[test]
@@ -728,5 +928,36 @@ mod tests {
         let mut a = art("linux-x86_64");
         a.sha256 = "z".repeat(64);
         assert!(a.validate().is_err());
+    }
+
+    #[test]
+    fn read_capped_reports_too_large_even_when_cap_splits_a_char() {
+        // A file larger than the cap, filled with a 2-byte character so the
+        // deliberately over-read `MAX_ENTRY_SIZE + 1`th byte lands mid-way
+        // through a UTF-8 sequence. The error must still be "too large", not a
+        // confusing "invalid UTF-8".
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("big.yml");
+        let oversized = "é".repeat((MAX_ENTRY_SIZE as usize / 2) + 8);
+        std::fs::write(&path, oversized).unwrap();
+        let err = read_capped(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("too large"),
+            "expected `too large`, got: {err}"
+        );
+    }
+
+    #[test]
+    fn read_capped_reports_invalid_utf8_for_small_binary_file() {
+        // A sub-cap file that is genuinely not UTF-8 still surfaces a clear
+        // UTF-8 error rather than being silently accepted.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("binary.yml");
+        std::fs::write(&path, [0xff, 0xfe, 0x00, 0x01]).unwrap();
+        let err = read_capped(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("not valid UTF-8"),
+            "expected UTF-8 error, got: {err}"
+        );
     }
 }

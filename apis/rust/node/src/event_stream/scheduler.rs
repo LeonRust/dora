@@ -7,10 +7,30 @@ use dora_message::{
     config::{DEFAULT_QUEUE_SIZE, QueuePolicy},
     daemon_to_node::NodeEvent,
     id::DataId,
-    metadata::{GOAL_ID, GOAL_STATUS, REQUEST_ID, get_string_param},
+    metadata::{
+        GOAL_ID, GOAL_STATUS, MetadataParameters, REQUEST_ID, carries_pattern_correlation,
+        get_string_param,
+    },
 };
 
 use super::thread::EventItem;
+
+/// The metadata parameters carried by an input-bearing event, or `None` for
+/// events with no metadata (Stop, reload, input-closed, ...).
+///
+/// This is the single place that decides which `EventItem` variants carry
+/// parameters, so the eviction guard (`is_correlated`) and its diagnostics
+/// (`log_correlation_drop`) can never disagree on that classification.
+fn event_parameters(event: &EventItem) -> Option<&MetadataParameters> {
+    match event {
+        EventItem::NodeEvent {
+            event: NodeEvent::Input { metadata, .. },
+            ..
+        } => Some(&metadata.parameters),
+        EventItem::ZenohInput { metadata, .. } => Some(&metadata.parameters),
+        _ => None,
+    }
+}
 
 /// Returns `true` if the event carries request/response or action correlation
 /// metadata (`request_id`, `goal_id`, or `goal_status`).
@@ -20,63 +40,93 @@ use super::thread::EventItem;
 /// client waits forever for a response or result that never arrives
 /// (dora-rs/adora#145).
 fn is_correlated(event: &EventItem) -> bool {
-    let params = match event {
+    // Delegate to the canonical definition in `dora_message` so the scheduler's
+    // eviction guard can never disagree with the send-side / receive-side /
+    // daemon-debug layers about which keys mark a message as pattern-correlated
+    // (see `carries_pattern_correlation`). Duplicating the key list here risked
+    // silently dropping service/action messages if a new correlation key were
+    // added to only one copy.
+    event_parameters(event).is_some_and(carries_pattern_correlation)
+}
+
+/// Returns `true` if the event is the daemon's [`Stop`][NodeEvent::Stop]
+/// shutdown signal.
+///
+/// `Stop` must never be silently evicted from a full queue: dropping it makes
+/// the node miss shutdown entirely and keep running until the daemon's
+/// force-kill grace deadline. Since at most one `Stop` is ever in flight,
+/// making it eviction-immune cannot let the queue grow unbounded.
+fn is_stop(event: &EventItem) -> bool {
+    matches!(
+        event,
         EventItem::NodeEvent {
-            event: NodeEvent::Input { metadata, .. },
+            event: NodeEvent::Stop,
             ..
-        } => &metadata.parameters,
-        EventItem::ZenohInput { metadata, .. } => &metadata.parameters,
-        _ => return false,
-    };
-    params.contains_key(REQUEST_ID)
-        || params.contains_key(GOAL_ID)
-        || params.contains_key(GOAL_STATUS)
+        }
+    )
 }
 
 /// Outcome of `select_eviction`.
 enum Eviction {
     /// Remove event at this index from the queue and push the incoming event.
     RemoveAt(usize),
-    /// The queue is entirely correlated and the incoming event is not —
-    /// drop the incoming event instead of breaking a correlation.
+    /// The queue holds only events that must be preserved (correlated and/or
+    /// the `Stop`) and the incoming event is an ordinary one — drop the
+    /// incoming event instead of breaking a correlation or losing `Stop`.
     DropIncoming,
-    /// The queue is entirely correlated and the incoming event is also
-    /// correlated — drop the oldest (front) event with a loud error log.
-    DropFrontLoud,
+    /// The queue is entirely correlated (plus possibly the `Stop`) and the
+    /// incoming event must also be preserved — drop the oldest *correlated*
+    /// event at this index with a loud error log, never the `Stop`.
+    DropCorrelatedLoud(usize),
 }
 
 /// Choose which event to drop when the queue is at capacity.
 ///
-/// Prefers sacrificing non-correlated events so that service responses and
-/// action results survive. See `is_correlated` for the metadata keys that
-/// mark an event as part of a pattern.
+/// Prefers sacrificing ordinary (non-correlated, non-`Stop`) events so that
+/// service responses, action results, and the shutdown signal survive. See
+/// `is_correlated` for the metadata keys that mark an event as part of a
+/// pattern, and `is_stop` for why `Stop` is eviction-immune.
 fn select_eviction(queue: &VecDeque<EventItem>, incoming: &EventItem) -> Eviction {
-    if let Some(idx) = queue.iter().position(|e| !is_correlated(e)) {
+    // 1. Sacrifice the oldest ordinary event, never a correlation or `Stop`.
+    if let Some(idx) = queue.iter().position(|e| !is_correlated(e) && !is_stop(e)) {
         return Eviction::RemoveAt(idx);
     }
-    if !is_correlated(incoming) {
+    // 2. Nothing ordinary left to sacrifice. If the incoming event is itself
+    //    ordinary, drop it rather than a correlation or the `Stop`.
+    if !is_correlated(incoming) && !is_stop(incoming) {
         return Eviction::DropIncoming;
     }
-    Eviction::DropFrontLoud
+    // 3. Both the queue and the incoming event must be preserved. Drop the
+    //    oldest *correlated* event (loudly), keeping the `Stop` intact. If the
+    //    queue somehow contains no correlated event (only a `Stop`, which is
+    //    at most one), fall back to dropping the incoming event.
+    match queue.iter().position(|e| !is_stop(e)) {
+        Some(idx) => Eviction::DropCorrelatedLoud(idx),
+        None => Eviction::DropIncoming,
+    }
 }
 
 /// Emit a loud error when a correlated event has to be dropped because
 /// everything in the queue is also correlated. Identifies the correlation
 /// keys so operators can trace the affected request/goal.
 fn log_correlation_drop(event_id: &DataId, dropped: &EventItem) {
-    let params = match dropped {
-        EventItem::NodeEvent {
-            event: NodeEvent::Input { metadata, .. },
-            ..
-        } => &metadata.parameters,
-        EventItem::ZenohInput { metadata, .. } => &metadata.parameters,
-        _ => return,
+    let Some(params) = event_parameters(dropped) else {
+        return;
     };
+    log_correlation_drop_params(event_id, params);
+}
+
+/// The body of [`log_correlation_drop`], taking the correlation parameters
+/// directly so the passthrough-buffer eviction path in
+/// [`EventStream`](super::EventStream) — which holds already-converted `Event`s,
+/// not `EventItem`s — can emit the identical loud error without duplicating the
+/// key list or the remediation message (dora-rs/dora#3197).
+pub(crate) fn log_correlation_drop_params(input_id: &DataId, params: &MetadataParameters) {
     let request_id = get_string_param(params, REQUEST_ID);
     let goal_id = get_string_param(params, GOAL_ID);
     let goal_status = get_string_param(params, GOAL_STATUS);
     tracing::error!(
-        input = %event_id,
+        input = %input_id,
         ?request_id,
         ?goal_id,
         ?goal_status,
@@ -86,10 +136,23 @@ fn log_correlation_drop(event_id: &DataId, dropped: &EventItem) {
          `queue_policy: backpressure`."
     );
 }
+/// Drop-accounting key for the non-input (control-event) queue.
+///
+/// The queue itself is [`Scheduler::non_input`], deliberately not keyed by this
+/// name: `dora.non_input_event` is a valid `DataId`, so a dataflow may declare
+/// an input with that id, and keying the control queue by it let that input's
+/// `queue_size` and eviction apply to control events (dora-rs/dora#3632). Only
+/// `drain_drop_counts` and the record node still use the name, to report
+/// control-event drops separately from per-input ones.
 pub(crate) const NON_INPUT_EVENT: &str = "dora.non_input_event";
 
-/// Shared [`DataId`] for [`NON_INPUT_EVENT`], so the hot `add_event`/`next`
-/// paths don't have to allocate a fresh `String` on every call.
+/// Capacity of the scheduler's single non-input (control-event) queue, and of
+/// the matching bucket in `EventStream`'s passthrough buffer. Shared so the two
+/// bounds cannot drift apart (dora-rs/dora#3197).
+pub(crate) const NON_INPUT_EVENT_QUEUE_SIZE: usize = 1_000;
+
+/// Shared [`DataId`] for [`NON_INPUT_EVENT`], so the drop-accounting path
+/// doesn't have to allocate a fresh `String` on every call.
 static NON_INPUT_EVENT_ID: LazyLock<DataId> =
     LazyLock::new(|| DataId::from(NON_INPUT_EVENT.to_string()));
 
@@ -168,12 +231,19 @@ static NON_INPUT_EVENT_ID: LazyLock<DataId> =
 pub struct Scheduler {
     /// Tracks the last-used event ID
     last_used: VecDeque<DataId>,
-    /// Tracks events per ID
+    /// Tracks events per input ID
     event_queues: HashMap<DataId, (usize, VecDeque<EventItem>)>,
     /// Queue policies per input ID
     queue_policies: HashMap<DataId, QueuePolicy>,
     /// Drop counters per input ID
     dropped: HashMap<DataId, u64>,
+    /// Control (non-input) events: `Stop`, `InputClosed`, `Reload`, ...
+    ///
+    /// Kept out of `event_queues` so that a user input whose id happens to be
+    /// `NON_INPUT_EVENT` (a valid `DataId`) cannot alias this queue. With the
+    /// two shared, that input's `queue_size` bounded control events and its
+    /// data events were yielded ahead of every other input (dora-rs/dora#3632).
+    non_input: VecDeque<EventItem>,
 }
 
 impl Scheduler {
@@ -181,23 +251,55 @@ impl Scheduler {
         event_queues: HashMap<DataId, (usize, VecDeque<EventItem>)>,
         queue_policies: HashMap<DataId, QueuePolicy>,
     ) -> Self {
-        let topic = VecDeque::from_iter(
-            event_queues
-                .keys()
-                .filter(|t| **t != *NON_INPUT_EVENT_ID)
-                .cloned(),
-        );
+        let topic = VecDeque::from_iter(event_queues.keys().cloned());
         Self {
             last_used: topic,
             event_queues,
             queue_policies,
             dropped: HashMap::new(),
+            non_input: VecDeque::new(),
         }
     }
 
     /// Returns and resets the accumulated drop counts per input ID.
     pub fn drain_drop_counts(&mut self) -> HashMap<DataId, u64> {
         std::mem::take(&mut self.dropped)
+    }
+
+    /// The effective queue capacity for an input, i.e. `queue_size` combined
+    /// with its [`QueuePolicy`] via [`QueuePolicy::effective_cap`]. Uses the
+    /// same defaults as [`add_event`](Self::add_event) for an unconfigured
+    /// input (`DEFAULT_QUEUE_SIZE`, `drop_oldest`), so a bound derived from
+    /// this matches what the scheduler itself would enforce.
+    ///
+    /// Exposed so the passthrough buffer in [`EventStream`](super::EventStream)
+    /// — which holds events that a pattern-aware wait pulled out of the
+    /// scheduler — can apply the *same* per-input bound the scheduler would
+    /// have, instead of retaining them without limit (dora-rs/dora#3197).
+    pub(crate) fn effective_cap_for(&self, id: &DataId) -> usize {
+        let size = self
+            .event_queues
+            .get(id)
+            .map(|(size, _)| *size)
+            .unwrap_or(DEFAULT_QUEUE_SIZE);
+        let policy = self.queue_policies.get(id).copied().unwrap_or_default();
+        policy.effective_cap(size)
+    }
+
+    /// Account for one dropped event on `id`, so a drop enforced outside the
+    /// scheduler (the passthrough bound) still shows up in
+    /// [`drain_drop_counts`](Self::drain_drop_counts) exactly like an in-queue
+    /// `drop_oldest` eviction (dora-rs/dora#3197).
+    pub(crate) fn record_drop(&mut self, id: &DataId) {
+        *self.dropped.entry(id.clone()).or_insert(0) += 1;
+    }
+
+    /// Account for one dropped non-input (control) event, under the same
+    /// `NON_INPUT_EVENT` key the scheduler itself uses when its non-input queue
+    /// overflows — so a passthrough-bound drop of a control event is reported
+    /// consistently with an in-queue one (dora-rs/dora#3197).
+    pub(crate) fn record_non_input_drop(&mut self) {
+        *self.dropped.entry(NON_INPUT_EVENT_ID.clone()).or_insert(0) += 1;
     }
 
     pub(crate) fn add_event(&mut self, event: EventItem) {
@@ -210,16 +312,22 @@ impl Scheduler {
                     &metadata.parameters,
                     dora_message::metadata::FLUSH,
                 ) == Some(true);
-                (id, flush)
+                (Some(id), flush)
             }
             EventItem::ZenohInput { id, metadata, .. } => {
                 let flush = dora_message::metadata::get_bool_param(
                     &metadata.parameters,
                     dora_message::metadata::FLUSH,
                 ) == Some(true);
-                (id, flush)
+                (Some(id), flush)
             }
-            _ => (&*NON_INPUT_EVENT_ID, false),
+            _ => (None, false),
+        };
+        // Control events have no input id; they go to their own queue so that no
+        // user input can ever share it (dora-rs/dora#3632).
+        let Some(event_id) = event_id else {
+            self.add_non_input_event(event);
+            return;
         };
 
         // Flush older queued messages when flush=true is present.
@@ -293,9 +401,9 @@ impl Scheduler {
                     // by dropping the incoming (non-correlated) event.
                     return;
                 }
-                Eviction::DropFrontLoud => {
-                    if let Some(front) = queue.pop_front() {
-                        log_correlation_drop(event_id, &front);
+                Eviction::DropCorrelatedLoud(idx) => {
+                    if let Some(dropped) = queue.remove(idx) {
+                        log_correlation_drop(event_id, &dropped);
                     }
                 }
             }
@@ -303,15 +411,40 @@ impl Scheduler {
         queue.push_back(event);
     }
 
+    /// Append a control event to the dedicated non-input queue.
+    ///
+    /// Bounded by [`NON_INPUT_EVENT_QUEUE_SIZE`] and evicted with the same rules
+    /// as an input queue (`select_eviction`), so a full control queue sacrifices
+    /// its oldest ordinary event rather than ever losing the `Stop` shutdown
+    /// signal (dora-rs/dora#2887).
+    fn add_non_input_event(&mut self, event: EventItem) {
+        if self.non_input.len() >= NON_INPUT_EVENT_QUEUE_SIZE {
+            tracing::warn!("Discarding non-input event due to queue size limit");
+            self.record_non_input_drop();
+            match select_eviction(&self.non_input, &event) {
+                Eviction::RemoveAt(idx) => {
+                    self.non_input.remove(idx);
+                }
+                Eviction::DropIncoming => return,
+                Eviction::DropCorrelatedLoud(idx) => {
+                    if let Some(dropped) = self.non_input.remove(idx) {
+                        log_correlation_drop(&NON_INPUT_EVENT_ID, &dropped);
+                    }
+                }
+            }
+        }
+        self.non_input.push_back(event);
+    }
+
     pub(crate) fn next(&mut self) -> Option<EventItem> {
         // Retrieve message from the non input event first that have priority over input message.
-        if let Some((_size, queue)) = self.event_queues.get_mut(&*NON_INPUT_EVENT_ID)
-            && let Some(event) = queue.pop_front()
-        {
+        if let Some(event) = self.non_input.pop_front() {
             return Some(event);
         }
 
-        // Process the ID with the oldest timestamp using BTreeMap Ordering
+        // Yield from the first non-empty input queue in least-recently-used
+        // order: `last_used` is a VecDeque of input IDs, and the ID we serve
+        // from is rotated to the back below so the others get a turn next.
         for index in 0..self.last_used.len() {
             let id = &self.last_used[index];
             if let Some((_size, queue)) = self.event_queues.get_mut(id)
@@ -329,9 +462,11 @@ impl Scheduler {
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.event_queues
-            .iter()
-            .all(|(_id, (_size, queue))| queue.is_empty())
+        self.non_input.is_empty()
+            && self
+                .event_queues
+                .iter()
+                .all(|(_id, (_size, queue))| queue.is_empty())
     }
 }
 
@@ -339,26 +474,14 @@ impl Scheduler {
 mod tests {
     use super::*;
     use crate::uhlc;
-    use arrow_schema::DataType;
     use dora_message::{
         daemon_to_node::NodeEvent,
-        metadata::{ArrowTypeInfo, FLUSH, Metadata, MetadataParameters, Parameter},
+        metadata::{FLUSH, Metadata, MetadataParameters, Parameter},
     };
 
     fn make_input(id: &str, params: MetadataParameters) -> EventItem {
-        let type_info = ArrowTypeInfo {
-            data_type: DataType::Null,
-            len: 0,
-            null_count: 0,
-            validity: None,
-            offset: 0,
-            buffer_offsets: vec![],
-            child_data: vec![],
-            field_names: None,
-            schema_hash: None,
-        };
         let ts = uhlc::HLC::default().new_timestamp();
-        let metadata = Metadata::from_parameters(ts, type_info, params);
+        let metadata = Metadata::from_parameters(ts, params);
         EventItem::NodeEvent {
             event: NodeEvent::Input {
                 id: DataId::from(id.to_string()),
@@ -368,14 +491,24 @@ mod tests {
         }
     }
 
+    fn make_stop() -> EventItem {
+        EventItem::NodeEvent {
+            event: NodeEvent::Stop,
+        }
+    }
+
+    fn make_input_closed(id: &str) -> EventItem {
+        EventItem::NodeEvent {
+            event: NodeEvent::InputClosed {
+                id: DataId::from(id.to_string()),
+            },
+        }
+    }
+
     fn make_scheduler(audio_capacity: usize) -> (Scheduler, DataId) {
         let id = DataId::from("audio".to_string());
         let mut queues = HashMap::new();
         queues.insert(id.clone(), (audio_capacity, VecDeque::new()));
-        queues.insert(
-            DataId::from(NON_INPUT_EVENT.to_string()),
-            (10, VecDeque::new()),
-        );
         (Scheduler::with_policies(queues, HashMap::new()), id)
     }
 
@@ -671,15 +804,196 @@ mod tests {
         );
     }
 
+    // The non-input queue holds every lifecycle event (`Stop`, `InputClosed`,
+    // `Error`, ...) under one cap. Overflow must never evict the `Stop`
+    // shutdown signal: dropping it makes the node miss shutdown and run until
+    // the daemon force-kills it. A `Stop` buffered while the node is busy must
+    // survive a flood of other non-input events that overflows the queue many
+    // times over.
+    #[test]
+    fn stop_survives_non_input_queue_overflow() {
+        let (mut sched, _id) = make_scheduler(10);
+
+        sched.add_event(make_stop());
+        for i in 0..NON_INPUT_EVENT_QUEUE_SIZE + 25 {
+            sched.add_event(make_input_closed(&format!("in-{i}")));
+        }
+
+        let non_input = &sched.non_input;
+        assert_eq!(
+            non_input.len(),
+            NON_INPUT_EVENT_QUEUE_SIZE,
+            "non-input queue must stay bounded"
+        );
+        assert!(
+            non_input.iter().any(is_stop),
+            "the Stop event must survive non-input queue overflow"
+        );
+    }
+
+    // The incoming event is a `Stop` and the queue is already full of ordinary
+    // non-input events: the `Stop` must be admitted (evicting an ordinary
+    // event), not dropped as the overflow victim.
+    #[test]
+    fn incoming_stop_is_admitted_into_a_full_non_input_queue() {
+        let (mut sched, _id) = make_scheduler(10);
+
+        for i in 0..NON_INPUT_EVENT_QUEUE_SIZE {
+            sched.add_event(make_input_closed(&format!("in-{i}")));
+        }
+        sched.add_event(make_stop());
+
+        let non_input = &sched.non_input;
+        assert_eq!(
+            non_input.len(),
+            NON_INPUT_EVENT_QUEUE_SIZE,
+            "non-input queue must stay bounded"
+        );
+        assert!(
+            non_input.iter().any(is_stop),
+            "an incoming Stop must be admitted into a full non-input queue"
+        );
+    }
+
+    // `dora.non_input_event` is a valid `DataId`, so a dataflow can declare an
+    // input with that exact name. The control queue must not be keyed by it:
+    // otherwise the input's `queue_size` bounds control events too, and a burst
+    // of input data can evict a pending `InputClosed` (dora-rs/dora#3632).
+    #[test]
+    fn user_input_cap_does_not_bound_control_events() {
+        let mut queues = HashMap::new();
+        queues.insert(
+            DataId::from(NON_INPUT_EVENT.to_string()),
+            (1, VecDeque::new()),
+        );
+        let mut sched = Scheduler::with_policies(queues, HashMap::new());
+
+        sched.add_event(make_input_closed("a"));
+        sched.add_event(make_input_closed("b"));
+
+        let mut closed = Vec::new();
+        while let Some(event) = sched.next() {
+            if let EventItem::NodeEvent {
+                event: NodeEvent::InputClosed { id },
+                ..
+            } = event
+            {
+                closed.push(id.to_string());
+            }
+        }
+        assert_eq!(
+            closed,
+            vec!["a", "b"],
+            "control events must use the control queue's cap, not the queue_size of \
+             an input that happens to be named `{NON_INPUT_EVENT}`"
+        );
+    }
+
+    // The scheduler drains control events before any input. A user input named
+    // `dora.non_input_event` must not be mistaken for the control queue, which
+    // would give it that priority over every other input and bypass the
+    // least-recently-used fairness (dora-rs/dora#3632).
+    #[test]
+    fn input_named_like_the_control_queue_is_scheduled_fairly() {
+        let audio = DataId::from("audio".to_string());
+        let mut queues = HashMap::new();
+        queues.insert(
+            DataId::from(NON_INPUT_EVENT.to_string()),
+            (10, VecDeque::new()),
+        );
+        queues.insert(audio.clone(), (10, VecDeque::new()));
+        let mut sched = Scheduler::with_policies(queues, HashMap::new());
+
+        for _ in 0..3 {
+            sched.add_event(make_input(NON_INPUT_EVENT, MetadataParameters::new()));
+        }
+        sched.add_event(make_input("audio", MetadataParameters::new()));
+
+        // LRU order rotates, so the single `audio` event lands within the first
+        // two yielded events no matter which queue starts. Draining three events
+        // of the reserved-named input first would starve it.
+        let first_two: Vec<_> = (0..2).filter_map(|_| sched.next()).collect();
+        assert!(
+            first_two.iter().any(|e| matches!(
+                e,
+                EventItem::NodeEvent {
+                    event: NodeEvent::Input { id, .. },
+                    ..
+                } if id == &audio
+            )),
+            "an input named `{NON_INPUT_EVENT}` must not preempt every other input"
+        );
+    }
+
+    // `flush: true` clears the flushing input's own queue. An input named
+    // `dora.non_input_event` must not flush the control queue, which would drop
+    // a pending `InputClosed`/`Reload` and hide the upstream close from the node
+    // (dora-rs/dora#3632).
+    #[test]
+    fn flush_on_an_input_named_like_the_control_queue_keeps_control_events() {
+        let mut queues = HashMap::new();
+        queues.insert(
+            DataId::from(NON_INPUT_EVENT.to_string()),
+            (10, VecDeque::new()),
+        );
+        let mut sched = Scheduler::with_policies(queues, HashMap::new());
+
+        sched.add_event(make_stop());
+        sched.add_event(make_input_closed("x"));
+
+        let mut flush_params = MetadataParameters::new();
+        flush_params.insert(FLUSH.into(), Parameter::Bool(true));
+        sched.add_event(make_input(NON_INPUT_EVENT, flush_params));
+
+        let mut closed = Vec::new();
+        let mut saw_stop = false;
+        while let Some(event) = sched.next() {
+            match event {
+                EventItem::NodeEvent {
+                    event: NodeEvent::InputClosed { id },
+                    ..
+                } => closed.push(id.to_string()),
+                EventItem::NodeEvent {
+                    event: NodeEvent::Stop,
+                    ..
+                } => saw_stop = true,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            closed,
+            vec!["x"],
+            "flushing an input named `{NON_INPUT_EVENT}` must not drop control events"
+        );
+        assert!(saw_stop, "flush must not drop the Stop shutdown signal");
+    }
+
+    // Boundary: the reserved-named input is still an ordinary input afterwards —
+    // its own `queue_size` applies and its drops are counted under its own id.
+    #[test]
+    fn reserved_named_input_keeps_its_configured_queue_size() {
+        let reserved = DataId::from(NON_INPUT_EVENT.to_string());
+        let mut queues = HashMap::new();
+        queues.insert(reserved.clone(), (1, VecDeque::new()));
+        let mut sched = Scheduler::with_policies(queues, HashMap::new());
+
+        for _ in 0..3 {
+            sched.add_event(make_input(NON_INPUT_EVENT, MetadataParameters::new()));
+        }
+
+        assert_eq!(
+            sched.effective_cap_for(&reserved),
+            1,
+            "an input named `{NON_INPUT_EVENT}` must keep its configured queue_size"
+        );
+        assert_eq!(sched.drain_drop_counts().get(&reserved), Some(&2));
+    }
+
     #[test]
     fn backpressure_policy_prevents_drops() {
         let id = DataId::from("commands".to_string());
         let mut queues = HashMap::new();
         queues.insert(id.clone(), (2, VecDeque::new()));
-        queues.insert(
-            DataId::from(NON_INPUT_EVENT.to_string()),
-            (10, VecDeque::new()),
-        );
         let policies = HashMap::from([(id.clone(), QueuePolicy::Backpressure)]);
         let mut sched = Scheduler::with_policies(queues, policies);
 
@@ -700,23 +1014,13 @@ mod tests {
     // ---- issue #2212: log_correlation_drop must also fire for ZenohInput ----
 
     fn make_zenoh_input(id: &str, params: MetadataParameters) -> EventItem {
-        let type_info = ArrowTypeInfo {
-            data_type: DataType::Null,
-            len: 0,
-            null_count: 0,
-            validity: None,
-            offset: 0,
-            buffer_offsets: vec![],
-            child_data: vec![],
-            field_names: None,
-            schema_hash: None,
-        };
         let ts = uhlc::HLC::default().new_timestamp();
-        let metadata = Metadata::from_parameters(ts, type_info, params);
+        let metadata = Metadata::from_parameters(ts, params);
+        use dora_arrow_convert::IntoArrow;
         EventItem::ZenohInput {
             id: DataId::from(id.to_string()),
             metadata: std::sync::Arc::new(metadata),
-            payload: zenoh::bytes::ZBytes::default(),
+            data: dora_arrow_convert::internal::into_array_ref(().into_arrow()).to_data(),
         }
     }
 

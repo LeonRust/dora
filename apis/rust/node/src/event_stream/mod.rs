@@ -4,9 +4,9 @@ use std::{
     pin::pin,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use dora_message::{
@@ -21,14 +21,19 @@ use futures::{
     future::{Either, select},
 };
 use futures_timer::Delay;
-use scheduler::{NON_INPUT_EVENT, Scheduler};
+use scheduler::{NON_INPUT_EVENT_QUEUE_SIZE, Scheduler};
 
 use self::thread::{EventItem, EventStreamThreadHandle};
 use crate::{
     DaemonCommunicationWrapper, PatternError,
-    daemon_connection::{DaemonChannel, node_integration_testing::convert_output_to_json},
+    daemon_connection::{
+        DaemonChannel,
+        node_integration_testing::{convert_arrow_input_to_json, convert_output_to_json},
+    },
     event_stream::data_conversion::RawData,
+    node::{ZENOH_TEARDOWN_TIMEOUT, teardown_with_timeout},
 };
+use dora_arrow_convert::IntoArrow;
 use dora_core::{
     config::{Input, NodeId},
     uhlc,
@@ -39,10 +44,83 @@ pub use scheduler::Scheduler as EventScheduler;
 
 mod data_conversion;
 mod event;
+/// Drop notifications for the daemon's opaque extension table.
+pub mod extensions;
+/// Tracks input health (timeouts, liveness) for circuit-breaker recovery.
 pub mod input_tracker;
+/// Merged event streams combining internal and external event sources.
 pub mod merged;
 mod scheduler;
 mod thread;
+
+/// Hand one zenoh-delivered event to the shared ingress channel, counting it as
+/// a drop if the channel is full.
+///
+/// The callback runs on zenoh's tokio IO worker, where `blocking_send` would
+/// panic, so the send is a `try_send` and a full channel means the payload is
+/// gone. That loss used to be log-only, which made `drain_drop_counts()` read
+/// zero while a node was losing every zero-copy message it could not keep up
+/// with (#3282).
+///
+/// A *closed* channel is not counted: it means the receiver is gone, i.e.
+/// ordinary shutdown, and counting it would have every node report phantom
+/// drops as it tears down.
+///
+/// Split out of the callback so the accounting is unit-testable without a live
+/// zenoh session.
+fn send_or_count_ingress_drop(
+    tx: &tokio::sync::mpsc::Sender<EventItem>,
+    item: EventItem,
+    input_id: &DataId,
+    dropped: &AtomicU64,
+) {
+    use tokio::sync::mpsc::error::TrySendError;
+    match tx.try_send(item) {
+        Ok(()) => {}
+        Err(TrySendError::Full(_)) => {
+            // Rate-limit the log, but not on `drain_drop_counts()`: a formatted
+            // `warn!` with a subscriber attached measures ~1.6 us against ~1.7 ns
+            // for the counter, and this runs on zenoh's IO worker — the thread
+            // delivering every input of this node — so logging per drop would
+            // amplify the very backlog it reports. Earlier this fired only on the
+            // first drop since a `drain_drop_counts()` swap reset the counter, but
+            // the only production caller that drains is the record node (#3555):
+            // every other node warned once at the first drop and then went silent
+            // forever, however long it kept losing input.
+            //
+            // `fetch_add` returns the previous value; warn whenever the running
+            // count is a power of two (1, 2, 4, 8, …). That is drain-independent,
+            // so the message recurs while loss continues for a node that never
+            // drains, yet only O(log N) times for N drops so the log cost stays
+            // bounded. A node that *does* drain resets the counter each window,
+            // restoring the once-per-drain-window cadence. The count itself is
+            // never rate-limited — that is what the counter is for.
+            let count = dropped.fetch_add(1, Ordering::Relaxed) + 1;
+            if should_warn_ingress_drop(count) {
+                tracing::warn!(
+                    input = %input_id,
+                    drops = count,
+                    "event channel full; dropping zenoh input. Raise this input's \
+                     queue_size — the ingress channel is sized from the sum of the \
+                     node's input queue_sizes."
+                );
+            }
+        }
+        Err(TrySendError::Closed(_)) => {
+            // Normal shutdown: the receiver is gone, nothing to report.
+        }
+    }
+}
+
+/// Whether a zenoh ingress drop that brings the running drop count to `count`
+/// should be logged.
+///
+/// Power-of-two cadence (1, 2, 4, 8, …): drain-independent so it recurs while a
+/// node keeps losing input, but only O(log N) times for N drops so the log cost
+/// on the zenoh IO worker stays bounded. See `send_or_count_ingress_drop`.
+fn should_warn_ingress_drop(count: u64) -> bool {
+    count.is_power_of_two()
+}
 
 /// Asynchronous iterator over the incoming [`Event`]s destined for this node.
 ///
@@ -75,16 +153,43 @@ pub struct EventStream {
     receiver: tokio::sync::mpsc::Receiver<EventItem>,
     _thread_handle: EventStreamThreadHandle,
     /// Callback subscribers — kept alive for the lifetime of the
-    /// EventStream. Dropping a subscriber stops further callbacks; the
-    /// callback itself will see `blocking_send` return Err once the
-    /// `receiver` (declared above) is dropped.
+    /// EventStream. Dropping a subscriber undeclares it and stops further
+    /// callbacks. The callbacks use `try_send` (never block), so undeclaring
+    /// does not depend on `receiver` being dropped first. `EventStream::drop`
+    /// explicitly tears these down under a deadline (see there); by the time
+    /// this field drops it is already empty.
     _zenoh_subscribers: Vec<zenoh::pubsub::Subscriber<()>>,
+    /// Per-input `@schema` subscribers (zenoh-ext AdvancedSubscriber) that prime
+    /// the data subscribers' decoders. Kept alive like `_zenoh_subscribers`.
+    _zenoh_schema_subscribers: Vec<zenoh_ext::AdvancedSubscriber<()>>,
+    /// The `dora-startup-acker` thread (see [`spawn_startup_acker`]). Exits
+    /// once the data subscribers — the only senders into its queue — are
+    /// dropped; joined in `EventStream::drop` inside the bounded zenoh
+    /// teardown, right after those subscribers are dropped.
+    startup_acker: Option<std::thread::JoinHandle<()>>,
     close_channel: DaemonChannel,
     clock: Arc<uhlc::HLC>,
     scheduler: Scheduler,
+    /// Per-input counters for events dropped at the shared zenoh ingress
+    /// channel, before the scheduler ever sees them.
+    ///
+    /// The scheduler's own counters cover only what reached its per-input
+    /// queues. A zero-copy payload arriving on the direct zenoh path is
+    /// `try_send`-ed into one shared channel by a zenoh IO worker, and a full
+    /// channel drops it there — a site the scheduler cannot observe and, being
+    /// on another thread, cannot be given `&mut Scheduler` to report through.
+    /// One `AtomicU64` per input keeps the callback lock-free; `drain_drop_counts`
+    /// folds them in so callers see one number per input regardless of which
+    /// transport the payload took (#3282).
+    ingress_drops: HashMap<DataId, Arc<AtomicU64>>,
     write_events_to: Option<WriteEventsTo>,
     start_timestamp: uhlc::Timestamp,
     use_scheduler: bool,
+    /// Set whenever an event is added to `scheduler`; cleared by `poll_next`
+    /// once the scheduler has run dry. Lets the Stream path skip
+    /// `Scheduler::next()` (O(#inputs) when empty) on every poll when nothing
+    /// was ever buffered there.
+    scheduler_maybe_nonempty: bool,
     /// Expected input types from YAML descriptor (for first-message validation).
     /// Each input is checked once; after the first message, the entry is removed.
     input_type_checks: HashMap<DataId, arrow_schema::DataType>,
@@ -93,6 +198,14 @@ pub struct EventStream {
     /// for a correlation match. Drained first on the next `recv()` so
     /// the caller's main event loop never loses intermediate events
     /// (dora-rs/adora#148).
+    ///
+    /// Bounded via [`buffer_passthrough`](Self::buffer_passthrough): an event a
+    /// correlated wait pulls out of the scheduler and stashes here still counts
+    /// against a bound — `Event::Input`s against their input's `queue_size` /
+    /// `queue_policy`, control events against a shared non-input cap — so the
+    /// retention cannot grow without limit for a node that never reads its
+    /// events, and per-input queue policy means the same thing whether or not a
+    /// correlated receive touched the event (dora-rs/dora#3197).
     pending_passthrough: std::collections::VecDeque<Event>,
     /// Set to true after an `Event::Stop` has been delivered. Zenoh
     /// subscriber threads hold clones of the event channel sender, so
@@ -101,6 +214,121 @@ pub struct EventStream {
     /// Returning `None` here lets the caller exit and drops the
     /// `EventStream`, which signals subscriber shutdown.
     stop_received: bool,
+    /// Testing-mode shutdown flag shared with the in-process daemon thread.
+    /// Set in [`Drop`] before `EventStreamDropped` so a scheduled `next_event`
+    /// sleep cannot deadlock the close handshake (dora-rs/dora#2855).
+    testing_shutdown: Option<Arc<AtomicBool>>,
+}
+
+/// Spawn the consumer half of the startup handshake: a thread that answers
+/// every startup marker with an ack on the marked output's `@ack` topic.
+///
+/// The data callbacks `try_send` the input id of each received marker into
+/// `ack_rx` (a zenoh callback must never `put` itself — it runs on zenoh's IO
+/// worker); this thread publishes the corresponding ack, identifying this
+/// (node, input) in the attachment. The producer switches the output from the
+/// lossless daemon path to direct zenoh once all its required consumers acked.
+///
+/// The thread acks *every* marker for the stream's whole lifetime, so late
+/// producers (dynamic nodes, restarts) get their acks whenever they run their
+/// handshake. Note that the producer's markers are **not** unbounded: it stops
+/// marking an output at its startup grace boundary and pins any still-un-acked
+/// output to the daemon path for the rest of its run (dora-rs/dora#2891). So
+/// acking promptly is what preserves the fast path — an ack-route race that
+/// outlasts the producer's grace does not self-heal, and a dropped ack (the
+/// bounded-queue `try_send` fallback below) costs that output direct zenoh for
+/// the producer's whole run. The thread exits when the data subscribers (the
+/// only senders) are dropped.
+fn spawn_startup_acker(
+    node_id: NodeId,
+    ack_publishers: HashMap<DataId, zenoh::pubsub::Publisher<'static>>,
+    mut ack_rx: tokio::sync::mpsc::Receiver<DataId>,
+    clock: Arc<uhlc::HLC>,
+) -> Option<std::thread::JoinHandle<()>> {
+    use dora_message::metadata::Metadata;
+    use zenoh::Wait;
+
+    if ack_publishers.is_empty() {
+        return None;
+    }
+    let handle = std::thread::Builder::new()
+        .name("dora-startup-acker".into())
+        .spawn(move || {
+            while let Some(input_id) = ack_rx.blocking_recv() {
+                let Some(publisher) = ack_publishers.get(&input_id) else {
+                    continue;
+                };
+                let metadata = Metadata::startup_ack(
+                    clock.new_timestamp(),
+                    node_id.as_ref(),
+                    input_id.as_ref(),
+                );
+                let attachment = match dora_message::encode(&metadata) {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        tracing::debug!(input = %input_id, "failed to serialize startup ack ({e})");
+                        continue;
+                    }
+                };
+                if let Err(e) = publisher.put(&[][..]).attachment(&attachment[..]).wait() {
+                    // Expected while the ack route is still coming up; the
+                    // producer's next marker triggers a retry.
+                    tracing::trace!(input = %input_id, "startup ack put failed ({e})");
+                }
+            }
+        });
+    match handle {
+        Ok(handle) => Some(handle),
+        Err(e) => {
+            // Without acks the producers keep this node's inputs on the
+            // reliable daemon path — correct, just without the fast path.
+            tracing::warn!(
+                "failed to spawn startup-acker thread ({e}); \
+                 producers keep this node's inputs on the daemon path"
+            );
+            None
+        }
+    }
+}
+
+/// Open a fresh [`DaemonChannel`] to the daemon this node talks to.
+///
+/// `purpose` names the channel in the connection-error context (e.g. `"event
+/// stream"`), so a failure points at which of the node's channels could not be
+/// established.
+fn connect_daemon_channel(
+    daemon_communication: &DaemonCommunicationWrapper,
+    node_id: &NodeId,
+    purpose: &str,
+) -> eyre::Result<DaemonChannel> {
+    let channel = match daemon_communication {
+        DaemonCommunicationWrapper::Standard(daemon_communication) => match daemon_communication {
+            DaemonCommunication::Tcp { socket_addr } => DaemonChannel::new_tcp(*socket_addr)
+                .wrap_err_with(|| format!("failed to connect {purpose} for node `{node_id}`"))?,
+            DaemonCommunication::Interactive => DaemonChannel::Interactive(Default::default()),
+        },
+        DaemonCommunicationWrapper::Testing { channel, .. } => {
+            DaemonChannel::IntegrationTestChannel(channel.clone())
+        }
+    };
+    Ok(channel)
+}
+
+/// Capacity of a node's ingress event channel: the sum of its inputs'
+/// `queue_size`s, at least 64.
+///
+/// `queue_size` is unvalidated, so the sum saturates and is clamped to the
+/// `usize::MAX >> 3` limit above which tokio's `mpsc::channel` panics. The
+/// channel allocates lazily, so a huge capacity costs nothing up front.
+fn ingress_channel_capacity<'a>(inputs: impl Iterator<Item = &'a Input>) -> usize {
+    const MAX_CHANNEL_CAPACITY: usize = usize::MAX >> 3;
+    inputs
+        .map(|c| {
+            c.queue_size
+                .unwrap_or(dora_message::config::DEFAULT_QUEUE_SIZE)
+        })
+        .fold(0, usize::saturating_add)
+        .clamp(64, MAX_CHANNEL_CAPACITY)
 }
 
 impl EventStream {
@@ -116,45 +344,17 @@ impl EventStream {
         write_events_to: Option<PathBuf>,
         zenoh_session: Option<&zenoh::Session>,
     ) -> eyre::Result<Self> {
-        let channel = match daemon_communication {
-            DaemonCommunicationWrapper::Standard(daemon_communication) => {
-                match daemon_communication {
-                    DaemonCommunication::Tcp { socket_addr } => {
-                        DaemonChannel::new_tcp(*socket_addr).wrap_err_with(|| {
-                            format!("failed to connect event stream for node `{node_id}`")
-                        })?
-                    }
+        let channel = connect_daemon_channel(daemon_communication, node_id, "event stream")?;
 
-                    DaemonCommunication::Interactive => {
-                        DaemonChannel::Interactive(Default::default())
-                    }
-                }
-            }
-
-            DaemonCommunicationWrapper::Testing { channel } => {
-                DaemonChannel::IntegrationTestChannel(channel.clone())
-            }
+        let testing_shutdown = match daemon_communication {
+            DaemonCommunicationWrapper::Testing { shutdown, .. } => Some(shutdown.clone()),
+            _ => None,
         };
 
-        let close_channel = match daemon_communication {
-            DaemonCommunicationWrapper::Standard(daemon_communication) => {
-                match daemon_communication {
-                    DaemonCommunication::Tcp { socket_addr } => {
-                        DaemonChannel::new_tcp(*socket_addr).wrap_err_with(|| {
-                            format!("failed to connect event close channel for node `{node_id}`")
-                        })?
-                    }
-                    DaemonCommunication::Interactive => {
-                        DaemonChannel::Interactive(Default::default())
-                    }
-                }
-            }
-            DaemonCommunicationWrapper::Testing { channel } => {
-                DaemonChannel::IntegrationTestChannel(channel.clone())
-            }
-        };
+        let close_channel =
+            connect_daemon_channel(daemon_communication, node_id, "event close channel")?;
 
-        let mut queue_size_limit: HashMap<DataId, (usize, VecDeque<EventItem>)> = input_config
+        let queue_size_limit: HashMap<DataId, (usize, VecDeque<EventItem>)> = input_config
             .iter()
             .map(|(input, config)| {
                 (
@@ -169,10 +369,12 @@ impl EventStream {
             })
             .collect();
 
-        queue_size_limit.insert(
-            DataId::from(NON_INPUT_EVENT.to_string()),
-            (1_000, VecDeque::new()),
-        );
+        // Control events (`Stop`, `InputClosed`, ...) live in a queue of their
+        // own inside the scheduler, so this map holds input ids only. Registering
+        // a `NON_INPUT_EVENT` entry here used to overwrite the `queue_size` of a
+        // user input with that exact id — `dora.non_input_event` is a valid
+        // `DataId` — and merged its data events with the control events
+        // (dora-rs/dora#3632).
 
         let queue_policies: HashMap<DataId, dora_message::config::QueuePolicy> = input_config
             .iter()
@@ -181,14 +383,7 @@ impl EventStream {
 
         let scheduler = Scheduler::with_policies(queue_size_limit, queue_policies);
 
-        let total_queue_capacity: usize = input_config
-            .values()
-            .map(|c| {
-                c.queue_size
-                    .unwrap_or(dora_message::config::DEFAULT_QUEUE_SIZE)
-            })
-            .sum::<usize>()
-            .max(64);
+        let total_queue_capacity = ingress_channel_capacity(input_config.values());
 
         let write_events_to = match write_events_to {
             Some(path) => {
@@ -259,6 +454,7 @@ impl EventStream {
             total_queue_capacity,
             zenoh_session,
             &input_config,
+            testing_shutdown,
         )
     }
 
@@ -275,6 +471,7 @@ impl EventStream {
         channel_capacity: usize,
         zenoh_session: Option<&zenoh::Session>,
         input_config: &BTreeMap<DataId, Input>,
+        testing_shutdown: Option<Arc<AtomicBool>>,
     ) -> eyre::Result<Self> {
         channel.register(dataflow_id, node_id.clone(), clock.new_timestamp())?;
         let (tx, rx) = tokio::sync::mpsc::channel(channel_capacity);
@@ -295,8 +492,20 @@ impl EventStream {
         // must be kept alive for the lifetime of the EventStream — we store
         // them in `_zenoh_subscribers` and drop them after `receiver`.
         let mut zenoh_subscribers = Vec::new();
+        let mut zenoh_schema_subscribers = Vec::new();
+        // Consumer half of the startup handshake: the data callbacks enqueue
+        // the input id of every received startup marker here, and the
+        // `dora-startup-acker` thread answers each with an ack on the output's
+        // `@ack` topic (see `spawn_startup_acker`). Bounded and `try_send`-fed:
+        // a full queue just delays the ack until the producer's next marker.
+        let (ack_tx, ack_rx) = tokio::sync::mpsc::channel::<DataId>(256);
+        let mut ack_publishers: HashMap<DataId, zenoh::pubsub::Publisher<'static>> = HashMap::new();
+        // Populated per subscribed input below and moved into `EventStream`, so
+        // `drain_drop_counts` can read what the zenoh IO workers recorded.
+        let mut ingress_drops: HashMap<DataId, Arc<AtomicU64>> = HashMap::new();
         if let Some(session) = zenoh_session {
             use zenoh::Wait;
+            use zenoh::qos::CongestionControl;
             for (input_id, input) in input_config {
                 let mapping = &input.mapping;
                 if let dora_message::config::InputMapping::User(user_mapping) = mapping {
@@ -314,8 +523,79 @@ impl EventStream {
                             continue;
                         }
                     };
+                    // Ack publisher for this input, declared eagerly so its
+                    // route wires while the node is parked in the barrier.
+                    // `express` + `Drop` QoS: a lost ack is retried on the
+                    // producer's next marker. On failure the producer's ack
+                    // deadline keeps the output on the (correct) daemon path.
+                    let ack_topic = dora_core::topics::zenoh_output_ack_topic(
+                        dataflow_id,
+                        source_node,
+                        source_output,
+                    );
+                    match session
+                        .declare_publisher(ack_topic)
+                        .congestion_control(CongestionControl::Drop)
+                        .express(true)
+                        .wait()
+                    {
+                        Ok(publisher) => {
+                            ack_publishers.insert(input_id.clone(), publisher);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                input = %input_id,
+                                "failed to declare startup-ack publisher ({e}); \
+                                 the producer keeps this input on the daemon path"
+                            );
+                        }
+                    }
+                    // Per-input persistent decoder for the schema-once path,
+                    // shared between this data subscriber (which decodes batches
+                    // in zenoh receipt order) and the `@schema` subscriber (which
+                    // primes it from the cached/live schema). `Mutex` because the
+                    // zenoh callbacks are `Fn`; uncontended in practice (each
+                    // subscriber delivers its samples serially).
+                    let decoder = std::sync::Arc::new(std::sync::Mutex::new(
+                        crate::arrow_utils::ipc_encode::InputDecoder::new(),
+                    ));
+                    // Set if the `@schema` subscriber fails to declare: the
+                    // schema plane is then dead for this input and only the
+                    // producer's periodic in-band full-stream refresh can prime
+                    // the decoder. The data callback surfaces a `FatalError` if
+                    // the input stays undecodable past a grace window (see
+                    // below), distinguishing a genuinely dead input from the
+                    // transient "schema not arrived yet" drop.
+                    let schema_plane_failed =
+                        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    // Start of the current run of undecodable schema-once
+                    // batches while the schema plane is dead; cleared by any
+                    // successful decode. Only touched when `schema_plane_failed`
+                    // is set, so it costs nothing on the healthy path.
+                    let first_undecodable =
+                        std::sync::Arc::new(std::sync::Mutex::new(Option::<Instant>::None));
+                    // The `@schema` subscriber primes `decoder`; its history query
+                    // fetches the cached schema on join (late joiners), and
+                    // `detect_late_publishers` covers a producer that starts later.
+                    declare_schema_subscriber(
+                        session,
+                        dataflow_id,
+                        source_node,
+                        source_output,
+                        input_id,
+                        decoder.clone(),
+                        tx.clone(),
+                        schema_plane_failed.clone(),
+                        &mut zenoh_schema_subscribers,
+                    );
+
+                    let ack_tx_cb = ack_tx.clone();
                     let tx_cb = tx.clone();
                     let input_id_cb = input_id.clone();
+                    let ingress_drops_cb =
+                        ingress_drops.entry(input_id.clone()).or_default().clone();
+                    let decoder = decoder.clone();
+                    let first_undecodable_cb = first_undecodable.clone();
                     let subscriber = session
                         .declare_subscriber(key_expr)
                         .callback(move |sample| {
@@ -325,20 +605,43 @@ impl EventStream {
                             // it and exits cleanly.
                             let result =
                                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    use dora_message::metadata::Metadata;
                                     let metadata = match sample.attachment() {
-                                        Some(att) => match bincode::deserialize::<
-                                            dora_message::metadata::Metadata,
-                                        >(
-                                            &att.to_bytes()
-                                        ) {
-                                            Ok(m) => m,
-                                            Err(e) => {
-                                                tracing::warn!(
-                                                    "zenoh metadata deserialization failed: {e}"
-                                                );
-                                                return;
+                                        Some(att) => {
+                                            match dora_message::decode::<Metadata>(&att.to_bytes())
+                                            {
+                                                // A version mismatch that still happens
+                                                // to deserialize: reject with a clear
+                                                // message rather than acting on data from
+                                                // an incompatible wire format.
+                                                Ok(m)
+                                                    if m.metadata_version()
+                                                        != Metadata::CURRENT_VERSION =>
+                                                {
+                                                    tracing::warn!(
+                                                        "dropping zenoh sample: incompatible \
+                                                     metadata wire version {} (this node \
+                                                     speaks {})",
+                                                        m.metadata_version(),
+                                                        Metadata::CURRENT_VERSION
+                                                    );
+                                                    return;
+                                                }
+                                                Ok(m) => m,
+                                                Err(e) => {
+                                                    // A pre-1.0 peer (old ArrowTypeInfo
+                                                    // sidecar layout) misaligns here; name
+                                                    // the likely cause so the failure isn't
+                                                    // a bare deserialization error.
+                                                    tracing::warn!(
+                                                        "zenoh metadata deserialization failed \
+                                                     (possibly a peer using an incompatible \
+                                                     wire format/version): {e}"
+                                                    );
+                                                    return;
+                                                }
                                             }
-                                        },
+                                        }
                                         None => {
                                             tracing::warn!(
                                                 "zenoh sample missing metadata attachment"
@@ -346,29 +649,134 @@ impl EventStream {
                                             return;
                                         }
                                     };
-                                    let payload = sample.payload().clone();
-                                    // Callback runs on zenoh's tokio IO worker —
-                                    // `blocking_send` panics from a tokio context, so
-                                    // use `try_send`. If the channel is full the event
-                                    // is dropped (logged); receiver-dropped also
-                                    // surfaces here, in which case there's nothing to do.
-                                    if let Err(e) = tx_cb.try_send(EventItem::ZenohInput {
-                                        id: input_id_cb.clone(),
-                                        metadata: std::sync::Arc::new(metadata),
-                                        payload,
-                                    }) {
-                                        use tokio::sync::mpsc::error::TrySendError;
-                                        match e {
-                                            TrySendError::Full(_) => {
-                                                tracing::warn!(
-                                                    "event channel full; dropping zenoh input"
-                                                );
-                                            }
-                                            TrySendError::Closed(_) => {
-                                                // normal shutdown
-                                            }
-                                        }
+                                    // Startup marker: its arrival proves this input's
+                                    // zenoh route carries data end-to-end. Answer with
+                                    // an ack (via the acker thread — a zenoh callback
+                                    // must not `put` itself) so the producer can switch
+                                    // the output to the direct zenoh path, and stop — a
+                                    // marker has no payload and must never reach the
+                                    // (stateful) decoder or user code. A full ack queue
+                                    // is fine: the producer's next marker retries.
+                                    if metadata.is_startup_marker() {
+                                        let _ = ack_tx_cb.try_send(input_id_cb.clone());
+                                        return;
                                     }
+                                    let payload = sample.payload().clone();
+                                    // Decode here (receipt order) so the per-input
+                                    // persistent decoder stays in sync. This runs on
+                                    // zenoh's IO worker: the aligned-SHM path is
+                                    // zero-copy, but an under-aligned heap payload
+                                    // copies its buffers on this thread (acceptable —
+                                    // only small messages take the heap path).
+                                    let mut decoder = decoder.lock().unwrap_or_else(|poison| {
+                                        // A prior callback panicked mid-decode
+                                        // (caught below), poisoning the lock and
+                                        // leaving the decoder in an undefined
+                                        // state. Reset it so the next batch is not
+                                        // fed into a corrupt decoder.
+                                        let mut guard = poison.into_inner();
+                                        guard.reset();
+                                        guard
+                                    });
+                                    let data =
+                                        match decode_zenoh_sample(&mut decoder, &metadata, payload)
+                                        {
+                                            Ok(Some(data)) => data,
+                                            // Schema-less batch we can't decode yet.
+                                            // Normally transient: the priming schema
+                                            // hasn't arrived (lossy data plane), so drop
+                                            // and wait — the window is bounded by the
+                                            // producer's periodic full-stream refresh,
+                                            // which re-primes in-band. But if the
+                                            // `@schema` subscriber failed to declare, the
+                                            // schema plane is dead (a degraded zenoh
+                                            // session) and only that refresh can save the
+                                            // input — give it a grace window, then surface
+                                            // a `FatalError` so the node exits loudly
+                                            // rather than drop messages forever. Only
+                                            // clear the flag once the error is actually
+                                            // queued, so a momentarily-full channel can't
+                                            // swallow the one-shot fatal signal forever; it
+                                            // retries on the next undecodable batch. This
+                                            // callback is the sole reader, so the
+                                            // load-then-store is race-free. `Relaxed` is
+                                            // sufficient: the flag is stored in
+                                            // `declare_schema_subscriber` before the data
+                                            // subscriber that drives this callback is even
+                                            // declared, so that write happens-before any
+                                            // read here.
+                                            Ok(None) => {
+                                                if schema_plane_failed
+                                                    .load(std::sync::atomic::Ordering::Relaxed)
+                                                {
+                                                    let mut first = first_undecodable_cb
+                                                        .lock()
+                                                        .unwrap_or_else(|p| p.into_inner());
+                                                    if first.is_none() {
+                                                        tracing::warn!(
+                                                            input = %input_id_cb,
+                                                            "schema-once batch arrived unprimed \
+                                                             while the `@schema` subscriber is \
+                                                             not declared; dropping, waiting up \
+                                                             to {}s for the producer's in-band \
+                                                             full-stream refresh",
+                                                            SCHEMA_PLANE_FATAL_GRACE.as_secs()
+                                                        );
+                                                    }
+                                                    if schema_plane_fatal_due(
+                                                        &mut first,
+                                                        Instant::now(),
+                                                    ) && tx_cb
+                                                        .try_send(EventItem::FatalError(eyre!(
+                                                            "input `{input_id_cb}`: the `@schema` \
+                                                             subscriber failed to declare (a \
+                                                             degraded zenoh session) and the \
+                                                             input stayed undecodable for {}s \
+                                                             despite the producer's periodic \
+                                                             full-stream refresh — messages on \
+                                                             this input are being dropped",
+                                                            SCHEMA_PLANE_FATAL_GRACE.as_secs()
+                                                        )))
+                                                        .is_ok()
+                                                    {
+                                                        schema_plane_failed.store(
+                                                            false,
+                                                            std::sync::atomic::Ordering::Relaxed,
+                                                        );
+                                                    }
+                                                }
+                                                return;
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    input = %input_id_cb,
+                                                    "zenoh payload decode failed: {e}"
+                                                );
+                                                return;
+                                            }
+                                        };
+                                    drop(decoder);
+                                    // A successful decode means the input is healthy
+                                    // (in-band priming worked); reset the fatal grace
+                                    // window. Only costs a lock when the schema plane
+                                    // is actually dead.
+                                    if schema_plane_failed
+                                        .load(std::sync::atomic::Ordering::Relaxed)
+                                    {
+                                        *first_undecodable_cb
+                                            .lock()
+                                            .unwrap_or_else(|p| p.into_inner()) = None;
+                                    }
+                                    send_or_count_ingress_drop(
+                                        &tx_cb,
+                                        EventItem::ZenohInput {
+                                            id: input_id_cb.clone(),
+                                            metadata: std::sync::Arc::new(metadata),
+                                            data,
+                                        },
+                                        &input_id_cb,
+                                        &ingress_drops_cb,
+                                    );
                                 }));
                             if result.is_err() {
                                 tracing::error!(
@@ -387,6 +795,10 @@ impl EventStream {
                             zenoh_subscribers.push(s);
                         }
                         Err(e) => {
+                            // No zenoh subscriber for this input: no marker can
+                            // ever arrive, so this node never acks it and the
+                            // producer keeps the output on the reliable daemon
+                            // path — the input is served via daemon events.
                             tracing::warn!(
                                 input = %input_id,
                                 "failed to declare zenoh subscriber ({e}), using daemon path"
@@ -396,6 +808,17 @@ impl EventStream {
                 }
             }
         }
+
+        // Consumer half of the startup handshake: from here on, every startup
+        // marker received by a data callback above is answered with an ack.
+        // Nothing blocks and nothing can fail init: a route that never
+        // delivers a marker simply never gets acked, and the producer keeps
+        // that output on the lossless daemon path (see `StartupHandshake` on
+        // the producer side). The acker runs for the stream's whole lifetime
+        // so late producers (dynamic nodes, restarts) get acks too.
+        drop(ack_tx); // the callbacks hold the only remaining senders
+        let startup_acker =
+            spawn_startup_acker(node_id.clone(), ack_publishers, ack_rx, clock.clone());
 
         let reply = channel
             .request(&Timestamped {
@@ -422,15 +845,20 @@ impl EventStream {
             receiver: rx,
             _thread_handle: thread_handle,
             _zenoh_subscribers: zenoh_subscribers,
+            _zenoh_schema_subscribers: zenoh_schema_subscribers,
+            startup_acker,
             close_channel,
             start_timestamp: clock.new_timestamp(),
             clock,
             scheduler,
+            ingress_drops,
             write_events_to,
             use_scheduler,
+            scheduler_maybe_nonempty: false,
             input_type_checks,
             pending_passthrough: std::collections::VecDeque::new(),
             stop_received: false,
+            testing_shutdown,
         })
     }
 
@@ -450,8 +878,35 @@ impl EventStream {
     /// If you want to receive the events in their original chronological order, use the
     /// asynchronous [`StreamExt::next`](futures::StreamExt::next) method instead ([`EventStream`] implements the
     /// [`Stream`] trait).
+    ///
+    /// The canonical node loop drains this stream until it closes, reacting to
+    /// the events the node cares about (typically [`Event::Input`]) and ignoring
+    /// the rest:
+    ///
+    /// ```no_run
+    /// use dora_node_api::{DoraNode, Event};
+    ///
+    /// let (_node, mut events) = DoraNode::init_from_env()?;
+    ///
+    /// while let Some(event) = events.recv() {
+    ///     match event {
+    ///         Event::Input { id, metadata: _, data } => {
+    ///             // react to the input `id`, reading the Arrow `data`
+    ///             println!("received input `{id}` with {} element(s)", data.len());
+    ///         }
+    ///         Event::Stop(_) => break,
+    ///         _ => {}
+    ///     }
+    /// }
+    /// # Ok::<(), eyre::Report>(())
+    /// ```
     pub fn recv(&mut self) -> Option<Event> {
-        futures::executor::block_on(self.recv_async())
+        // A synchronous receive can't yield to tokio, so it must not spend the
+        // calling task's coop budget: inside a task that never yields, the
+        // receiver reports `Pending` after 128 receives with events still
+        // queued, and this `block_on` spins forever. Same for `recv_timeout`
+        // and `try_recv`.
+        futures::executor::block_on(tokio::task::unconstrained(self.recv_async()))
     }
 
     /// Receives the next incoming [`Event`] synchronously with a timeout.
@@ -473,7 +928,7 @@ impl EventStream {
     /// asynchronous [`StreamExt::next`](futures::StreamExt::next) method instead ([`EventStream`] implements the
     /// [`Stream`] trait).
     pub fn recv_timeout(&mut self, dur: Duration) -> Option<Event> {
-        futures::executor::block_on(self.recv_async_timeout(dur))
+        futures::executor::block_on(tokio::task::unconstrained(self.recv_async_timeout(dur)))
     }
 
     /// Receives the next incoming [`Event`] asynchronously, using an [`EventScheduler`] for fairness.
@@ -499,6 +954,23 @@ impl EventStream {
         if let Some(event) = self.pending_passthrough.pop_front() {
             return Some(event);
         }
+        self.recv_from_stream().await
+    }
+
+    /// Receive the next event straight from the scheduler/receiver,
+    /// **without** draining `pending_passthrough` first.
+    ///
+    /// The pattern-aware wait loop ([`wait_for_correlation`](Self::wait_for_correlation))
+    /// buffers every non-matching event into `pending_passthrough` itself. If
+    /// it pumped the stream through [`recv_async`](Self::recv_async), that
+    /// drain would immediately hand the just-buffered event straight back, the
+    /// classifier would re-buffer it, and the loop would spin on the same event
+    /// forever — never reading the awaited response off the receiver — until it
+    /// hit its deadline and wrongly reported a timeout (while pinning a CPU
+    /// core). Reading through this bypass keeps the buffered events reserved for
+    /// the caller's own `recv`/`recv_async` while the wait loop makes real
+    /// progress.
+    async fn recv_from_stream(&mut self) -> Option<Event> {
         // Close the stream after a Stop event: the daemon thread has
         // already dropped its sender, but zenoh subscriber threads
         // hold clones that would otherwise keep `receiver` open.
@@ -514,86 +986,127 @@ impl EventStream {
             // events from `receiver`; the dataflow is stopping, and on the
             // non-scheduler path returning `None` closes the stream against
             // zenoh-held senders.
-            if self.use_scheduler {
-                while let Some(item) = self.scheduler.next() {
-                    if matches!(
-                        &item,
-                        EventItem::NodeEvent {
-                            event: NodeEvent::Input { .. },
-                            ..
-                        } | EventItem::ZenohInput { .. }
-                    ) {
-                        return Some(Self::convert_event_item(item));
-                    }
-                }
-            }
-            return None;
+            return self.pop_scheduled(true);
         }
         let event = if !self.use_scheduler {
-            self.receiver.recv().await.map(Self::convert_event_item)
+            self.receiver
+                .recv()
+                .await
+                .inspect(|item| self.record_or_poison(item))
+                .map(Self::convert_event_item)
         } else {
-            loop {
-                if self.scheduler.is_empty() {
-                    if let Some(event) = self.receiver.recv().await {
-                        self.add_event(event);
-                    } else {
-                        break;
-                    }
-                } else {
-                    match self.receiver.try_recv() {
-                        Ok(event) => self.add_event(event),
-                        Err(_) => break, // empty or disconnected
-                    };
+            // Block for the first event while the scheduler is empty, then drain
+            // the rest non-blocking. The old code re-checked `is_empty()` on
+            // every iteration; `Scheduler::is_empty()` scans every input queue
+            // (O(#inputs)), so draining K events cost O(K·#inputs).
+            //
+            // `add_event` usually pushes, but it can also *drop* the event
+            // without retaining it (e.g. `queue_size: 0` -> `DropIncoming`), so
+            // we must keep blocking while the scheduler is still empty rather
+            // than assume a single `recv` made it non-empty — otherwise a
+            // dropped-only event would fall through to `scheduler.next() ==
+            // None` and be misread as a closed stream. This preserves the
+            // previous "block until a retained event arrives" behavior while
+            // checking `is_empty()` only twice in the common case instead of
+            // once per drained event.
+            while self.scheduler.is_empty() {
+                match self.receiver.recv().await {
+                    Some(event) => self.add_event(event),
+                    None => break,
                 }
+            }
+            while let Ok(event) = self.receiver.try_recv() {
+                self.add_event(event);
             }
             self.scheduler.next().map(Self::convert_event_item)
         };
 
+        if let Some(ref event) = event {
+            self.note_produced_event(event);
+        }
+        event
+    }
+
+    /// Pop the next event buffered in the scheduler, converted and
+    /// post-processed. With `inputs_only` (the post-`Stop` drain, see
+    /// `recv_from_stream`), control events are discarded instead of returned.
+    fn pop_scheduled(&mut self, inputs_only: bool) -> Option<Event> {
+        if !self.use_scheduler {
+            return None;
+        }
+        while let Some(item) = self.scheduler.next() {
+            if inputs_only
+                && !matches!(
+                    &item,
+                    EventItem::NodeEvent {
+                        event: NodeEvent::Input { .. },
+                        ..
+                    } | EventItem::ZenohInput { .. }
+                )
+            {
+                continue;
+            }
+            // Route through the shared post-process helper, exactly like the
+            // other receive paths, so the one-shot first-message type check
+            // still runs. The paths must stay in lockstep
+            // (dora-rs/adora#172, #174).
+            let event = Self::convert_event_item(item);
+            self.note_produced_event(&event);
+            return Some(event);
+        }
+        None
+    }
+
+    /// Post-process an event just produced by `recv_async` / `poll_next`: run
+    /// the one-shot, first-message input type check and update the
+    /// stop-tracking flag. Shared by both receive paths so they cannot drift —
+    /// the two paths must stay in lockstep (dora-rs/adora#172, #174).
+    fn note_produced_event(&mut self, event: &Event) {
         // First-message type validation: check once per input, then remove.
-        // Zero cost after first message per input.
+        // `contains_key` short-circuits cheaply once the check is consumed, so
+        // steady-state topic messages pay a single map lookup after the check
+        // is consumed. The check is consumed on the first *non-`Null`* message
+        // (see the `Null` note below), so an input that only ever carries
+        // `Null` (an annotated timer, an empty-payload stream) keeps re-running
+        // this cheap, allocation-free inspection each message rather than a
+        // single lookup — the deliberate cost of not disabling validation on a
+        // `Null` first message.
         //
-        // Skip the check when the message carries pattern metadata
-        // (`request_id`, `goal_id`, or `goal_status`) — the input is
-        // polymorphic by pattern design and a single declared type
-        // cannot cover all variants. The check stays armed so a later
-        // non-pattern message can still validate (dora-rs/adora#150).
-        if let Some(Event::Input {
-            ref id,
-            ref metadata,
-            ref data,
-        }) = event
-            && let Some(expected) = self.input_type_checks.get(id).cloned()
+        // Skip the check (and keep it armed) when the message carries pattern
+        // metadata (`request_id`, `goal_id`, or `goal_status`) — the input is
+        // polymorphic by pattern design and a single declared type cannot cover
+        // all variants (dora-rs/adora#150). The membership test runs before the
+        // pattern predicate so the common consumed-check path avoids the
+        // parameter lookups, and before `remove` so an armed pattern input's
+        // stored `DataType` is never cloned.
+        if let Event::Input { id, metadata, data } = event
+            && self.input_type_checks.contains_key(id)
+            && !crate::node::carries_pattern_correlation(&metadata.parameters)
         {
-            let is_pattern_message = metadata
-                .parameters
-                .contains_key(dora_message::metadata::REQUEST_ID)
-                || metadata
-                    .parameters
-                    .contains_key(dora_message::metadata::GOAL_ID)
-                || metadata
-                    .parameters
-                    .contains_key(dora_message::metadata::GOAL_STATUS);
-            if !is_pattern_message {
-                // Consume the check and validate.
-                self.input_type_checks.remove(id);
-                let actual = data.data_type();
-                // Skip check for Null type (timer ticks, empty payloads)
-                // to avoid spurious warnings on annotated timer inputs.
-                if *actual != arrow_schema::DataType::Null && *actual != expected {
-                    tracing::warn!(
-                        input = %id,
-                        expected = ?expected,
-                        actual = ?actual,
-                        "input type mismatch on first message"
-                    );
-                }
+            let raw = dora_arrow_convert::internal::array_ref(data);
+            let actual = raw.data_type();
+            // A `Null` first message (timer ticks, empty/metadata-only
+            // payloads) carries no type to validate. Skip it *without*
+            // consuming the one-shot check, so the first genuinely-typed
+            // message on this input is still validated instead of silently
+            // escaping the check. The check is consumed (`remove`) only once
+            // a non-`Null` payload has actually been inspected.
+            if *actual != arrow_schema::DataType::Null
+                && let Some(expected) = self.input_type_checks.remove(id)
+                && *actual != expected
+            {
+                tracing::warn!(
+                    input = %id,
+                    expected = ?expected,
+                    actual = ?actual,
+                    "input type mismatch on first message"
+                );
             }
         }
 
-        if matches!(&event, Some(Event::Stop(_))) {
+        if matches!(event, Event::Stop(_)) {
             self.stop_received = true;
         }
-        event
     }
 
     /// Check if there are any buffered events in the scheduler, the
@@ -604,20 +1117,48 @@ impl EventStream {
 
     /// Returns and resets the accumulated drop counts per input ID.
     ///
-    /// When inputs overflow their queue limits, the oldest messages are discarded.
-    /// For `drop_oldest` inputs this happens at `queue_size`. For `backpressure`
-    /// inputs this happens at a hard safety cap of 10x `queue_size`.
+    /// When inputs overflow their queue limits, events are discarded to keep memory bounded. For
+    /// `drop_oldest` inputs the cap is `queue_size` (clamped to at least 1); an overflow normally
+    /// evicts the oldest queued event, but correlated service/action messages and the `Stop` event
+    /// are preserved where possible, so the evicted event may instead be a newer one (or the
+    /// incoming event itself). For `backpressure` inputs the hard safety cap is
+    /// `max(10 × queue_size, 100)`.
     /// This method returns a map from input ID to the number of messages dropped
     /// since the last call.
+    /// Drops are reported per input across both loss sites — the scheduler's
+    /// per-input eviction and the shared zenoh ingress channel — so a caller
+    /// does not have to know which transport a payload took to learn it was
+    /// lost (#3282).
     pub fn drain_drop_counts(&mut self) -> HashMap<DataId, u64> {
-        self.scheduler.drain_drop_counts()
+        let mut counts = self.scheduler.drain_drop_counts();
+        for (id, dropped) in &self.ingress_drops {
+            // Load before swapping: a node polling this every `recv()` pays a
+            // read-modify-write per input otherwise, and the counter is zero on
+            // every healthy call.
+            if dropped.load(Ordering::Relaxed) > 0 {
+                let n = dropped.swap(0, Ordering::Relaxed);
+                *counts.entry(id.clone()).or_insert(0) += n;
+            }
+        }
+        counts
     }
 
     fn add_event(&mut self, event: EventItem) {
+        self.record_or_poison(&event);
+        self.scheduler.add_event(event);
+        self.scheduler_maybe_nonempty = true;
+    }
+
+    /// Record `event` to the optional `write_events_to` log. Every event taken
+    /// off `receiver` must pass through here exactly once, whichever receive
+    /// path takes it: `add_event` for the scheduler paths, directly for the
+    /// ones that bypass the scheduler (`poll_next`, the non-scheduler branch
+    /// of `recv_from_stream`).
+    fn record_or_poison(&mut self, event: &EventItem) {
         // Event recording is observability-only (writes to the optional
         // `write_events_to` log). A write failure must not panic the event
         // loop — drop the log line and continue scheduling.
-        if let Err(err) = self.record_event(&event) {
+        if let Err(err) = self.record_event(event) {
             tracing::warn!(
                 node = %self.node_id,
                 "failed to record event to write_events_to log: {err:?}"
@@ -634,24 +1175,18 @@ impl EventStream {
                 write_events_to.mark_poisoned(&err, time_offset_secs);
             }
         }
-        self.scheduler.add_event(event);
     }
 
     fn record_event(&mut self, event: &EventItem) -> eyre::Result<()> {
         if let Some(write_events_to) = &mut self.write_events_to {
             let event_json = match event {
                 EventItem::NodeEvent { event, .. } => match event {
-                    NodeEvent::Stop => {
-                        let time_offset = self
-                            .clock
-                            .new_timestamp()
-                            .get_diff_duration(&self.start_timestamp);
-                        let event_json = serde_json::json!({
-                            "type": "Stop",
-                            "time_offset_secs": time_offset.as_secs_f64(),
-                        });
-                        Some(event_json)
-                    }
+                    NodeEvent::Stop => Some(control_event_json(
+                        &self.clock,
+                        &self.start_timestamp,
+                        "Stop",
+                        None,
+                    )),
                     NodeEvent::Reload { .. } => None,
                     NodeEvent::Input { id, metadata, data } => {
                         let mut event_json = convert_output_to_json(
@@ -664,55 +1199,49 @@ impl EventStream {
                         event_json.insert("type".into(), "Input".into());
                         Some(event_json.into())
                     }
-                    NodeEvent::InputClosed { id } => {
-                        let time_offset = self
-                            .clock
-                            .new_timestamp()
-                            .get_diff_duration(&self.start_timestamp);
-                        let event_json = serde_json::json!({
-                            "type": "InputClosed",
-                            "id": id.to_string(),
-                            "time_offset_secs": time_offset.as_secs_f64(),
-                        });
-                        Some(event_json)
-                    }
-                    NodeEvent::InputRecovered { id } => {
-                        let time_offset = self
-                            .clock
-                            .new_timestamp()
-                            .get_diff_duration(&self.start_timestamp);
-                        let event_json = serde_json::json!({
-                            "type": "InputRecovered",
-                            "id": id.to_string(),
-                            "time_offset_secs": time_offset.as_secs_f64(),
-                        });
-                        Some(event_json)
-                    }
-                    NodeEvent::NodeRestarted { id } => {
-                        let time_offset = self
-                            .clock
-                            .new_timestamp()
-                            .get_diff_duration(&self.start_timestamp);
-                        let event_json = serde_json::json!({
-                            "type": "NodeRestarted",
-                            "id": id.to_string(),
-                            "time_offset_secs": time_offset.as_secs_f64(),
-                        });
-                        Some(event_json)
-                    }
-                    NodeEvent::AllInputsClosed => {
-                        let time_offset = self
-                            .clock
-                            .new_timestamp()
-                            .get_diff_duration(&self.start_timestamp);
-                        let event_json = serde_json::json!({
-                            "type": "AllInputsClosed",
-                            "time_offset_secs": time_offset.as_secs_f64(),
-                        });
-                        Some(event_json)
-                    }
+                    NodeEvent::InputClosed { id } => Some(control_event_json(
+                        &self.clock,
+                        &self.start_timestamp,
+                        "InputClosed",
+                        Some(id.to_string()),
+                    )),
+                    NodeEvent::InputRecovered { id } => Some(control_event_json(
+                        &self.clock,
+                        &self.start_timestamp,
+                        "InputRecovered",
+                        Some(id.to_string()),
+                    )),
+                    NodeEvent::NodeRestarted { id } => Some(control_event_json(
+                        &self.clock,
+                        &self.start_timestamp,
+                        "NodeRestarted",
+                        Some(id.to_string()),
+                    )),
+                    NodeEvent::AllInputsClosed => Some(control_event_json(
+                        &self.clock,
+                        &self.start_timestamp,
+                        "AllInputsClosed",
+                        None,
+                    )),
                     _ => None,
                 },
+                // Zenoh-delivered inputs surface to the user as `Event::Input`
+                // exactly like the daemon-path `NodeEvent::Input` above, but
+                // bypass the daemon, so neither this recorder nor the daemon
+                // would otherwise capture them — silently dropping inputs from
+                // the `write_events_to` recording. Record them here too.
+                EventItem::ZenohInput { id, metadata, data } => {
+                    let array = arrow::array::make_array(data.clone());
+                    let mut event_json = convert_arrow_input_to_json(
+                        id,
+                        metadata,
+                        array,
+                        self.start_timestamp,
+                        false,
+                    )?;
+                    event_json.insert("type".into(), "Input".into());
+                    Some(event_json.into())
+                }
                 _ => None,
             };
             if let Some(event_json) = event_json {
@@ -740,7 +1269,7 @@ impl EventStream {
     /// [`StreamExt::next`](futures::StreamExt::next) method with a custom timeout future instead
     /// ([`EventStream`] implements the [`Stream`] trait).
     pub fn try_recv(&mut self) -> Result<Event, TryRecvError> {
-        match self.recv_async().now_or_never() {
+        match tokio::task::unconstrained(self.recv_async()).now_or_never() {
             Some(Some(event)) => Ok(event),
             Some(None) => Err(TryRecvError::Closed),
             None => Err(TryRecvError::Empty),
@@ -816,20 +1345,41 @@ impl EventStream {
     ///   returned to the caller's next `recv()`.
     /// - `StreamError` — an upstream error event surfaced during the wait.
     ///
+    /// A response that was already queued when the dataflow began stopping is
+    /// still returned as `Ok`. The wait may have read the `Stop` while looking
+    /// for it, so after an `Ok` too, the caller's next `recv()` can return
+    /// `Stop`; check it before sending another request.
+    ///
     /// # Example
     ///
-    /// ```ignore
-    /// let request_id = node.send_service_request(...)?;
+    /// ```no_run
+    /// # async fn run() -> eyre::Result<()> {
+    /// use dora_node_api::{DoraNode, Event, MetadataParameters, PatternError};
+    /// use dora_core::config::{DataId, NodeId};
+    /// use std::time::Duration;
+    ///
+    /// let (mut node, mut events) = DoraNode::init_from_env()?;
+    /// let server = NodeId::from("service_server".to_owned());
+    ///
+    /// // `send_service_request` returns the id this response is matched against.
+    /// let request_id = node.send_service_request(
+    ///     DataId::from("request".to_owned()),
+    ///     MetadataParameters::default(),
+    ///     vec![1u8, 2, 3],
+    /// )?;
+    ///
     /// match events
-    ///     .recv_service_response(&request_id, &server_id, Duration::from_secs(5))
+    ///     .recv_service_response(&request_id, &server, Duration::from_secs(5))
     ///     .await
     /// {
-    ///     Ok(Event::Input { data, .. }) => handle_response(data),
-    ///     Err(PatternError::Timeout) => fallback_path(),
-    ///     Err(PatternError::ServerRestarted(_)) => retry_with_new_instance(),
+    ///     Ok(Event::Input { data, .. }) => { let _ = data; /* handle the response */ }
+    ///     Err(PatternError::Timeout) => { /* no response in time; take a fallback path */ }
+    ///     Err(PatternError::ServerRestarted(_)) => { /* retry against the new instance */ }
     ///     Err(e) => return Err(e.into()),
-    ///     _ => unreachable!(),
+    ///     _ => {}
     /// }
+    /// # Ok(())
+    /// # }
     /// ```
     pub async fn recv_service_response(
         &mut self,
@@ -897,6 +1447,110 @@ impl EventStream {
         .await
     }
 
+    /// Stash an event that a pattern-aware wait consumed while searching for a
+    /// correlation match, so the caller's own event loop can still see it on
+    /// the next `recv()` / `recv_async()` / `next()`.
+    ///
+    /// The buffer escapes the scheduler's per-input `queue_size` /
+    /// `queue_policy` — an event that moves scheduler → passthrough left that
+    /// policy behind and, before dora-rs/dora#3197, was retained without limit
+    /// until someone read it. A node that lets pattern-aware waits own the
+    /// stream and never reads events itself has no drain, so a high-rate input
+    /// it never correlates for (or a flapping upstream spamming control events)
+    /// grew unbounded where the scheduler would have dropped oldest. We re-apply
+    /// a bound here (see [`enforce_passthrough_bound`](Self::enforce_passthrough_bound))
+    /// so the retention stays bounded and per-input policy means the same thing
+    /// whether or not a correlated receive touched the event.
+    fn buffer_passthrough(&mut self, event: Event) {
+        let (bucket, cap) = match &event {
+            Event::Input { id, .. } => {
+                let id = id.clone();
+                let cap = self.scheduler.effective_cap_for(&id);
+                (PassthroughBucket::Input(id), cap)
+            }
+            // Control events (`Reload`, a non-expected-server `NodeRestarted`,
+            // `ParamUpdate`, …) share one cap, mirroring the scheduler's single
+            // `NON_INPUT_EVENT` queue. `Stop` is exempt from eviction below.
+            _ => (PassthroughBucket::NonInput, NON_INPUT_EVENT_QUEUE_SIZE),
+        };
+        self.pending_passthrough.push_back(event);
+        self.enforce_passthrough_bound(&bucket, cap);
+    }
+
+    /// Enforce `bucket`'s bound over the buffered passthrough events belonging
+    /// to it, mirroring `Scheduler::select_eviction`: sacrifice the oldest
+    /// ordinary (non-correlated) event first so service responses and action
+    /// results survive; only when every buffered event in the bucket is
+    /// correlated do we drop the oldest correlated one, loudly — the same
+    /// request/response-contract-breaking last resort the scheduler logs
+    /// (dora-rs/adora#145, dora-rs/dora#3197). `Stop` is never dropped, matching
+    /// the scheduler's `is_stop`.
+    ///
+    /// `buffer_passthrough` calls this after every push, so the buffer is over
+    /// capacity by at most one and a single eviction restores the bound.
+    fn enforce_passthrough_bound(&mut self, bucket: &PassthroughBucket, cap: usize) {
+        use dora_message::metadata::carries_pattern_correlation;
+
+        let in_bucket = |event: &Event| match (bucket, event) {
+            (PassthroughBucket::Input(id), Event::Input { id: eid, .. }) => eid == id,
+            (PassthroughBucket::Input(_), _) => false,
+            // Non-input bucket: every non-input event counts (no correlation
+            // concept applies); `Stop` is handled as eviction-immune below.
+            (PassthroughBucket::NonInput, event) => !matches!(event, Event::Input { .. }),
+        };
+        let correlated = |event: &Event| {
+            matches!(event, Event::Input { metadata, .. }
+                if carries_pattern_correlation(&metadata.parameters))
+        };
+        // Droppable: in this bucket and not the eviction-immune `Stop` (matching
+        // the scheduler's `is_stop`).
+        let droppable = |event: &Event| in_bucket(event) && !matches!(event, Event::Stop(_));
+
+        if self
+            .pending_passthrough
+            .iter()
+            .filter(|e| in_bucket(e))
+            .count()
+            <= cap
+        {
+            return;
+        }
+
+        // Mirror `Scheduler::select_eviction`: sacrifice the oldest ordinary
+        // event first (`RemoveAt` / `DropIncoming`); only when the whole bucket
+        // is correlated drop the oldest correlated one, loudly
+        // (`DropCorrelatedLoud`).
+        let evict_at = self
+            .pending_passthrough
+            .iter()
+            .position(|e| droppable(e) && !correlated(e))
+            .or_else(|| self.pending_passthrough.iter().position(droppable));
+        let Some(evict_at) = evict_at else {
+            // Only a `Stop` in the bucket (at most one) — nothing to drop.
+            return;
+        };
+
+        // Log before removing; the immutable borrow ends with the `match`.
+        match self.pending_passthrough.get(evict_at) {
+            Some(Event::Input { id, metadata, .. })
+                if carries_pattern_correlation(&metadata.parameters) =>
+            {
+                scheduler::log_correlation_drop_params(id, &metadata.parameters);
+            }
+            Some(Event::Input { id, .. }) => {
+                tracing::warn!(input = %id, "discarding buffered input due to queue size limit");
+            }
+            _ => {
+                tracing::warn!("discarding buffered control event due to passthrough buffer limit");
+            }
+        }
+        self.pending_passthrough.remove(evict_at);
+        match bucket {
+            PassthroughBucket::Input(id) => self.scheduler.record_drop(id),
+            PassthroughBucket::NonInput => self.scheduler.record_non_input_drop(),
+        }
+    }
+
     /// Core loop for the pattern-aware helpers. Waits up to `timeout`
     /// for an event that satisfies `is_match(event, needle)`. Buffers
     /// every non-matching event so the caller's main event loop can
@@ -911,14 +1565,52 @@ impl EventStream {
     where
         F: Fn(&Event, &str) -> bool,
     {
-        let deadline = std::time::Instant::now() + timeout;
+        // A previous pattern-aware wait may already have buffered the event
+        // we are now looking for. With pipelined requests, the response to
+        // `req-2` can arrive — and be classified non-matching, so buffered
+        // into `pending_passthrough` — *during* the wait for `req-1`. The loop
+        // below pumps `recv_from_stream`, which never reads
+        // `pending_passthrough`, so without this scan that already-buffered
+        // response would be invisible and the wait would wrongly time out.
+        // Extract a buffered match in place (preserving the order of the
+        // remaining events for the caller's own `recv()`/`recv_async()`).
+        //
+        // Only a `Match` is pulled from the buffer: a buffered `Stop` is
+        // already handled by the `stop_received` short-circuit in
+        // `recv_from_stream`, and a buffered `NodeRestarted` was reported to
+        // the caller when it was first seen, so it is left for the caller's
+        // own event loop rather than re-surfaced here.
+        if let Some(pos) = self
+            .pending_passthrough
+            .iter()
+            .position(|event| is_match(event, needle))
+            && let Some(event) = self.pending_passthrough.remove(pos)
+        {
+            return Ok(event);
+        }
+
+        // Compute the wait deadline, clamping a `timeout` so large that the
+        // addition would overflow the monotonic clock, so a caller passing e.g.
+        // `Duration::MAX` (a natural way to say "wait effectively forever") gets
+        // the longest representable wait instead of aborting the process. See
+        // `representable_wait_deadline`.
+        let deadline = representable_wait_deadline(timeout);
         loop {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
                 return Err(PatternError::Timeout);
             }
-            let event = match select(Delay::new(remaining), pin!(self.recv_async())).await {
+            // Pump the stream via `recv_from_stream`, NOT `recv_async`: the
+            // latter drains `pending_passthrough` first, which would re-hand us
+            // the very events we buffer below and livelock the loop (see
+            // `recv_from_stream`'s docs).
+            let event = match select(Delay::new(remaining), pin!(self.recv_from_stream())).await {
                 Either::Left((_elapsed, _)) => return Err(PatternError::Timeout),
+                // A `Stop` does not end the wait by itself: the scheduler hands
+                // it out ahead of any input queued with it, so the reply may
+                // still be waiting behind it. Once `Stop` is read,
+                // `recv_from_stream` drains only the inputs already queued and
+                // then returns `None`, which ends the wait here.
                 Either::Right((None, _)) => return Err(PatternError::StreamEnded),
                 Either::Right((Some(e), _)) => e,
             };
@@ -926,12 +1618,8 @@ impl EventStream {
             match classify_correlation_event(&event, expected_server, |e| is_match(e, needle)) {
                 CorrelationOutcome::Match => return Ok(event),
                 CorrelationOutcome::ServerRestarted => {
-                    self.pending_passthrough.push_back(event);
+                    self.buffer_passthrough(event);
                     return Err(PatternError::ServerRestarted(expected_server.to_string()));
-                }
-                CorrelationOutcome::StreamEnded => {
-                    self.pending_passthrough.push_back(event);
-                    return Err(PatternError::StreamEnded);
                 }
                 CorrelationOutcome::StreamError => {
                     if let Event::Error(err) = event {
@@ -940,11 +1628,64 @@ impl EventStream {
                     unreachable!("StreamError only returned for Event::Error");
                 }
                 CorrelationOutcome::Passthrough => {
-                    self.pending_passthrough.push_back(event);
+                    self.buffer_passthrough(event);
                 }
             }
         }
     }
+}
+
+/// Compute the wait deadline `now + timeout`, clamping a `timeout` so large that
+/// the addition would overflow the monotonic clock by halving it until the sum
+/// is representable. Reads the clock exactly once, so the `now` used to validate
+/// the clamp is the same `now` the deadline is built from.
+///
+/// The pattern-wait helpers ([`EventStream::recv_service_response`],
+/// [`EventStream::recv_action_result`]) take a caller-supplied [`Duration`] and
+/// wait until this deadline. A very large value — e.g. `Duration::MAX`, a
+/// natural way to express "wait effectively forever" — would otherwise panic
+/// (`overflow when adding duration to instant`) and abort the process. Clamping
+/// yields the longest representable deadline instead. The C++ binding's
+/// `clamp_pattern_timeout` guards the identical computation on the FFI side;
+/// this covers the Rust-native callers.
+fn representable_wait_deadline(timeout: Duration) -> Instant {
+    let now = Instant::now();
+    let mut timeout = timeout;
+    while !timeout.is_zero() && now.checked_add(timeout).is_none() {
+        timeout /= 2;
+    }
+    now + timeout
+}
+
+/// Build the JSON for a "control" event that carries only a type tag, an
+/// optional input/node id, and the elapsed time offset since the node started.
+///
+/// Shared by the `Stop` / `InputClosed` / `InputRecovered` / `NodeRestarted` /
+/// `AllInputsClosed` arms of [`EventStream::record_event`], which differ only in
+/// the `"type"` string and whether an `"id"` field is present. A free function
+/// (rather than a `&self` method) so it can take the `clock` and
+/// `start_timestamp` fields by reference while `record_event` holds a mutable
+/// borrow of the sibling `write_events_to` field.
+fn control_event_json(
+    clock: &uhlc::HLC,
+    start_timestamp: &uhlc::Timestamp,
+    ty: &str,
+    id: Option<String>,
+) -> serde_json::Value {
+    let time_offset = clock.new_timestamp().get_diff_duration(start_timestamp);
+    // Build the map explicitly (rather than via `json!`) so the key order
+    // matches the previous per-arm literals byte-for-byte under serde_json's
+    // `preserve_order`: `type`, then the optional `id`, then `time_offset_secs`.
+    let mut event_json = serde_json::Map::new();
+    event_json.insert("type".to_owned(), ty.into());
+    if let Some(id) = id {
+        event_json.insert("id".to_owned(), serde_json::Value::String(id));
+    }
+    event_json.insert(
+        "time_offset_secs".to_owned(),
+        time_offset.as_secs_f64().into(),
+    );
+    serde_json::Value::Object(event_json)
 }
 
 /// Outcome of classifying a single event during a pattern-aware wait.
@@ -956,11 +1697,10 @@ enum CorrelationOutcome {
     Match,
     /// `Event::NodeRestarted { id }` where `id == expected_server`.
     ServerRestarted,
-    /// `Event::Stop(_)` — the dataflow is shutting down.
-    StreamEnded,
     /// `Event::Error(_)` — the stream surfaced an error.
     StreamError,
-    /// Unrelated event — buffer it and keep waiting.
+    /// Unrelated event, or a `Stop` (see `wait_for_correlation`) — buffer it
+    /// and keep waiting.
     Passthrough,
 }
 
@@ -977,10 +1717,19 @@ where
     }
     match event {
         Event::NodeRestarted { id } if id == expected_server => CorrelationOutcome::ServerRestarted,
-        Event::Stop(_) => CorrelationOutcome::StreamEnded,
         Event::Error(_) => CorrelationOutcome::StreamError,
         _ => CorrelationOutcome::Passthrough,
     }
+}
+
+/// Which bound a buffered passthrough event counts against.
+enum PassthroughBucket {
+    /// An `Event::Input`, bounded by its input's effective `queue_size`.
+    Input(DataId),
+    /// Any non-input control event, bounded — like the scheduler's single
+    /// `NON_INPUT_EVENT` queue — by
+    /// [`NON_INPUT_EVENT_QUEUE_SIZE`](scheduler::NON_INPUT_EVENT_QUEUE_SIZE).
+    NonInput,
 }
 
 impl EventStream {
@@ -994,13 +1743,19 @@ impl EventStream {
                 NodeEvent::NodeRestarted { id } => Event::NodeRestarted { id },
                 NodeEvent::Input { id, metadata, data } => {
                     let data_inner = data.map(Arc::unwrap_or_clone);
-                    let result = data_to_arrow_array(data_inner, &metadata);
+                    let result = data_to_arrow_array(data_inner);
                     match result {
-                        Ok(data) => Event::Input {
-                            id,
-                            metadata: Arc::unwrap_or_clone(metadata),
-                            data: data.into(),
-                        },
+                        Ok(data) => {
+                            let mut metadata = Arc::unwrap_or_clone(metadata);
+                            dora_message::metadata::strip_internal_parameters(
+                                &mut metadata.parameters,
+                            );
+                            Event::Input {
+                                id,
+                                metadata,
+                                data: dora_arrow_convert::internal::from_array_ref(data),
+                            }
+                        }
                         Err(err) => Event::Error(format!("{err:?}")),
                     }
                 }
@@ -1029,19 +1784,14 @@ impl EventStream {
                 }
             },
 
-            EventItem::ZenohInput {
-                id,
-                metadata,
-                payload,
-            } => {
-                let result = zenoh_payload_to_arrow_array(payload, &metadata);
-                match result {
-                    Ok(data) => Event::Input {
-                        id,
-                        metadata: Arc::unwrap_or_clone(metadata),
-                        data: data.into(),
-                    },
-                    Err(err) => Event::Error(format!("{err:?}")),
+            EventItem::ZenohInput { id, metadata, data } => {
+                let mut metadata = Arc::unwrap_or_clone(metadata);
+                dora_message::metadata::strip_internal_parameters(&mut metadata.parameters);
+                Event::Input {
+                    id,
+                    metadata,
+                    // Already decoded in the subscriber callback (receipt order).
+                    data: dora_arrow_convert::internal::from_array_data(data),
                 }
             }
 
@@ -1064,224 +1814,213 @@ pub enum TryRecvError {
     Closed,
 }
 
-/// Convert a zenoh `ZBytes` payload into an Arrow array without copying
-/// for contiguous buffers (e.g. Zenoh SHM).
-///
-/// For `Cow::Borrowed` payloads (SHM), the Arrow `Buffer` is backed by
-/// the original `ZBytes` allocation via `Buffer::from_custom_allocation`,
-/// achieving true zero-copy. For `Cow::Owned` (normal network path),
-/// copy into Dora's aligned buffer type before reconstructing Arrow arrays.
-/// Convert a zenoh payload to an Arrow array (dora-rs/adora#132).
-fn zenoh_payload_to_arrow_array(
-    payload: zenoh::bytes::ZBytes,
-    metadata: &dora_message::metadata::Metadata,
-) -> eyre::Result<Arc<dyn arrow::array::Array>> {
-    use crate::arrow_utils::{buffer_into_arrow_array, decode_arrow_ipc};
-    use std::ptr::NonNull;
+/// Newtype that owns a Zenoh [`ZBytes`](zenoh::bytes::ZBytes) payload so it can
+/// back an Arrow `Buffer` via `Buffer::from_custom_allocation`. Keeping the
+/// `ZBytes` alive keeps the underlying SHM mapping (or heap buffer) valid for
+/// the lifetime of the zero-copy Arrow buffer.
+#[allow(dead_code)] // field kept alive to own the zenoh buffer
+struct ZBytesAllocation(zenoh::bytes::ZBytes);
+// SAFETY: the wrapped `ZBytes` is only used to keep the backing allocation
+// alive; the bytes are treated as immutable for the Buffer's lifetime.
+unsafe impl Sync for ZBytesAllocation {}
+unsafe impl Send for ZBytesAllocation {}
+impl std::panic::RefUnwindSafe for ZBytesAllocation {}
 
-    let is_ipc = dora_message::metadata::get_string_param(
-        &metadata.parameters,
-        dora_message::metadata::FRAMING,
-    ) == Some(dora_message::metadata::FRAMING_ARROW_IPC);
+/// Wrap a zenoh payload as an Arrow `Buffer` — aliasing the zenoh SHM mapping
+/// for borrowed payloads (zero-copy), owning the materialized `Vec` otherwise.
+fn zenoh_payload_to_buffer(payload: zenoh::bytes::ZBytes) -> arrow::buffer::Buffer {
+    use std::ptr::NonNull;
+    match payload.to_bytes() {
+        std::borrow::Cow::Borrowed(slice) => {
+            let ptr =
+                NonNull::new(slice.as_ptr() as *mut u8).expect("zenoh SHM payload ptr is null");
+            let len = slice.len();
+            // SAFETY: `ptr` points into the SHM region owned by `payload`;
+            // moving `payload` into the Arc keeps the region mapped for the
+            // lifetime of the Buffer.
+            unsafe {
+                arrow::buffer::Buffer::from_custom_allocation(
+                    ptr,
+                    len,
+                    Arc::new(ZBytesAllocation(payload)),
+                )
+            }
+        }
+        std::borrow::Cow::Owned(vec) => arrow::buffer::Buffer::from_vec(vec),
+    }
+}
+
+/// Declare the `@schema` AdvancedSubscriber for an input: its callback primes
+/// `decoder` from the schema published on the output's schema subtopic. The
+/// history query fetches the cached schema on join; `detect_late_publishers`
+/// re-queries a producer that appears after this subscriber.
+///
+/// On failure, `schema_plane_failed` is set so the data subscriber surfaces a
+/// `FatalError` if the input stays undecodable past
+/// [`SCHEMA_PLANE_FATAL_GRACE`]: a failed declare means a degraded zenoh
+/// session, so exit loudly rather than limp along on the in-band full-stream
+/// refresh alone — but give that refresh (which fully heals the input) its
+/// chance first instead of killing a node that would recover within seconds.
+/// It never blocks the data subscriber.
+#[allow(clippy::too_many_arguments)]
+fn declare_schema_subscriber(
+    session: &zenoh::Session,
+    dataflow_id: DataflowId,
+    source_node: &NodeId,
+    source_output: &DataId,
+    input_id: &DataId,
+    decoder: Arc<std::sync::Mutex<crate::arrow_utils::ipc_encode::InputDecoder>>,
+    tx: tokio::sync::mpsc::Sender<EventItem>,
+    schema_plane_failed: Arc<std::sync::atomic::AtomicBool>,
+    out: &mut Vec<zenoh_ext::AdvancedSubscriber<()>>,
+) {
+    use zenoh::Wait;
+    use zenoh_ext::{AdvancedSubscriberBuilderExt, HistoryConfig};
+
+    let topic =
+        dora_core::topics::zenoh_output_schema_topic(dataflow_id, source_node, source_output);
+    let key = match zenoh::key_expr::KeyExpr::new(topic) {
+        Ok(k) => k.into_owned(),
+        Err(e) => {
+            tracing::warn!(input = %input_id, "invalid @schema zenoh key ({e}); schema-once disabled for this input");
+            schema_plane_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+    };
+    let input_id_cb = input_id.clone();
+    let sub = session
+        .declare_subscriber(key)
+        .history(HistoryConfig::default().detect_late_publishers())
+        .callback(move |sample| {
+            // catch_unwind: a panic must not unwind through zenoh's IO worker.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let buffer = zenoh_payload_to_buffer(sample.payload().clone());
+                let hash = crate::node::fnv1a(buffer.as_slice());
+                let mut decoder = decoder.lock().unwrap_or_else(|poison| {
+                    let mut guard = poison.into_inner();
+                    guard.reset();
+                    guard
+                });
+                if let Err(e) = decoder.set_schema_raw(hash, buffer) {
+                    tracing::warn!(input = %input_id_cb, "failed to prime decoder from @schema sample: {e}");
+                }
+            }));
+            if result.is_err() {
+                tracing::error!(input = %input_id_cb, "zenoh @schema subscriber callback panicked");
+                let _ = tx.try_send(EventItem::FatalError(eyre!(
+                    "zenoh @schema subscriber for input `{input_id_cb}` panicked"
+                )));
+            }
+        })
+        .wait();
+    match sub {
+        Ok(s) => out.push(s),
+        Err(e) => {
+            tracing::warn!(input = %input_id, "failed to declare @schema subscriber ({e}); schema-once disabled for this input");
+            schema_plane_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// How long a schema-once input may stay continuously undecodable — with the
+/// `@schema` plane dead — before the node exits with a `FatalError`. Three
+/// producer full-stream refresh intervals: the refresh re-primes the input
+/// in-band, so if it hasn't healed after three periods the input is genuinely
+/// dead (producer gone or data plane dropping every refresh), not just waiting
+/// out the documented recovery window.
+const SCHEMA_PLANE_FATAL_GRACE: Duration =
+    crate::node::SCHEMA_ONCE_REFRESH_INTERVAL.saturating_mul(3);
+
+/// Whether the undecodable-input condition has persisted past
+/// [`SCHEMA_PLANE_FATAL_GRACE`]. Records the start of the window on first call;
+/// the caller clears `first_undecodable` on any successful decode.
+fn schema_plane_fatal_due(first_undecodable: &mut Option<Instant>, now: Instant) -> bool {
+    let start = *first_undecodable.get_or_insert(now);
+    now.duration_since(start) >= SCHEMA_PLANE_FATAL_GRACE
+}
+
+/// Decode a zenoh data sample in receipt order. A schema-less batch (the
+/// `SCHEMA_HASH` parameter is present) decodes against the per-input decoder
+/// primed from the output's `@schema` subtopic or in-band from an earlier full
+/// stream — returning `Ok(None)` if that schema hasn't been received yet, in
+/// which case the caller drops it. Other messages (large/SHM full streams,
+/// daemon-path payloads) decode standalone — and additionally prime the decoder
+/// in-band (see [`prime_in_band`]).
+fn decode_zenoh_sample(
+    decoder: &mut crate::arrow_utils::ipc_encode::InputDecoder,
+    metadata: &dora_message::metadata::Metadata,
+    payload: zenoh::bytes::ZBytes,
+) -> eyre::Result<Option<arrow::array::ArrayData>> {
+    use crate::arrow_utils::decode_arrow_ipc_zero_copy_raw;
+    use dora_message::metadata::{SCHEMA_HASH, get_integer_param};
 
     if payload.is_empty() {
-        // Mirror the daemon raw path (`arrow_utils::buffer_into_arrow_array`):
-        // an empty payload still carries a meaningful `type_info`, so rebuild
-        // the array from it with an empty backing buffer. This preserves both
-        // the declared type (a zero-length *typed* array stays typed, avoiding
-        // a downstream `as_primitive` panic — cross-transport non-determinism,
-        // dora-rs/dora#2027) AND the declared length (a `NullArray::new(n)` or
-        // struct-of-nulls keeps its length `n` instead of collapsing to 0 —
-        // dora-rs/dora#2083).
-        //
-        // `data_type` is peer-controlled (bincode-decoded from the zenoh
-        // attachment). `ArrayData::try_new` is meant to validate and return an
-        // error rather than panic, but some malformed types (e.g. empty `Union`
-        // fields, a `Dictionary` with a non-integer key) can still abort inside
-        // Arrow. Keep the unwind guard so a buggy or malicious peer can't crash
-        // the node with an empty payload (#2027 anti-panic, dora-rs/dora#2083).
-        let empty = arrow::buffer::Buffer::from_vec(Vec::<u8>::new());
-        let array = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            buffer_into_arrow_array(&empty, &metadata.type_info)
-        }))
-        .map_err(|_| {
-            eyre!(
-                "cannot build an empty array for declared type {:?}",
-                metadata.type_info.data_type
-            )
-        })??;
-        return Ok(arrow::array::make_array(array));
+        return Ok(Some(
+            dora_arrow_convert::internal::into_array_ref(().into_arrow()).to_data(),
+        ));
     }
-
-    if is_ipc {
-        // IPC path: need contiguous bytes for the IPC reader.
-        let bytes = payload.to_bytes();
-        return decode_arrow_ipc(&bytes).map(arrow::array::make_array);
+    let buffer = zenoh_payload_to_buffer(payload);
+    match get_integer_param(&metadata.parameters, SCHEMA_HASH) {
+        Some(hash) => {
+            tracing::debug!("received schema-less batch with SCHEMA_HASH={}", hash);
+            decoder.decode_batch_raw(buffer, hash as u64)
+        }
+        None => {
+            tracing::debug!("received full IPC stream (no SCHEMA_HASH)");
+            // Service/action messages are excluded from schema-once (a server
+            // multiplexes per-request schemas through one output); don't let
+            // them churn the retained schema set.
+            if !crate::node::carries_pattern_correlation(&metadata.parameters) {
+                prime_in_band(decoder, &buffer);
+            }
+            decode_arrow_ipc_zero_copy_raw(buffer).map(Some)
+        }
     }
+}
 
-    // Raw buffer path: wrap the zenoh payload as an Arrow Buffer. Borrowed
-    // payloads point into zenoh-owned shared memory; owned payloads are
-    // materialized heap buffers. In both cases the resulting Arrow buffer must
-    // be 64-byte aligned before Arrow can safely run SIMD loads on strict ARM
-    // cores.
-    let raw_buffer = match payload.to_bytes() {
-        std::borrow::Cow::Borrowed(slice) => {
-            if raw_payload_is_arrow_aligned(slice.as_ptr(), &metadata.type_info) {
-                // SHM path: the slice points into memory owned by `payload`
-                // (the zenoh shared-memory mapping). Wrap `payload` in an
-                // Arc as the allocation owner so the mapping stays alive for
-                // the lifetime of the Arrow buffer.
-                let ptr =
-                    NonNull::new(slice.as_ptr() as *mut u8).expect("zenoh SHM payload ptr is null");
-                let len = slice.len();
-
-                // Newtype satisfying arrow's Allocation trait.
-                #[allow(dead_code)] // field kept alive to own the zenoh buffer
-                struct ZBytesAllocation(zenoh::bytes::ZBytes);
-                unsafe impl Sync for ZBytesAllocation {}
-                unsafe impl Send for ZBytesAllocation {}
-                impl std::panic::RefUnwindSafe for ZBytesAllocation {}
-
-                // SAFETY: `ptr` points into the SHM region owned by
-                // `payload`. Moving `payload` into the Arc keeps the region
-                // mapped for the lifetime of the Buffer.
-                unsafe {
-                    arrow::buffer::Buffer::from_custom_allocation(
-                        ptr,
-                        len,
-                        Arc::new(ZBytesAllocation(payload)),
-                    )
-                }
-            } else {
-                warn_misaligned_payload_once(MisalignedPayloadSource::ZenohShm, slice.as_ptr());
-                copy_to_aligned_arrow_buffer(slice)
-            }
-        }
-        std::borrow::Cow::Owned(vec) => {
-            if raw_payload_is_arrow_aligned(vec.as_ptr(), &metadata.type_info) {
-                // Non-SHM path: zenoh materialized a fresh Vec. Let the Arrow
-                // buffer own that Vec directly — no copy, correct ownership.
-                arrow::buffer::Buffer::from_vec(vec)
-            } else {
-                warn_misaligned_payload_once(MisalignedPayloadSource::ZenohHeap, vec.as_ptr());
-                copy_to_aligned_arrow_buffer(&vec)
-            }
-        }
+/// Prime the per-input decoder from the schema block of a full self-describing
+/// stream received on the data topic.
+///
+/// The producer sends a full stream for the first message of an output (and
+/// after every schema change, failed `@schema` publish, or periodic refresh —
+/// see `publish_schema_once`). Since all data-plane puts share one publisher,
+/// zenoh delivers them in order, so this priming happens strictly before the
+/// schema-less batches that reference the schema — closing the QoS race where
+/// an express batch overtakes the `@schema` plane's non-express schema, and
+/// re-priming (within the refresh interval) any consumer whose `@schema`
+/// history query missed the single schema emission.
+fn prime_in_band(
+    decoder: &mut crate::arrow_utils::ipc_encode::InputDecoder,
+    buffer: &arrow::buffer::Buffer,
+) {
+    let Some((hash, schema)) =
+        crate::arrow_utils::ipc_encode::schema_block_and_hash(buffer.as_slice())
+    else {
+        return;
     };
-
-    buffer_into_arrow_array(&raw_buffer, &metadata.type_info).map(arrow::array::make_array)
-}
-
-fn raw_payload_is_arrow_aligned(
-    base_ptr: *const u8,
-    type_info: &dora_message::metadata::ArrowTypeInfo,
-) -> bool {
-    is_aligned_for_arrow(base_ptr)
-        && raw_payload_buffer_offsets_are_arrow_aligned(base_ptr, type_info)
-}
-
-fn raw_payload_buffer_offsets_are_arrow_aligned(
-    base_ptr: *const u8,
-    type_info: &dora_message::metadata::ArrowTypeInfo,
-) -> bool {
-    let layout = arrow::array::layout(&type_info.data_type);
-    for (buffer, spec) in type_info.buffer_offsets.iter().zip(&layout.buffers) {
-        if let arrow::array::BufferSpec::FixedWidth { alignment, .. } = *spec
-            // `buffer.offset` is peer-controlled (bincode-decoded from the zenoh
-            // attachment), so a hostile/buggy value could overflow this add and
-            // panic in debug builds. Treat an overflowing offset as "not aligned"
-            // so the caller falls back to the copy path, mirroring the
-            // `checked_add` discipline in `buffer_into_arrow_array`.
-            && (base_ptr as usize)
-                .checked_add(buffer.offset)
-                .is_none_or(|addr| !addr.is_multiple_of(alignment))
-        {
-            return false;
-        }
+    // A known schema (live or retained) needs no eager re-prime: the full
+    // stream decodes standalone, and `decode_batch` re-primes lazily from the
+    // retained set when a schema-less batch actually references it.
+    if decoder.knows_schema(hash) {
+        return;
     }
-
-    type_info
-        .child_data
-        .iter()
-        .all(|child| raw_payload_buffer_offsets_are_arrow_aligned(base_ptr, child))
-}
-
-fn is_aligned_for_arrow(ptr: *const u8) -> bool {
-    (ptr as usize).is_multiple_of(crate::arrow_utils::ARROW_BUFFER_ALIGNMENT)
-}
-
-enum MisalignedPayloadSource {
-    ZenohShm,
-    ZenohHeap,
-}
-
-impl MisalignedPayloadSource {
-    fn as_str(&self) -> &'static str {
-        match self {
-            Self::ZenohShm => "zenoh SHM",
-            Self::ZenohHeap => "zenoh heap",
-        }
-    }
-
-    fn warned_flag(&self) -> &'static AtomicBool {
-        static WARNED_SHM: AtomicBool = AtomicBool::new(false);
-        static WARNED_HEAP: AtomicBool = AtomicBool::new(false);
-
-        match self {
-            Self::ZenohShm => &WARNED_SHM,
-            Self::ZenohHeap => &WARNED_HEAP,
-        }
+    // Copy the schema block out of the payload: retaining a slice of an
+    // SHM-backed buffer would pin the whole segment for the decoder's lifetime.
+    let schema = arrow::buffer::Buffer::from(schema);
+    if let Err(e) = decoder.set_schema_raw(hash, schema) {
+        tracing::debug!("in-band schema priming failed: {e}");
     }
 }
 
-fn warn_misaligned_payload_once(source: MisalignedPayloadSource, ptr: *const u8) {
-    if !source.warned_flag().swap(true, Ordering::Relaxed) {
-        tracing::warn!(
-            source = source.as_str(),
-            address = %format_args!("{:#x}", ptr as usize),
-            alignment = crate::arrow_utils::ARROW_BUFFER_ALIGNMENT,
-            "received misaligned Zenoh payload, copying before Arrow decode"
-        );
-    }
-}
-
-fn copy_to_aligned_arrow_buffer(slice: &[u8]) -> arrow::buffer::Buffer {
-    use std::ptr::NonNull;
-
-    // The raw Arrow layout requires 64-byte alignment; this follows the
-    // codebase-wide AVec convention of over-aligning data buffers to 128 bytes.
-    let mut aligned: aligned_vec::AVec<u8, aligned_vec::ConstAlign<128>> =
-        aligned_vec::AVec::__from_elem(128, 0, slice.len());
-    aligned.copy_from_slice(slice);
-    debug_assert!(is_aligned_for_arrow(aligned.as_ptr()));
-
-    let ptr = NonNull::new(aligned.as_ptr() as *mut u8).expect("aligned payload ptr is null");
-    let len = aligned.len();
-    // SAFETY: `ptr` points into `aligned`, and the Arc keeps that allocation
-    // alive for the lifetime of the Arrow Buffer.
-    unsafe { arrow::buffer::Buffer::from_custom_allocation(ptr, len, Arc::new(aligned)) }
-}
-
+/// Convert an optional [`DataMessage`] into an Arrow array, or return an
+/// empty null array when no data is present.
 pub fn data_to_arrow_array(
     data: Option<DataMessage>,
-    metadata: &dora_message::metadata::Metadata,
 ) -> eyre::Result<Arc<dyn arrow::array::Array>> {
-    let data: eyre::Result<Option<RawData>> = match data {
-        None => Ok(None),
-        Some(DataMessage::Vec(v)) => Ok(Some(RawData::Vec(v))),
-    };
-
-    let is_ipc = dora_message::metadata::get_string_param(
-        &metadata.parameters,
-        dora_message::metadata::FRAMING,
-    ) == Some(dora_message::metadata::FRAMING_ARROW_IPC);
-
-    data.and_then(|data| {
-        let raw_data = data.unwrap_or(RawData::Empty);
-        raw_data
-            .into_arrow_array(&metadata.type_info, is_ipc)
-            .map(arrow::array::make_array)
-    })
+    // `DataMessage` has a single infallible variant, so the conversion cannot
+    // fail; the only fallible step is `into_arrow_array`.
+    let raw_data = data.map_or(RawData::Empty, |DataMessage::Vec(v)| RawData::Vec(v));
+    raw_data.into_arrow_array().map(arrow::array::make_array)
 }
 
 impl Stream for EventStream {
@@ -1303,52 +2042,38 @@ impl Stream for EventStream {
 
         // Close the stream after a Stop event: zenoh subscriber threads
         // hold sender clones that would otherwise keep `receiver` open.
+        // Inputs still buffered in the scheduler are delivered first, as
+        // `recv_async` does.
         if self.stop_received {
-            return std::task::Poll::Ready(None);
+            return std::task::Poll::Ready(self.pop_scheduled(true));
         }
 
-        let poll = self
-            .receiver
-            .poll_recv(cx)
-            .map(|item| item.map(Self::convert_event_item));
-
-        // Run first-message type check on the Stream path too.
-        //
-        // Mirror the recv_async() logic: skip the check (and keep it
-        // armed) when the message carries pattern metadata, so a later
-        // non-pattern message can still validate (dora-rs/adora#174).
-        if let std::task::Poll::Ready(Some(Event::Input {
-            ref id,
-            ref metadata,
-            ref data,
-        })) = poll
-            && let Some(expected) = self.input_type_checks.get(id).cloned()
-        {
-            let is_pattern_message = metadata
-                .parameters
-                .contains_key(dora_message::metadata::REQUEST_ID)
-                || metadata
-                    .parameters
-                    .contains_key(dora_message::metadata::GOAL_ID)
-                || metadata
-                    .parameters
-                    .contains_key(dora_message::metadata::GOAL_STATUS);
-            if !is_pattern_message {
-                self.input_type_checks.remove(id);
-                let actual = data.data_type();
-                if *actual != arrow_schema::DataType::Null && *actual != expected {
-                    tracing::warn!(
-                        input = %id,
-                        expected = ?expected,
-                        actual = ?actual,
-                        "input type mismatch on first message (Stream path)"
-                    );
-                }
+        // `recv_async` / `try_recv` and the pattern-aware wait helpers drain
+        // the receiver into the scheduler and take one event out of it; the
+        // rest stay buffered there. They arrived before anything still in
+        // `receiver`, so hand them out first — otherwise a node that mixes
+        // those calls with `StreamExt::next()` never sees them.
+        if self.scheduler_maybe_nonempty {
+            if let Some(event) = self.pop_scheduled(false) {
+                return std::task::Poll::Ready(Some(event));
             }
+            self.scheduler_maybe_nonempty = false;
         }
 
-        if matches!(&poll, std::task::Poll::Ready(Some(Event::Stop(_)))) {
-            self.stop_received = true;
+        let poll = self.receiver.poll_recv(cx);
+        // This path bypasses `add_event`, so record the event here — otherwise
+        // a node reading with `StreamExt::next()` writes an empty `events`
+        // array that is still marked `clean`.
+        if let std::task::Poll::Ready(Some(item)) = &poll {
+            self.record_or_poison(item);
+        }
+        let poll = poll.map(|item| item.map(Self::convert_event_item));
+
+        // Mirror recv_async(): run the first-message type check and stop
+        // tracking on the Stream path too, via the shared helper so the two
+        // paths stay in lockstep (dora-rs/adora#172, #174).
+        if let std::task::Poll::Ready(Some(ref event)) = poll {
+            self.note_produced_event(event);
         }
         poll
     }
@@ -1356,10 +2081,56 @@ impl Stream for EventStream {
 
 impl Drop for EventStream {
     fn drop(&mut self) {
+        // Tear down the per-input zenoh callback subscribers under a deadline.
+        // `Subscriber::drop` undeclares the subscription on the shared zenoh
+        // session, which blocks indefinitely when zenoh's net runtime is
+        // wedged (e.g. stuck retrying an unreachable scouted peer). Left
+        // unbounded, that hangs the whole node in `EventStream`'s field-drop
+        // sequence — before `DoraNode::Drop` (which already bounds its own
+        // session teardown) even runs — so the daemon never sees the node
+        // finish and the dataflow stalls until an outer timeout (dora-rs/dora#2425).
+        // The callbacks use `try_send`, so undeclaring before `receiver` drops
+        // cannot deadlock on a blocked callback.
+        //
+        // The `@schema` `AdvancedSubscriber`s (added with the Arrow IPC data
+        // plane in #2366) undeclare on the same shared session and can wedge
+        // the same way, so they must be torn down under the same deadline —
+        // mirroring `DoraNode::Drop`, which drops both publisher maps inside
+        // one guard. Left out, they would otherwise drop unbounded in the
+        // implicit field-drop phase after this `Drop` body returns (#2583).
+        let subscribers = std::mem::take(&mut self._zenoh_subscribers);
+        let schema_subscribers = std::mem::take(&mut self._zenoh_schema_subscribers);
+        let startup_acker = self.startup_acker.take();
+        if !subscribers.is_empty() || !schema_subscribers.is_empty() || startup_acker.is_some() {
+            let completed =
+                teardown_with_timeout("zenoh-subscribers", ZENOH_TEARDOWN_TIMEOUT, move || {
+                    drop(subscribers);
+                    drop(schema_subscribers);
+                    // Dropping the subscribers dropped their callbacks — the
+                    // only senders into the acker's queue — so the acker
+                    // thread exits (undeclaring its ack publishers, also
+                    // bounded by this deadline) and can be joined.
+                    if let Some(handle) = startup_acker {
+                        let _ = handle.join();
+                    }
+                });
+            if !completed {
+                tracing::warn!(
+                    "zenoh subscriber teardown timed out after {}s; continuing node shutdown",
+                    ZENOH_TEARDOWN_TIMEOUT.as_secs()
+                );
+            }
+        }
+
         let request = Timestamped {
             inner: DaemonRequest::EventStreamDropped,
             timestamp: self.clock.new_timestamp(),
         };
+        // Interrupt a testing-daemon `next_event` sleep before the blocking
+        // close handshake so Drop cannot deadlock (dora-rs/dora#2855).
+        if let Some(shutdown) = &self.testing_shutdown {
+            shutdown.store(true, Ordering::Relaxed);
+        }
         let result = self
             .close_channel
             .request(&request)
@@ -1486,25 +2257,22 @@ impl EventStream {
     /// prioritizing `Stop`. Used to verify `recv_async` drains buffered inputs
     /// after `Stop` instead of dropping them (dora-rs/dora#2027).
     fn push_scheduler_input_for_testing(&mut self, id: &str) {
+        self.push_scheduler_input_with_params_for_testing(id, Default::default());
+    }
+
+    /// Test-only: like [`Self::push_scheduler_input_for_testing`], with the
+    /// given metadata parameters.
+    fn push_scheduler_input_with_params_for_testing(
+        &mut self,
+        id: &str,
+        parameters: dora_message::metadata::MetadataParameters,
+    ) {
         use crate::event_stream::thread::EventItem;
-        use dora_message::{
-            daemon_to_node::NodeEvent,
-            metadata::{ArrowTypeInfo, Metadata},
-        };
+        use dora_message::{daemon_to_node::NodeEvent, metadata::Metadata};
         self.use_scheduler = true;
-        let type_info = ArrowTypeInfo {
-            data_type: arrow_schema::DataType::Null,
-            len: 0,
-            null_count: 0,
-            validity: None,
-            offset: 0,
-            buffer_offsets: vec![],
-            child_data: vec![],
-            field_names: None,
-            schema_hash: None,
-        };
-        let meta = Metadata::new(dora_core::uhlc::HLC::default().new_timestamp(), type_info);
-        self.scheduler.add_event(EventItem::NodeEvent {
+        let meta =
+            Metadata::from_parameters(dora_core::uhlc::HLC::default().new_timestamp(), parameters);
+        self.add_event(EventItem::NodeEvent {
             event: NodeEvent::Input {
                 id: id.into(),
                 metadata: std::sync::Arc::new(meta),
@@ -1520,7 +2288,7 @@ impl EventStream {
         use crate::event_stream::thread::EventItem;
         use dora_message::daemon_to_node::NodeEvent;
         self.use_scheduler = true;
-        self.scheduler.add_event(EventItem::NodeEvent {
+        self.add_event(EventItem::NodeEvent {
             event: NodeEvent::Stop,
         });
     }
@@ -1530,21 +2298,85 @@ impl EventStream {
 mod tests {
     use super::*;
 
-    #[test]
-    fn copy_to_aligned_arrow_buffer_realigns_misaligned_payload() {
-        let payload: Vec<u8> = (0..64).collect();
-        let mut storage = vec![0; payload.len() + 1];
-        let start = usize::from(is_aligned_for_arrow(storage.as_ptr()));
-        storage[start..start + payload.len()].copy_from_slice(&payload);
-        let misaligned = &storage[start..start + payload.len()];
-        assert!(
-            !is_aligned_for_arrow(misaligned.as_ptr()),
-            "test setup must provide a misaligned slice"
-        );
+    fn input_with_queue_size(queue_size: usize) -> Input {
+        serde_yaml::from_str(&format!("source: a/out\nqueue_size: {queue_size}\n"))
+            .expect("parse input")
+    }
 
-        let buffer = copy_to_aligned_arrow_buffer(misaligned);
-        assert!(is_aligned_for_arrow(buffer.as_ptr()));
-        assert_eq!(buffer.as_slice(), payload.as_slice());
+    #[test]
+    fn ingress_channel_capacity_saturates_for_huge_queue_sizes() {
+        for sizes in [
+            vec![usize::MAX],
+            vec![usize::MAX / 2 + 1, usize::MAX / 2 + 1],
+        ] {
+            let inputs: Vec<Input> = sizes.into_iter().map(input_with_queue_size).collect();
+            let capacity = ingress_channel_capacity(inputs.iter());
+            assert_eq!(capacity, usize::MAX >> 3);
+            // The capacity must be one tokio accepts.
+            let _ = tokio::sync::mpsc::channel::<()>(capacity);
+        }
+    }
+
+    #[test]
+    fn ingress_channel_capacity_sums_queue_sizes_with_a_floor() {
+        let inputs = [input_with_queue_size(50), input_with_queue_size(70)];
+        assert_eq!(ingress_channel_capacity(inputs.iter()), 120);
+        let small = [input_with_queue_size(1)];
+        assert_eq!(ingress_channel_capacity(small.iter()), 64);
+        assert_eq!(ingress_channel_capacity(std::iter::empty()), 64);
+    }
+
+    // A caller may pass a very large `Duration` to a pattern-wait helper to mean
+    // "wait effectively forever". The `Instant::now() + timeout` deadline used to
+    // panic on such a value (monotonic-clock overflow), aborting the process.
+    // `representable_wait_deadline` clamps it to the longest representable wait.
+    #[test]
+    fn representable_wait_deadline_clamps_overflow_without_panic() {
+        // A normal timeout lands roughly `timeout` in the future (not clamped).
+        let before = Instant::now();
+        let deadline = representable_wait_deadline(Duration::from_secs(5));
+        assert!(
+            deadline > before,
+            "a real timeout must produce a future deadline"
+        );
+        assert!(
+            deadline <= Instant::now() + Duration::from_secs(6),
+            "a small timeout must not be clamped to a huge one"
+        );
+        // `Duration::MAX` would overflow `Instant::now() + timeout`; the clamp
+        // yields a real future deadline instead of panicking.
+        let deadline_max = representable_wait_deadline(Duration::MAX);
+        assert!(
+            deadline_max > Instant::now(),
+            "an overflowing timeout must still produce a future deadline"
+        );
+    }
+
+    #[test]
+    fn control_event_json_shape_and_key_order() {
+        let clock = uhlc::HLC::default();
+        let start = clock.new_timestamp();
+
+        // An id-bearing control event: keys in `type`, `id`, `time_offset_secs`
+        // order (serde_json's `preserve_order` makes the order observable).
+        let with_id = control_event_json(&clock, &start, "InputClosed", Some("cam".to_owned()));
+        let obj = with_id.as_object().expect("object");
+        assert_eq!(
+            obj.keys().collect::<Vec<_>>(),
+            vec!["type", "id", "time_offset_secs"]
+        );
+        assert_eq!(obj["type"], serde_json::json!("InputClosed"));
+        assert_eq!(obj["id"], serde_json::json!("cam"));
+        assert!(obj["time_offset_secs"].is_f64());
+
+        // A control event without an id omits the `id` field entirely.
+        let without_id = control_event_json(&clock, &start, "AllInputsClosed", None);
+        let obj = without_id.as_object().expect("object");
+        assert_eq!(
+            obj.keys().collect::<Vec<_>>(),
+            vec!["type", "time_offset_secs"]
+        );
+        assert_eq!(obj["type"], serde_json::json!("AllInputsClosed"));
     }
 
     #[test]
@@ -1566,14 +2398,14 @@ mod tests {
     }
 
     /// Regression test for the daemon↔node wire protocol: `NodeEvent`
-    /// is sent over TCP with bincode, so any field type that uses
+    /// is sent over TCP with postcard, so any field type that uses
     /// `Deserializer::deserialize_any` (like `serde_json::Value`)
     /// breaks the channel and kills the node at the next receive.
     /// `NodeEvent::ParamUpdate` carries its value as JSON-encoded
     /// bytes for that reason. This test pins the invariant so we
     /// don't regress back to a `deserialize_any` field.
     #[test]
-    fn node_event_param_update_round_trips_through_bincode() {
+    fn node_event_param_update_round_trips_through_postcard() {
         let cases = [
             serde_json::json!(42),
             serde_json::json!(1.5),
@@ -1587,8 +2419,8 @@ mod tests {
                 key: "rate".into(),
                 value_json: serde_json::to_vec(&value).unwrap(),
             };
-            let bytes = bincode::serialize(&event).expect("bincode serialize");
-            let back: NodeEvent = bincode::deserialize(&bytes).expect("bincode deserialize");
+            let bytes = dora_message::encode(&event).expect("serialize");
+            let back: NodeEvent = dora_message::decode(&bytes).expect("deserialize");
             match back {
                 NodeEvent::ParamUpdate { key, value_json } => {
                     assert_eq!(key, "rate");
@@ -1755,36 +2587,21 @@ mod tests {
 
     use arrow::array::new_empty_array;
     use arrow::datatypes::DataType as ArrowDataType;
-    use dora_arrow_convert::ArrowData;
+    use dora_arrow_convert::internal::from_array_ref;
     use dora_message::metadata::{
-        ArrowTypeInfo, GOAL_ID, GOAL_STATUS, GOAL_STATUS_ABORTED, GOAL_STATUS_SUCCEEDED, Metadata,
+        GOAL_ID, GOAL_STATUS, GOAL_STATUS_ABORTED, GOAL_STATUS_SUCCEEDED, Metadata,
         MetadataParameters, Parameter, REQUEST_ID,
     };
 
     fn make_metadata(params: MetadataParameters) -> Metadata {
-        let type_info = ArrowTypeInfo {
-            data_type: ArrowDataType::Null,
-            len: 0,
-            null_count: 0,
-            validity: None,
-            offset: 0,
-            buffer_offsets: vec![],
-            child_data: vec![],
-            field_names: None,
-            schema_hash: None,
-        };
-        Metadata::from_parameters(
-            dora_core::uhlc::HLC::default().new_timestamp(),
-            type_info,
-            params,
-        )
+        Metadata::from_parameters(dora_core::uhlc::HLC::default().new_timestamp(), params)
     }
 
     fn make_input_event(id: &str, params: MetadataParameters) -> Event {
         Event::Input {
             id: id.into(),
             metadata: make_metadata(params),
-            data: ArrowData(new_empty_array(&ArrowDataType::Null)),
+            data: from_array_ref(new_empty_array(&ArrowDataType::Null)),
         }
     }
 
@@ -1872,12 +2689,12 @@ mod tests {
     }
 
     #[test]
-    fn classify_stop_returns_stream_ended() {
+    fn classify_stop_is_passthrough() {
         let server = NodeId::from("calc".to_string());
         let event = Event::Stop(StopCause::Manual);
         assert_eq!(
             classify_correlation_event(&event, &server, is_request_match("req-42")),
-            CorrelationOutcome::StreamEnded
+            CorrelationOutcome::Passthrough
         );
     }
 
@@ -1966,6 +2783,116 @@ mod tests {
 
     /// Create a minimal EventStream via the testing path.
     fn test_event_stream() -> (crate::DoraNode, EventStream) {
+        test_event_stream_with(Vec::new())
+    }
+
+    /// An EventStream over the testing path that delivers `events`, then `Stop`.
+    fn test_event_stream_with(
+        mut events: Vec<TimedIncomingEvent>,
+    ) -> (crate::DoraNode, EventStream) {
+        events.push(TimedIncomingEvent {
+            time_offset_secs: 0.0,
+            event: IncomingEvent::Stop,
+        });
+        let inputs = TestingInput::Input(IntegrationTestInput::new(
+            "test-node".parse().unwrap(),
+            events,
+        ));
+        let (tx, _rx) = crate::integration_testing::output_channel();
+        let outputs = TestingOutput::ToChannel(tx);
+        let options = TestingOptions {
+            skip_output_time_offsets: true,
+        };
+        crate::DoraNode::init_testing(inputs, outputs, options).unwrap()
+    }
+
+    /// `EventStream::init` must not register the control-event id in the
+    /// per-input queue map. `dora.non_input_event` is a valid `DataId`, so a
+    /// dataflow can declare an input with that name, and the old
+    /// `queue_size_limit.insert(NON_INPUT_EVENT, ...)` overwrote that input's
+    /// configured `queue_size` with the control cap of 1000 (dora-rs/dora#3632).
+    ///
+    /// The scheduler-level tests build `Scheduler::with_policies` directly, so
+    /// none of them reaches the map `init` builds; this one goes through `init`
+    /// and asserts the cap the scheduler would actually enforce.
+    #[test]
+    fn init_keeps_configured_queue_size_for_reserved_named_input() {
+        use dora_core::config::InputMapping;
+
+        let reserved = DataId::from(super::scheduler::NON_INPUT_EVENT.to_string());
+        let input_config = BTreeMap::from([(
+            reserved.clone(),
+            Input {
+                mapping: InputMapping::Timer {
+                    interval: Duration::from_secs(1),
+                },
+                queue_size: Some(1),
+                input_timeout: None,
+                queue_policy: None,
+            },
+        )]);
+
+        // Minimal in-process daemon: answer the register/subscribe handshake,
+        // and end the event-stream loop on its first `NextEvent` poll.
+        let (channel, mut requests) = tokio::sync::mpsc::channel::<(
+            Timestamped<DaemonRequest>,
+            tokio::sync::oneshot::Sender<DaemonReply>,
+        )>(16);
+        let responder = std::thread::spawn(move || {
+            while let Some((request, reply)) = requests.blocking_recv() {
+                let reply_value = match request.inner {
+                    DaemonRequest::NextEvent => DaemonReply::NextEvents(Vec::new()),
+                    _ => DaemonReply::Result(Ok(())),
+                };
+                if reply.send(reply_value).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let daemon_communication = DaemonCommunicationWrapper::Testing {
+            channel,
+            shutdown: Arc::new(AtomicBool::new(false)),
+        };
+        let events = EventStream::init(
+            DataflowId::new_v4(),
+            &"test-node".parse().unwrap(),
+            &daemon_communication,
+            input_config,
+            &BTreeMap::new(),
+            Arc::new(uhlc::HLC::default()),
+            None,
+            None,
+        )
+        .expect("EventStream::init should succeed against the in-process daemon");
+
+        assert_eq!(
+            events.scheduler.effective_cap_for(&reserved),
+            1,
+            "an input named `{}` must keep its configured queue_size through `init`",
+            super::scheduler::NON_INPUT_EVENT
+        );
+
+        // Both holders of a sender clone must go before the responder can see
+        // the channel close: `daemon_communication` owns the original sender,
+        // `events` owns `close_channel`.
+        drop(daemon_communication);
+        drop(events);
+        let _ = responder.join();
+    }
+
+    /// #2956: outputs sent through `TestingOutput::ToChannel` must reach the
+    /// receiver, in order, when drained after the node has finished — the
+    /// documented usage pattern, and previously untested (every other
+    /// `ToChannel` test here drops the receiver).
+    ///
+    /// Plain `#[test]` on purpose: the testing bridge uses
+    /// `blocking_send`/`blocking_recv` on the request channel, which panic
+    /// inside a tokio runtime.
+    #[test]
+    fn to_channel_delivers_outputs_in_order() {
+        use arrow::array::Int32Array;
+
         let events = vec![TimedIncomingEvent {
             time_offset_secs: 0.0,
             event: IncomingEvent::Stop,
@@ -1974,12 +2901,118 @@ mod tests {
             "test-node".parse().unwrap(),
             events,
         ));
-        let (tx, _rx) = flume::unbounded();
+        let (tx, mut rx) = crate::integration_testing::output_channel();
         let outputs = TestingOutput::ToChannel(tx);
         let options = TestingOptions {
             skip_output_time_offsets: true,
         };
-        crate::DoraNode::init_testing(inputs, outputs, options).unwrap()
+        let (mut node, _events) = crate::DoraNode::init_testing(inputs, outputs, options).unwrap();
+
+        for i in 0..3 {
+            node.send_output(
+                "out".parse().unwrap(),
+                Default::default(),
+                dora_arrow_convert::internal::from_array_ref(std::sync::Arc::new(
+                    Int32Array::from(vec![i]),
+                )),
+            )
+            .unwrap();
+        }
+
+        let received = crate::integration_testing::drain_outputs(&mut rx);
+
+        assert_eq!(received.len(), 3, "every sent output should be delivered");
+        for (i, output) in received.iter().enumerate() {
+            assert_eq!(output.get("id").and_then(|v| v.as_str()), Some("out"));
+            assert_eq!(
+                output.get("data"),
+                Some(&serde_json::json!([i as i32])),
+                "outputs should arrive in send order"
+            );
+        }
+    }
+
+    /// A `Null` first message on a type-checked input must NOT consume the
+    /// one-shot first-message type check: the check has to survive so the
+    /// first genuinely-typed message is still validated. Before the fix the
+    /// check was `remove`d before the `Null` guard, so any input whose first
+    /// message was `Null` (a timer tick, an empty/metadata-only payload)
+    /// silently disabled type validation for all its later messages.
+    #[test]
+    fn null_first_message_does_not_consume_type_check() {
+        use arrow::array::{Int32Array, NullArray};
+        use dora_message::metadata::Metadata;
+
+        let (_node, mut events) = test_event_stream();
+        let id = DataId::from("cam".to_string());
+        events
+            .input_type_checks
+            .insert(id.clone(), arrow_schema::DataType::Int32);
+
+        let clock = dora_core::uhlc::HLC::default();
+        let input = |arr: std::sync::Arc<dyn arrow::array::Array>| Event::Input {
+            id: id.clone(),
+            metadata: Metadata::new(clock.new_timestamp()),
+            data: dora_arrow_convert::internal::from_array_ref(arr),
+        };
+
+        // A `Null` first message leaves the check armed.
+        events.note_produced_event(&input(std::sync::Arc::new(NullArray::new(1))));
+        assert!(
+            events.input_type_checks.contains_key(&id),
+            "a Null first message must not consume the type check"
+        );
+
+        // The first non-Null message consumes it (validation happened).
+        events.note_produced_event(&input(std::sync::Arc::new(Int32Array::from(vec![1]))));
+        assert!(
+            !events.input_type_checks.contains_key(&id),
+            "the first non-Null message must consume the one-shot type check"
+        );
+    }
+
+    /// `poll_next` takes events straight off the receiver, bypassing the
+    /// scheduler's `add_event` — the only place events used to be recorded —
+    /// so a node reading with `StreamExt::next()` wrote a `clean` recording
+    /// with no events in it.
+    #[test]
+    fn stream_path_records_events() {
+        use futures::StreamExt;
+
+        let (_node, mut events) = test_event_stream();
+        let (w, path) = write_events_to_with_tempfile();
+        events.write_events_to = Some(w);
+
+        let event = futures::executor::block_on(events.next());
+        assert!(matches!(event, Some(Event::Stop(_))), "got {event:?}");
+        drop(events);
+
+        let v = read_back(&path);
+        assert_eq!(v["recording_status"]["state"], "clean");
+        let recorded = v["events"].as_array().unwrap();
+        assert_eq!(recorded.len(), 1, "the Stop must be recorded: {v}");
+        assert_eq!(recorded[0]["type"], "Stop");
+    }
+
+    /// Twin of `stream_path_records_events` for the other recording site:
+    /// the `!use_scheduler` branch of `recv_from_stream`, which
+    /// `recv` / `recv_async` take for an integration-test channel (the mode
+    /// `test_event_stream` builds).
+    #[test]
+    fn recv_path_records_events() {
+        let (_node, mut events) = test_event_stream();
+        let (w, path) = write_events_to_with_tempfile();
+        events.write_events_to = Some(w);
+
+        let event = events.recv();
+        assert!(matches!(event, Some(Event::Stop(_))), "got {event:?}");
+        drop(events);
+
+        let v = read_back(&path);
+        assert_eq!(v["recording_status"]["state"], "clean");
+        let recorded = v["events"].as_array().unwrap();
+        assert_eq!(recorded.len(), 1, "the Stop must be recorded: {v}");
+        assert_eq!(recorded[0]["type"], "Stop");
     }
 
     #[test]
@@ -2048,6 +3081,384 @@ mod tests {
         );
     }
 
+    // ---- dora-rs/dora#3197: the passthrough buffer is bounded per input ----
+
+    /// Build an `Event::Input` for `id`, optionally tagged with a `request_id`
+    /// so `carries_pattern_correlation` treats it as a correlated response.
+    fn passthrough_input(id: &DataId, request_id: Option<&str>) -> Event {
+        use dora_message::metadata::{Metadata, MetadataParameters, Parameter, REQUEST_ID};
+        let mut params = MetadataParameters::new();
+        if let Some(request_id) = request_id {
+            params.insert(REQUEST_ID.into(), Parameter::String(request_id.to_string()));
+        }
+        let ts = dora_core::uhlc::HLC::default().new_timestamp();
+        Event::Input {
+            id: id.clone(),
+            metadata: Metadata::from_parameters(ts, params),
+            data: dora_arrow_convert::internal::from_array_ref(std::sync::Arc::new(
+                arrow::array::NullArray::new(1),
+            )),
+        }
+    }
+
+    fn count_buffered_for(events: &EventStream, id: &DataId) -> usize {
+        events
+            .pending_passthrough
+            .iter()
+            .filter(|e| matches!(e, Event::Input { id: eid, .. } if eid == id))
+            .count()
+    }
+
+    /// A node that lets pattern-aware waits own the stream and never reads
+    /// events itself must not accumulate an unbounded passthrough buffer: an
+    /// ordinary input stashed there is capped at its effective `queue_size`
+    /// (default 10, `drop_oldest`), and the overflow is accounted as drops.
+    #[test]
+    fn buffer_passthrough_bounds_ordinary_inputs_per_queue_size() {
+        let (_node, mut events) = test_event_stream();
+        let _ = events.recv(); // drain the initial Stop
+
+        let id = DataId::from("sensor".to_string());
+        let cap = 10; // unconfigured input -> DEFAULT_QUEUE_SIZE, drop_oldest
+        for _ in 0..(cap + 5) {
+            events.buffer_passthrough(passthrough_input(&id, None));
+        }
+
+        assert_eq!(
+            count_buffered_for(&events, &id),
+            cap,
+            "passthrough retention must be capped at the input's queue_size"
+        );
+        assert_eq!(
+            events.drain_drop_counts().get(&id),
+            Some(&5),
+            "over-cap passthrough events must be counted as drops for the input"
+        );
+    }
+
+    /// The passthrough bound honours the same correlation preference the
+    /// scheduler uses: when the buffer for an input is full of correlated
+    /// responses, an incoming ordinary event on that input is dropped rather
+    /// than a correlation — a client waiting on a `request_id` never loses its
+    /// response to unrelated traffic.
+    #[test]
+    fn buffer_passthrough_preserves_correlated_over_ordinary() {
+        use dora_message::metadata::{REQUEST_ID, get_string_param};
+
+        let (_node, mut events) = test_event_stream();
+        let _ = events.recv();
+
+        let id = DataId::from("svc".to_string());
+        let cap = 10;
+
+        for i in 0..cap {
+            events.buffer_passthrough(passthrough_input(&id, Some(&format!("req-{i}"))));
+        }
+        // Flood with ordinary events on the same input.
+        for _ in 0..20 {
+            events.buffer_passthrough(passthrough_input(&id, None));
+        }
+
+        let correlated = events
+            .pending_passthrough
+            .iter()
+            .filter(|e| {
+                matches!(e, Event::Input { metadata, .. }
+                if get_string_param(&metadata.parameters, REQUEST_ID).is_some())
+            })
+            .count();
+        assert_eq!(
+            correlated, cap,
+            "every correlated response must be preserved"
+        );
+        assert_eq!(
+            events.pending_passthrough.len(),
+            cap,
+            "ordinary floods must not push the buffer past the cap"
+        );
+    }
+
+    /// A buffered `Stop` has no input id and must never be evicted by an input
+    /// flooding the buffer — mirroring the scheduler, where `Stop` is
+    /// eviction-immune.
+    #[test]
+    fn buffer_passthrough_never_drops_stop() {
+        let (_node, mut events) = test_event_stream();
+        let _ = events.recv();
+
+        events.buffer_passthrough(Event::Stop(StopCause::Manual));
+
+        let id = DataId::from("flood".to_string());
+        for _ in 0..30 {
+            events.buffer_passthrough(passthrough_input(&id, None));
+        }
+
+        assert!(
+            events
+                .pending_passthrough
+                .iter()
+                .any(|e| matches!(e, Event::Stop(_))),
+            "a buffered Stop must survive an input flood"
+        );
+        assert_eq!(
+            count_buffered_for(&events, &id),
+            10,
+            "the flooding input is still capped at its queue_size"
+        );
+    }
+
+    /// Non-input control events (a flapping upstream's `NodeRestarted`,
+    /// `Reload`, `ParamUpdate`, …) that a pattern-aware wait keeps stashing are
+    /// also bounded — otherwise a never-reading node grows the buffer without
+    /// limit even though no input is involved (dora-rs/dora#3197). `Stop` still
+    /// survives.
+    #[test]
+    fn buffer_passthrough_bounds_control_events() {
+        let (_node, mut events) = test_event_stream();
+        let _ = events.recv();
+
+        // One eviction-immune `Stop` plus a control-event flood. The cap counts
+        // the `Stop` (as the scheduler's `NON_INPUT_EVENT` queue length does),
+        // so the bucket settles at `cap` = 1 `Stop` + (cap - 1) `Reload`s.
+        events.buffer_passthrough(Event::Stop(StopCause::Manual));
+        let pushed_reloads = NON_INPUT_EVENT_QUEUE_SIZE + 25;
+        for _ in 0..pushed_reloads {
+            events.buffer_passthrough(Event::Reload { operator_id: None });
+        }
+
+        let non_input = events
+            .pending_passthrough
+            .iter()
+            .filter(|e| !matches!(e, Event::Input { .. }))
+            .count();
+        assert_eq!(
+            non_input, NON_INPUT_EVENT_QUEUE_SIZE,
+            "buffered control events must be capped at the non-input limit"
+        );
+        assert!(
+            events
+                .pending_passthrough
+                .iter()
+                .any(|e| matches!(e, Event::Stop(_))),
+            "Stop must survive a control-event flood"
+        );
+        let expected_drops = (pushed_reloads + 1 - NON_INPUT_EVENT_QUEUE_SIZE) as u64;
+        assert_eq!(
+            events
+                .drain_drop_counts()
+                .get(&DataId::from(super::scheduler::NON_INPUT_EVENT.to_string())),
+            Some(&expected_drops),
+            "control-event overflow must be accounted under the non-input key"
+        );
+    }
+
+    /// Regression: a pattern-aware wait (`recv_service_response`) must make
+    /// progress when a non-matching event arrives *before* the correlated
+    /// response.
+    ///
+    /// The wait loop buffers every non-matching event into
+    /// `pending_passthrough` so the caller's own event loop can still see it.
+    /// Before the fix the loop pumped the stream via `recv_async`, which
+    /// drains `pending_passthrough` first — so it kept re-serving the buffered
+    /// non-matching event, re-buffering it, and spinning forever without ever
+    /// reading the response off the receiver. Every such call pinned a CPU core
+    /// and returned `Timeout`. The fix pumps via `recv_from_stream`, which
+    /// bypasses the passthrough buffer.
+    #[test]
+    fn recv_service_response_matches_after_non_matching_event() {
+        // Delivered FIFO (integration tests disable the reordering scheduler):
+        // the non-matching "sensor" input, then the correlated "response".
+        let events = vec![
+            TimedIncomingEvent {
+                time_offset_secs: 0.0,
+                event: IncomingEvent::Input {
+                    id: "sensor".parse().unwrap(),
+                    metadata: None,
+                    data: None,
+                },
+            },
+            TimedIncomingEvent {
+                time_offset_secs: 0.0,
+                event: IncomingEvent::Input {
+                    id: "response".parse().unwrap(),
+                    metadata: Some(request_id_params("req-1")),
+                    data: None,
+                },
+            },
+            TimedIncomingEvent {
+                time_offset_secs: 0.0,
+                event: IncomingEvent::Stop,
+            },
+        ];
+        let inputs = TestingInput::Input(IntegrationTestInput::new(
+            "test-node".parse().unwrap(),
+            events,
+        ));
+        let (tx, _rx) = crate::integration_testing::output_channel();
+        let outputs = TestingOutput::ToChannel(tx);
+        let options = TestingOptions {
+            skip_output_time_offsets: true,
+        };
+        let (_node, mut events) = crate::DoraNode::init_testing(inputs, outputs, options).unwrap();
+
+        let server = NodeId::from("calc".to_string());
+        let response = futures::executor::block_on(events.recv_service_response(
+            "req-1",
+            &server,
+            Duration::from_secs(5),
+        ));
+        match response {
+            Ok(Event::Input { id, .. }) => assert_eq!(id.as_str(), "response"),
+            other => panic!("expected the correlated response Input, got {other:?}"),
+        }
+
+        // The non-matching "sensor" input must not be lost — it is replayed
+        // to the caller's own event loop after the wait returns.
+        let buffered = events.recv();
+        assert!(
+            matches!(&buffered, Some(Event::Input { id, .. }) if id.as_str() == "sensor"),
+            "expected the buffered non-matching 'sensor' input, got {buffered:?}"
+        );
+    }
+
+    /// Regression: a pattern-aware wait must find its correlated response even
+    /// when a *previous* wait already buffered it.
+    ///
+    /// This is the pipelined / out-of-order case: two requests are in flight,
+    /// and `req-2`'s response arrives before `req-1`'s. The wait for `req-1`
+    /// buffers `resp-2` into `pending_passthrough` as non-matching, then
+    /// returns `resp-1`. The subsequent wait for `req-2` must return the
+    /// already-buffered `resp-2` — the wait loop pumps `recv_from_stream`,
+    /// which never reads `pending_passthrough`, so `wait_for_correlation`
+    /// scans the buffer for a match before reading the stream. Without that
+    /// scan the buffered response is invisible and the wait wrongly times out.
+    #[test]
+    fn recv_service_response_matches_buffered_response_from_prior_wait() {
+        // Delivered FIFO: `resp-2` arrives before `resp-1`, then `Stop`.
+        let events = vec![
+            TimedIncomingEvent {
+                time_offset_secs: 0.0,
+                event: IncomingEvent::Input {
+                    id: "response".parse().unwrap(),
+                    metadata: Some(request_id_params("req-2")),
+                    data: None,
+                },
+            },
+            TimedIncomingEvent {
+                time_offset_secs: 0.0,
+                event: IncomingEvent::Input {
+                    id: "response".parse().unwrap(),
+                    metadata: Some(request_id_params("req-1")),
+                    data: None,
+                },
+            },
+            TimedIncomingEvent {
+                time_offset_secs: 0.0,
+                event: IncomingEvent::Stop,
+            },
+        ];
+        let inputs = TestingInput::Input(IntegrationTestInput::new(
+            "test-node".parse().unwrap(),
+            events,
+        ));
+        let (tx, _rx) = crate::integration_testing::output_channel();
+        let outputs = TestingOutput::ToChannel(tx);
+        let options = TestingOptions {
+            skip_output_time_offsets: true,
+        };
+        let (_node, mut events) = crate::DoraNode::init_testing(inputs, outputs, options).unwrap();
+
+        let server = NodeId::from("calc".to_string());
+        let request_id_of = |event: &Event| match event {
+            Event::Input { metadata, .. } => dora_message::metadata::get_string_param(
+                &metadata.parameters,
+                dora_message::metadata::REQUEST_ID,
+            )
+            .map(str::to_owned),
+            _ => None,
+        };
+
+        // Wait for `req-1`: reads `resp-2` (buffered as non-matching), then
+        // returns `resp-1`.
+        let first = futures::executor::block_on(events.recv_service_response(
+            "req-1",
+            &server,
+            Duration::from_secs(5),
+        ));
+        match &first {
+            Ok(event) => assert_eq!(request_id_of(event).as_deref(), Some("req-1")),
+            other => panic!("expected the req-1 response, got {other:?}"),
+        }
+
+        // Wait for `req-2`: `resp-2` is already in `pending_passthrough`, so
+        // this must return it from the buffer rather than time out.
+        let second = futures::executor::block_on(events.recv_service_response(
+            "req-2",
+            &server,
+            Duration::from_secs(5),
+        ));
+        match &second {
+            Ok(event) => assert_eq!(request_id_of(event).as_deref(), Some("req-2")),
+            other => panic!("expected the buffered req-2 response, got {other:?}"),
+        }
+    }
+
+    /// Regression: a pattern-aware wait must return a reply that was queued
+    /// together with a `Stop`.
+    ///
+    /// The scheduler hands out control events before inputs, so when the
+    /// server's reply and a `Stop` (e.g. the `AllInputsClosed` a one-shot
+    /// server's exit triggers, or a `dora stop`) are queued at the same time,
+    /// the wait sees the `Stop` first. It used to return `StreamEnded` right
+    /// there, reporting an answered request as unanswered while the reply sat
+    /// in the scheduler. The `Stop` must still reach the caller's own loop.
+    #[test]
+    fn recv_service_response_finds_reply_queued_behind_stop() {
+        let (_node, mut events) = test_event_stream();
+        events.push_scheduler_input_with_params_for_testing("response", request_id_params("req-1"));
+        events.push_scheduler_stop_for_testing();
+
+        let server = NodeId::from("calc".to_string());
+        let response = futures::executor::block_on(events.recv_service_response(
+            "req-1",
+            &server,
+            Duration::from_secs(5),
+        ));
+        match response {
+            Ok(Event::Input { id, .. }) => assert_eq!(id.as_str(), "response"),
+            other => panic!("expected the reply queued behind Stop, got {other:?}"),
+        }
+
+        // The `Stop` the wait read first is replayed to the caller's loop.
+        assert!(matches!(events.recv(), Some(Event::Stop(_))));
+        assert!(events.recv().is_none(), "nothing may follow the Stop");
+    }
+
+    /// With no reply queued, a wait that reads `Stop` still ends with
+    /// `StreamEnded` instead of waiting out its timeout.
+    #[test]
+    fn recv_service_response_after_stop_without_reply_is_stream_ended() {
+        let (_node, mut events) = test_event_stream();
+        events.push_scheduler_input_for_testing("sensor");
+        events.push_scheduler_stop_for_testing();
+
+        let server = NodeId::from("calc".to_string());
+        let response = futures::executor::block_on(events.recv_service_response(
+            "req-1",
+            &server,
+            Duration::from_secs(5),
+        ));
+        assert!(
+            matches!(response, Err(PatternError::StreamEnded)),
+            "expected StreamEnded, got {response:?}"
+        );
+
+        // Both events the wait buffered reach the caller, `Stop` first.
+        assert!(matches!(events.recv(), Some(Event::Stop(_))));
+        assert!(matches!(&events.recv(), Some(Event::Input { id, .. }) if id.as_str() == "sensor"));
+        assert!(events.recv().is_none());
+    }
+
     /// After a `Stop` event is delivered, subsequent `recv` calls must
     /// return `None` so the node can exit cleanly even when zenoh
     /// subscriber threads still hold clones of the event channel
@@ -2097,6 +3508,46 @@ mod tests {
         );
     }
 
+    /// Inputs left in the scheduler by `recv`/`try_recv` or the pattern-aware
+    /// wait helpers (which drain the receiver into it) must still come out of
+    /// `StreamExt::next()`; `poll_next` used to only poll the receiver, so a
+    /// node mixing the two APIs silently lost them.
+    #[test]
+    fn stream_next_delivers_inputs_buffered_in_scheduler() {
+        use futures::{FutureExt, StreamExt};
+
+        let (_node, mut events) = test_event_stream();
+        events.push_scheduler_input_for_testing("cam");
+
+        let next = events.next().now_or_never();
+        assert!(
+            matches!(&next, Some(Some(Event::Input { id, .. })) if id.as_str() == "cam"),
+            "buffered input must be delivered by the Stream path, got {next:?}"
+        );
+    }
+
+    /// The Stream path must drain buffered inputs after `Stop` exactly like
+    /// `recv` does (see `recv_drains_buffered_scheduler_inputs_after_stop`).
+    #[test]
+    fn stream_next_drains_buffered_inputs_after_stop() {
+        use futures::{FutureExt, StreamExt};
+
+        let (_node, mut events) = test_event_stream();
+        assert!(matches!(events.recv(), Some(Event::Stop(_))));
+        events.push_scheduler_stop_for_testing();
+        events.push_scheduler_input_for_testing("cam");
+
+        let drained = events.next().now_or_never();
+        assert!(
+            matches!(&drained, Some(Some(Event::Input { id, .. })) if id.as_str() == "cam"),
+            "buffered input must be drained after Stop, got {drained:?}"
+        );
+        assert!(
+            matches!(events.next().now_or_never(), Some(None)),
+            "stream must close after draining buffered inputs"
+        );
+    }
+
     /// #2027 review (P2): the post-Stop drain must deliver buffered *inputs*
     /// only. A non-input control event buffered behind Stop (e.g. a second
     /// `Stop`) must NOT be re-delivered to a loop-until-`None` caller.
@@ -2122,80 +3573,354 @@ mod tests {
         assert!(events.recv().is_none(), "stream must close after the input");
     }
 
-    /// #2027 + #2083: an empty payload over the zenoh transport must round-trip
-    /// through the array's real `type_info` (as produced by the send side),
-    /// preserving both the DECLARED type and the DECLARED length.
-    ///
-    /// #2027: a zero-length typed array stays typed (it previously degraded to
-    /// `NullArray` only on the zenoh path, so a downstream `as_primitive` would
-    /// panic on one transport but not the other).
-    ///
-    /// #2083: a zero-footprint array with a non-zero length (e.g.
-    /// `NullArray::new(n)`) keeps its length instead of collapsing to 0.
+    /// The post-`Stop` scheduler drain must run the same first-message
+    /// bookkeeping (`note_produced_event`) as the normal receive path — the two
+    /// paths are documented to stay in lockstep (dora-rs/adora#172, #174). An
+    /// input buffered before `Stop` and drained after it used to be returned
+    /// directly, bypassing that call, so its one-shot first-message type check
+    /// was never consumed and a type mismatch on such an input never warned.
+    /// Regression guard: reverting the fix (returning the item without
+    /// `note_produced_event`) leaves the check armed and fails this test.
     #[test]
-    fn zenoh_empty_payload_preserves_declared_type_and_length() {
-        use crate::arrow_utils::{copy_array_into_sample, required_data_size};
-        use arrow::array::{Array, Int32Array, NullArray};
+    fn post_stop_drain_runs_first_message_type_check() {
+        use crate::event_stream::thread::EventItem;
         use dora_message::metadata::Metadata;
 
-        // Build the real `type_info` the send side would record for `array`.
-        // (Hand-built `type_info` would not match the serialized layout — e.g. a
-        // typed array always records a zero-length data-buffer offset.)
-        fn meta_for(array: &dyn Array) -> Metadata {
-            let data = array.to_data();
-            let mut sample = vec![0; required_data_size(&data)];
-            assert!(sample.is_empty(), "expected a zero-footprint array");
-            let type_info = copy_array_into_sample(&mut sample, &data);
-            Metadata::new(dora_core::uhlc::HLC::default().new_timestamp(), type_info)
-        }
+        let (_node, mut events) = test_event_stream();
+        let id = DataId::from("cam".to_string());
+        events
+            .input_type_checks
+            .insert(id.clone(), arrow_schema::DataType::Int32);
 
-        let empty = zenoh::bytes::ZBytes::new();
+        // Deliver the seeded Stop (sets `stop_received`).
+        assert!(matches!(events.recv(), Some(Event::Stop(_))));
 
-        // #2027: zero-length typed array stays typed.
-        let typed = zenoh_payload_to_arrow_array(
-            empty.clone(),
-            &meta_for(&Int32Array::from(Vec::<i32>::new())),
-        )
-        .unwrap();
-        assert_eq!(typed.data_type(), &arrow_schema::DataType::Int32);
-        assert_eq!(typed.len(), 0);
+        // An input the scheduler held back behind the prioritized Stop, carrying
+        // a real (non-`Null`) typed payload so the one-shot check is consumed.
+        events.use_scheduler = true;
+        events.scheduler.add_event(EventItem::ZenohInput {
+            id: id.clone(),
+            metadata: std::sync::Arc::new(Metadata::new(
+                dora_core::uhlc::HLC::default().new_timestamp(),
+            )),
+            data: {
+                use arrow::array::Array;
+                arrow::array::Int32Array::from(vec![1]).into_data()
+            },
+        });
 
-        // #2083: a NullArray with a non-zero length keeps its length.
-        let null = zenoh_payload_to_arrow_array(empty, &meta_for(&NullArray::new(5))).unwrap();
-        assert_eq!(null.data_type(), &arrow_schema::DataType::Null);
-        assert_eq!(
-            null.len(),
-            5,
-            "NullArray length must survive the zenoh path"
-        );
-
-        // #2027 review (P2): `data_type` is peer-controlled. A malformed type
-        // (`Dictionary` with a non-integer key) must surface as `Err`, not crash
-        // the node — the `catch_unwind` guard on the empty-payload path turns any
-        // panic inside Arrow into a clean error. (A panic trace printed during
-        // this test is expected — it is the caught unwind.)
-        let malformed = dora_message::metadata::ArrowTypeInfo {
-            data_type: arrow_schema::DataType::Dictionary(
-                Box::new(arrow_schema::DataType::Utf8),
-                Box::new(arrow_schema::DataType::Int32),
-            ),
-            len: 0,
-            null_count: 0,
-            validity: None,
-            offset: 0,
-            buffer_offsets: vec![],
-            child_data: vec![],
-            field_names: None,
-            schema_hash: None,
-        };
-        let result = zenoh_payload_to_arrow_array(
-            zenoh::bytes::ZBytes::new(),
-            &Metadata::new(dora_core::uhlc::HLC::default().new_timestamp(), malformed),
+        let drained = events.recv();
+        assert!(
+            matches!(&drained, Some(Event::Input { id: got, .. }) if got == &id),
+            "buffered input must be drained after Stop, got {drained:?}"
         );
         assert!(
-            result.is_err(),
-            "malformed peer type must produce Err, not panic"
+            !events.input_type_checks.contains_key(&id),
+            "the post-Stop drain must consume the one-shot type check, \
+             staying in lockstep with the normal receive path"
         );
+    }
+
+    /// The zenoh receive path is Arrow-IPC-only. An empty payload is a
+    /// metadata-only message and maps to the unit array; a non-empty payload is
+    /// a self-describing IPC stream and round-trips to its original array (with
+    /// no type sidecar involved).
+    #[test]
+    fn zenoh_payload_ipc_roundtrip_and_empty_is_unit() {
+        use crate::arrow_utils::ipc_encode::{
+            InputDecoder, encode_ipc_into_data, ipc_fast_path_len_data,
+        };
+        use arrow::array::{Array, Int32Array};
+
+        // A standalone full stream (no SCHEMA_HASH parameter) decodes directly.
+        let metadata =
+            dora_message::metadata::Metadata::new(dora_core::uhlc::HLC::default().new_timestamp());
+        let mut decoder = InputDecoder::new();
+
+        // Empty payload -> unit array (metadata-only message).
+        let unit = decode_zenoh_sample(&mut decoder, &metadata, zenoh::bytes::ZBytes::new())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            unit.data_type(),
+            &arrow_schema::DataType::Null,
+            "empty payload maps to the unit array"
+        );
+
+        // Non-empty IPC payload round-trips to the original array.
+        let data = Int32Array::from(vec![10, 20, 30]).into_data();
+        let len = ipc_fast_path_len_data(&data).expect("primitive is fast-path eligible");
+        let mut buf = vec![0u8; len];
+        encode_ipc_into_data(&data, &mut buf).unwrap();
+
+        let decoded = decode_zenoh_sample(&mut decoder, &metadata, zenoh::bytes::ZBytes::from(buf))
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoded.data_type(), &arrow_schema::DataType::Int32);
+        assert_eq!(&decoded, &data);
+    }
+
+    /// A full self-describing stream on the data topic must prime the per-input
+    /// decoder in-band: the schema-less batches that follow decode against it
+    /// without any `@schema`-plane delivery. This is what makes the producer's
+    /// "full stream until the schema is confirmed published" strategy race-free
+    /// — data-plane puts share one publisher, so zenoh preserves their order,
+    /// while the separate `@schema` plane can lose the race with an express
+    /// batch (dora-rs/dora#2366 review: first-message QoS race).
+    #[test]
+    fn full_stream_primes_decoder_in_band_for_schema_less_batches() {
+        use crate::arrow_utils::ipc_encode::{
+            InputDecoder, batch_fast_path_len_data, encode_batch_into_data, encode_ipc_into_data,
+            ipc_fast_path_len_data, schema_block_len,
+        };
+        use arrow::array::{Array, Int32Array};
+        use dora_message::metadata::{Metadata, Parameter, SCHEMA_HASH};
+
+        let hlc = dora_core::uhlc::HLC::default();
+        let mut decoder = InputDecoder::new();
+
+        // Message 1: full stream (no SCHEMA_HASH), as the producer sends while
+        // the schema is not yet confirmed published on the `@schema` plane.
+        let first = Int32Array::from(vec![1, 2]).into_data();
+        let mut full = vec![0u8; ipc_fast_path_len_data(&first).unwrap()];
+        encode_ipc_into_data(&first, &mut full).unwrap();
+        let block = schema_block_len(&full).unwrap();
+        let hash = dora_message::metadata::fnv1a(&full[..block]);
+
+        let plain = Metadata::new(hlc.new_timestamp());
+        let got = decode_zenoh_sample(&mut decoder, &plain, zenoh::bytes::ZBytes::from(full))
+            .unwrap()
+            .unwrap();
+        assert_eq!(&got, &first);
+
+        // Message 2: schema-less batch tagged with the schema hash. No
+        // `set_schema` call happened — decoding must succeed purely from the
+        // in-band priming above.
+        let second = Int32Array::from(vec![3]).into_data();
+        let mut batch = vec![0u8; batch_fast_path_len_data(&second).unwrap()];
+        encode_batch_into_data(&second, &mut batch).unwrap();
+        let mut tagged = Metadata::new(hlc.new_timestamp());
+        tagged
+            .parameters
+            .insert(SCHEMA_HASH.to_string(), Parameter::Integer(hash as i64));
+
+        let got = decode_zenoh_sample(&mut decoder, &tagged, zenoh::bytes::ZBytes::from(batch))
+            .unwrap()
+            .expect("schema-less batch must decode against the in-band-primed decoder");
+        assert_eq!(&got, &second);
+    }
+
+    /// Service/action full streams (pattern-correlated) are excluded from
+    /// schema-once and must NOT prime the decoder in-band: a server multiplexes
+    /// per-request schemas through one output, and letting those prime the
+    /// decoder would churn the retained schema set for no benefit.
+    #[test]
+    fn pattern_correlated_full_stream_does_not_prime_in_band() {
+        use crate::arrow_utils::ipc_encode::{
+            InputDecoder, batch_fast_path_len_data, encode_batch_into_data, encode_ipc_into_data,
+            ipc_fast_path_len_data, schema_block_len,
+        };
+        use arrow::array::{Array, Int32Array};
+        use dora_message::metadata::{Metadata, Parameter, REQUEST_ID, SCHEMA_HASH};
+
+        let hlc = dora_core::uhlc::HLC::default();
+        let mut decoder = InputDecoder::new();
+
+        let reply = Int32Array::from(vec![7]).into_data();
+        let mut full = vec![0u8; ipc_fast_path_len_data(&reply).unwrap()];
+        encode_ipc_into_data(&reply, &mut full).unwrap();
+        let block = schema_block_len(&full).unwrap();
+        let hash = dora_message::metadata::fnv1a(&full[..block]);
+
+        // A service reply (request_id) decodes standalone…
+        let mut service = Metadata::new(hlc.new_timestamp());
+        service
+            .parameters
+            .insert(REQUEST_ID.to_string(), Parameter::String("req-1".into()));
+        let got = decode_zenoh_sample(&mut decoder, &service, zenoh::bytes::ZBytes::from(full))
+            .unwrap()
+            .unwrap();
+        assert_eq!(&got, &reply);
+
+        // …but must not have primed the decoder for its schema hash.
+        let batch_array = Int32Array::from(vec![8]).into_data();
+        let mut batch = vec![0u8; batch_fast_path_len_data(&batch_array).unwrap()];
+        encode_batch_into_data(&batch_array, &mut batch).unwrap();
+        let mut tagged = Metadata::new(hlc.new_timestamp());
+        tagged
+            .parameters
+            .insert(SCHEMA_HASH.to_string(), Parameter::Integer(hash as i64));
+        assert!(
+            decode_zenoh_sample(&mut decoder, &tagged, zenoh::bytes::ZBytes::from(batch))
+                .unwrap()
+                .is_none(),
+            "a pattern-correlated stream must not prime the schema-once decoder"
+        );
+    }
+
+    /// Internal wire-protocol keys (`_schema_hash`, `_framing`) must be
+    /// stripped from the metadata handed to user code — on both the zenoh and
+    /// the daemon receive paths. A forwarded `_schema_hash` would otherwise
+    /// ride onto a large/service output (which does not overwrite it) and make
+    /// receivers hash-mismatch and silently drop the message
+    /// (dora-rs/dora#2366 review).
+    #[test]
+    fn internal_wire_keys_are_stripped_from_user_visible_metadata() {
+        use dora_message::metadata::{
+            FRAMING, FRAMING_ARROW_IPC, Metadata, Parameter, SCHEMA_HASH,
+        };
+
+        let hlc = dora_core::uhlc::HLC::default();
+        let mut metadata = Metadata::new(hlc.new_timestamp());
+        metadata
+            .parameters
+            .insert(SCHEMA_HASH.to_string(), Parameter::Integer(42));
+        metadata.parameters.insert(
+            FRAMING.to_string(),
+            Parameter::String(FRAMING_ARROW_IPC.to_string()),
+        );
+        metadata
+            .parameters
+            .insert("user_key".to_string(), Parameter::Integer(7));
+
+        // Zenoh receive path.
+        let zenoh_item = EventItem::ZenohInput {
+            id: DataId::from("in".to_string()),
+            metadata: Arc::new(metadata.clone()),
+            data: {
+                use arrow::array::Array;
+                arrow::array::Int32Array::from(vec![1]).into_data()
+            },
+        };
+        let Event::Input {
+            metadata: user_metadata,
+            ..
+        } = EventStream::convert_event_item(zenoh_item)
+        else {
+            panic!("expected an input event");
+        };
+        assert!(!user_metadata.parameters.contains_key(SCHEMA_HASH));
+        assert!(!user_metadata.parameters.contains_key(FRAMING));
+        assert_eq!(
+            user_metadata.parameters.get("user_key"),
+            Some(&Parameter::Integer(7)),
+            "user-provided keys must survive the strip"
+        );
+
+        // Daemon receive path.
+        let daemon_item = EventItem::NodeEvent {
+            event: dora_message::daemon_to_node::NodeEvent::Input {
+                id: DataId::from("in".to_string()),
+                metadata: Arc::new(metadata),
+                data: None,
+            },
+        };
+        let Event::Input {
+            metadata: user_metadata,
+            ..
+        } = EventStream::convert_event_item(daemon_item)
+        else {
+            panic!("expected an input event");
+        };
+        assert!(!user_metadata.parameters.contains_key(SCHEMA_HASH));
+        assert!(!user_metadata.parameters.contains_key(FRAMING));
+    }
+
+    /// A zenoh-delivered input must be serializable into the same recording
+    /// JSON shape as a daemon-path input, so `write_events_to` recordings do
+    /// not silently drop inputs that take the direct zenoh data plane.
+    #[test]
+    fn zenoh_input_serializes_into_recording_json() {
+        use crate::daemon_connection::node_integration_testing::convert_arrow_input_to_json;
+
+        let hlc = dora_core::uhlc::HLC::default();
+        let start = hlc.new_timestamp();
+        let metadata = Metadata::new(hlc.new_timestamp());
+        let array: arrow::array::ArrayRef =
+            std::sync::Arc::new(arrow::array::Int32Array::from(vec![1, 2, 3]));
+
+        let json = convert_arrow_input_to_json(
+            &DataId::from("in".to_string()),
+            &metadata,
+            array,
+            start,
+            true,
+        )
+        .expect("zenoh input must serialize");
+
+        assert_eq!(json["id"], "in");
+        assert!(json.contains_key("data"), "recorded event must carry data");
+        assert!(
+            json.contains_key("data_type"),
+            "recorded event must carry data_type"
+        );
+        assert_eq!(
+            json["data"].as_array().map(|a| a.len()),
+            Some(3),
+            "all array elements must be recorded"
+        );
+    }
+
+    /// A zenoh input can carry a remote HLC timestamp that predates this node's
+    /// `start_timestamp`. The recording must clamp the offset to zero instead of
+    /// underflowing the NTP64 subtraction (a debug panic that would kill the
+    /// event loop, or a release wraparound to a garbage offset).
+    #[test]
+    fn zenoh_input_with_earlier_timestamp_does_not_underflow() {
+        use crate::daemon_connection::node_integration_testing::convert_arrow_input_to_json;
+
+        let hlc = dora_core::uhlc::HLC::default();
+        // `input_ts` is created first, so it is strictly before `start`.
+        let input_ts = hlc.new_timestamp();
+        let start = hlc.new_timestamp();
+        let metadata = Metadata::new(input_ts);
+        let array: arrow::array::ArrayRef =
+            std::sync::Arc::new(arrow::array::Int32Array::from(vec![1]));
+
+        // `skip_output_time_offsets = false` exercises the time-offset path.
+        let json = convert_arrow_input_to_json(
+            &DataId::from("in".to_string()),
+            &metadata,
+            array,
+            start,
+            false,
+        )
+        .expect("recording an earlier-timestamped input must not fail");
+        assert_eq!(
+            json["time_offset_secs"], 0.0,
+            "an input predating start must clamp to a zero offset"
+        );
+    }
+
+    /// The schema-plane FatalError only fires after the grace window: the
+    /// producer's periodic full-stream refresh heals an unprimed input in-band,
+    /// so a node with a dead `@schema` plane must not be killed on the first
+    /// dropped batch when it would recover within seconds.
+    #[test]
+    fn schema_plane_fatal_waits_out_the_grace_window() {
+        let start = Instant::now();
+        let mut first = None;
+
+        // First undecodable batch starts the window — not fatal yet.
+        assert!(!schema_plane_fatal_due(&mut first, start));
+        assert_eq!(first, Some(start));
+        // Still inside the grace window — not fatal.
+        assert!(!schema_plane_fatal_due(
+            &mut first,
+            start + SCHEMA_PLANE_FATAL_GRACE / 2
+        ));
+        // Past the window — fatal.
+        assert!(schema_plane_fatal_due(
+            &mut first,
+            start + SCHEMA_PLANE_FATAL_GRACE
+        ));
+
+        // A successful decode clears the window (caller side); the next drop
+        // starts a fresh one.
+        let mut first = None;
+        let later = start + SCHEMA_PLANE_FATAL_GRACE * 2;
+        assert!(!schema_plane_fatal_due(&mut first, later));
+        assert_eq!(first, Some(later));
     }
 
     /// Same invariant as `recv_returns_none_after_stop`, verified via
@@ -2215,35 +3940,161 @@ mod tests {
         );
     }
 
+    // ---- #3282: zenoh-path ingress drops must reach drain_drop_counts() ----
+
+    fn zenoh_item(id: &str) -> EventItem {
+        use dora_arrow_convert::IntoArrow;
+        let ts = uhlc::HLC::default().new_timestamp();
+        EventItem::ZenohInput {
+            id: DataId::from(id.to_string()),
+            metadata: std::sync::Arc::new(Metadata::new(ts)),
+            data: dora_arrow_convert::internal::into_array_ref(().into_arrow()).to_data(),
+        }
+    }
+
+    /// A zero-copy payload never reaches the scheduler's per-input queue: the
+    /// zenoh callback `try_send`s it into the node's single shared ingress
+    /// channel, and a full channel drops it there. Before #3282 that site only
+    /// logged, so `drain_drop_counts()` — the one programmatic way a node can
+    /// learn it lost data — reported zero while data was being lost. This is the
+    /// audit item in `docs/audit-2026-06-04-soundness.md`.
     #[test]
-    fn alignment_check_does_not_overflow_on_hostile_offset() {
-        use dora_message::metadata::{ArrowTypeInfo, BufferOffset};
+    fn ingress_overflow_is_counted() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<EventItem>(1);
+        let id = DataId::from("camera".to_string());
+        let drops = std::sync::Arc::new(AtomicU64::new(0));
 
-        // `buffer.offset` is peer-controlled. A value near `usize::MAX` would
-        // overflow `base_ptr as usize + buffer.offset`, panicking in debug
-        // builds. The check must instead treat it as "not aligned" (so the
-        // caller copies into an aligned buffer) without panicking.
-        let type_info = ArrowTypeInfo {
-            data_type: arrow::datatypes::DataType::Int32,
-            len: 1,
-            null_count: 0,
-            validity: None,
-            offset: 0,
-            buffer_offsets: vec![BufferOffset {
-                offset: usize::MAX,
-                len: 4,
-            }],
-            child_data: Vec::new(),
-            field_names: None,
-            schema_hash: None,
-        };
+        // First fits the capacity-1 channel.
+        send_or_count_ingress_drop(&tx, zenoh_item("camera"), &id, &drops);
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
 
-        // A 64-byte-aligned base pointer; any non-zero offset added to it would
-        // overflow when offset == usize::MAX.
-        let base_ptr = 64usize as *const u8;
+        // The next two find it full and must be counted, not just logged.
+        send_or_count_ingress_drop(&tx, zenoh_item("camera"), &id, &drops);
+        send_or_count_ingress_drop(&tx, zenoh_item("camera"), &id, &drops);
+        assert_eq!(drops.load(Ordering::Relaxed), 2);
+    }
+
+    /// The ingress-drop `warn!` must recur while a node keeps losing input, not
+    /// go silent after the first drop (#3555). The log re-arm is decoupled from
+    /// `drain_drop_counts()` — the only production caller of which is the record
+    /// node — and follows a power-of-two cadence instead, so a node that never
+    /// drains still gets ongoing (if sparse) evidence of loss.
+    #[test]
+    fn ingress_drop_warning_recurs_without_draining() {
+        // First drop always warns…
+        assert!(should_warn_ingress_drop(1));
+        // …and it must keep warning as loss continues, even though the counter
+        // is never reset by a drain call. Before the fix only count 1 warned.
+        assert!(should_warn_ingress_drop(2));
+        assert!(should_warn_ingress_drop(4));
+        assert!(should_warn_ingress_drop(1024));
+        // But not on every drop — the cadence is logarithmic so the ~1.6 us
+        // `warn!` cannot amplify the backlog it reports on the IO worker.
+        assert!(!should_warn_ingress_drop(3));
+        assert!(!should_warn_ingress_drop(5));
+        assert!(!should_warn_ingress_drop(1000));
+    }
+
+    /// A closed channel is ordinary shutdown, not data loss — counting it would
+    /// make every node report phantom drops as it tears down.
+    #[test]
+    fn ingress_send_to_a_closed_channel_is_not_a_drop() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<EventItem>(1);
+        drop(rx);
+        let id = DataId::from("camera".to_string());
+        let drops = std::sync::Arc::new(AtomicU64::new(0));
+
+        send_or_count_ingress_drop(&tx, zenoh_item("camera"), &id, &drops);
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+    }
+
+    /// `drain_drop_counts()` must report one number per input, summing the
+    /// scheduler's per-input evictions and the ingress-channel drops — a caller
+    /// asking "did I lose anything on `camera`?" should not have to know which
+    /// transport the payload happened to take. And draining must reset, so two
+    /// calls don't double-count.
+    #[test]
+    fn drain_drop_counts_merges_ingress_and_scheduler_drops() {
+        let (_node, mut events) = test_event_stream();
+        let id = DataId::from("camera".to_string());
+
+        events.scheduler.record_drop(&id);
+        events
+            .ingress_drops
+            .entry(id.clone())
+            .or_default()
+            .fetch_add(2, Ordering::Relaxed);
+
+        let counts = events.drain_drop_counts();
+        assert_eq!(counts.get(&id), Some(&3));
+
         assert!(
-            !raw_payload_buffer_offsets_are_arrow_aligned(base_ptr, &type_info),
-            "an overflowing offset must be reported as not aligned, not panic"
+            events.drain_drop_counts().is_empty(),
+            "drain must reset both sources"
         );
+    }
+
+    // ---- tokio coop budget: synchronous receives inside a tokio task ----
+
+    /// More inputs than tokio's per-task coop budget (128).
+    const COOP_TEST_INPUTS: usize = 400;
+
+    /// Drain a stream of `COOP_TEST_INPUTS` inputs with `next`, from inside a
+    /// tokio task that never yields to the runtime: the shape of a plain
+    /// event loop in `#[tokio::main]`. Returns how many inputs were seen, and
+    /// fails instead of hanging.
+    fn inputs_seen_in_tokio_task(next: fn(&mut EventStream) -> Option<Event>) -> usize {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let inputs = (0..COOP_TEST_INPUTS)
+                .map(|_| TimedIncomingEvent {
+                    time_offset_secs: 0.0,
+                    event: IncomingEvent::Input {
+                        id: "tick".parse().unwrap(),
+                        metadata: None,
+                        data: None,
+                    },
+                })
+                .collect();
+            let (_node, mut events) = test_event_stream_with(inputs);
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            let seen = rt.block_on(async {
+                let mut seen = 0;
+                while let Some(Event::Input { .. }) = next(&mut events) {
+                    seen += 1;
+                }
+                seen
+            });
+            let _ = tx.send(seen);
+        });
+        rx.recv_timeout(Duration::from_secs(20))
+            .expect("the receive loop hung inside the tokio task")
+    }
+
+    #[test]
+    fn recv_inside_a_tokio_task_sees_every_event() {
+        assert_eq!(inputs_seen_in_tokio_task(|e| e.recv()), COOP_TEST_INPUTS);
+    }
+
+    #[test]
+    fn recv_timeout_inside_a_tokio_task_sees_every_event() {
+        let seen = inputs_seen_in_tokio_task(|e| e.recv_timeout(Duration::from_secs(1)));
+        assert_eq!(seen, COOP_TEST_INPUTS);
+    }
+
+    #[test]
+    fn try_recv_inside_a_tokio_task_sees_every_event() {
+        let seen = inputs_seen_in_tokio_task(|e| {
+            loop {
+                match e.try_recv() {
+                    Ok(event) => return Some(event),
+                    Err(TryRecvError::Closed) => return None,
+                    Err(TryRecvError::Empty) => std::thread::sleep(Duration::from_millis(1)),
+                }
+            }
+        });
+        assert_eq!(seen, COOP_TEST_INPUTS);
     }
 }

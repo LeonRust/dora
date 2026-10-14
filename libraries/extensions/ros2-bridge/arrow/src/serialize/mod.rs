@@ -52,15 +52,23 @@ impl serde::Serialize for TypedValue<'_> {
         })?;
         for column_name in input.column_names() {
             if !message.members.iter().any(|m| m.name == column_name) {
-                return Err(error(format!(
+                Err(error(format!(
                     "given struct has unknown field {column_name}"
                 )))?;
             }
         }
         if input.len() > 1 {
-            return Err(error(format!(
+            Err(error(format!(
                 "expected single struct instance, got struct array with {} entries",
                 input.len()
+            )))?;
+        }
+        // A null message, e.g. a null element of an `Inner[]` sequence, would
+        // otherwise go out as its masked child values.
+        if !input.is_empty() && input.is_null(0) {
+            Err(error(format!(
+                "a {} message is null, but ROS2 messages cannot represent null",
+                self.type_info.message_name
             )))?;
         }
         let mut s = serializer.serialize_tuple_struct(DUMMY_STRUCT_NAME, message.members.len())?;
@@ -84,6 +92,15 @@ impl serde::Serialize for TypedValue<'_> {
                 }
             };
 
+            // A ROS2 field always has a value. A null row would otherwise go
+            // out as whatever its masked buffers hold: for a sequence, array
+            // or nested message, values the producer never meant to send.
+            if !column.is_empty() && column.is_null(0) {
+                return Err(error(format!(
+                    "field {}.{} is null, but ROS2 messages cannot represent null",
+                    message.name, field.name
+                )));
+            }
             self.serialize_field::<S>(field, column, &mut s)
                 .map_err(|e| {
                     error(format!(
@@ -147,12 +164,14 @@ impl TypedValue<'_> {
                     GenericString::String | GenericString::BoundedString(_) => {
                         let string = if let Some(string_array) = column.as_string_opt::<i32>() {
                             check_single_element(string_array.len(), "StringArray")?;
+                            check_not_null(string_array, "StringArray")?;
                             string_array.value(0)
                         } else {
                             let string_array = column
                                 .as_string_opt::<i64>()
                                 .ok_or_else(|| error("expected string array"))?;
                             check_single_element(string_array.len(), "LargeStringArray")?;
+                            check_not_null(string_array, "LargeStringArray")?;
                             string_array.value(0)
                         };
                         if let GenericString::BoundedString(max) = t
@@ -169,12 +188,14 @@ impl TypedValue<'_> {
                     GenericString::WString | GenericString::BoundedWString(_) => {
                         let string = if let Some(string_array) = column.as_string_opt::<i32>() {
                             check_single_element(string_array.len(), "StringArray (WString)")?;
+                            check_not_null(string_array, "StringArray (WString)")?;
                             string_array.value(0)
                         } else {
                             let string_array = column
                                 .as_string_opt::<i64>()
                                 .ok_or_else(|| error("expected string array for WString"))?;
                             check_single_element(string_array.len(), "LargeStringArray (WString)")?;
+                            check_not_null(string_array, "LargeStringArray (WString)")?;
                             string_array.value(0)
                         };
                         if let GenericString::BoundedWString(max) = t {
@@ -236,6 +257,71 @@ fn check_single_element<E: serde::ser::Error>(len: usize, type_name: &str) -> Re
     Ok(())
 }
 
+/// Reject a null in a single-element scalar/string field column.
+///
+/// ROS2 messages (and the CDR wire format) have no null concept, but
+/// `Array::value(0)` returns the physical buffer slot regardless of the
+/// validity bit — for a null it silently yields a default (`0`/`false`/`""`).
+/// Serializing that would invent a value the producer never sent, so reject it
+/// instead, matching the sibling `arrow-convert` and `mavlink2-bridge` layers
+/// which also refuse nulls rather than substitute a default. Callers must have
+/// already checked that the column has exactly one element.
+fn check_not_null<E: serde::ser::Error>(
+    array: &dyn arrow::array::Array,
+    type_name: &str,
+) -> Result<(), E> {
+    if array.is_null(0) {
+        return Err(serde::ser::Error::custom(format!(
+            "{type_name} field is null at row 0, but ROS2 messages cannot represent null"
+        )));
+    }
+    Ok(())
+}
+
+/// Reject a null element in a ROS2 `string[]`/`string[N]` (or wstring) column.
+///
+/// The scalar-string path already refuses nulls via [`check_not_null`]; the
+/// array and sequence string paths must honor the same invariant. A ROS2 string
+/// array element is non-nullable on the CDR wire, so a null in the Arrow column
+/// would otherwise be silently encoded as `""` — inventing an empty string the
+/// producer never sent. Reject it instead, matching the scalar path and the
+/// sibling `arrow-convert`/`mavlink2-bridge` layers that also refuse nulls
+/// rather than substitute a default.
+fn reject_null_string_element<E: serde::ser::Error>(
+    element: Option<&str>,
+    index: usize,
+) -> Result<&str, E> {
+    element.ok_or_else(|| {
+        serde::ser::Error::custom(format!(
+            "string array element at index {index} is null, but ROS2 messages cannot represent null"
+        ))
+    })
+}
+
+/// Reject a null element in a ROS2 numeric/bool `T[]`/`T[N]` column.
+///
+/// The scalar-primitive and scalar-bool paths already refuse nulls via
+/// [`check_not_null`]; the array and sequence primitive/bool paths must honor
+/// the same invariant. `PrimitiveArray::values()` / `BooleanArray::values()`
+/// return the raw value buffer, so a null slot silently reads as the buffer
+/// default (`0` / `false`) — inventing a value the producer never sent. Reject
+/// it instead, matching the scalar path and the string-element helper
+/// [`reject_null_string_element`] introduced in #3254.
+fn reject_null_element<E: serde::ser::Error>(
+    array: &dyn arrow::array::Array,
+    type_name: &str,
+) -> Result<(), E> {
+    if array.null_count() == 0 {
+        return Ok(());
+    }
+    let index = (0..array.len())
+        .find(|&i| array.is_null(i))
+        .unwrap_or_default();
+    Err(serde::ser::Error::custom(format!(
+        "{type_name} element at index {index} is null, but ROS2 messages cannot represent null"
+    )))
+}
+
 /// Guard for fixed-size array fields: a ROS2 `T[N]` array has no length prefix
 /// on the CDR wire, so the Arrow column must have exactly `expected` elements.
 /// A mismatch would otherwise emit the wrong element count into a fixed tuple
@@ -247,4 +333,241 @@ fn check_array_len<E: serde::ser::Error>(actual: usize, expected: usize) -> Resu
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::HashMap, sync::Arc};
+
+    use arrow::{
+        array::{ArrayRef, Int32Array, StringArray, StructArray},
+        buffer::NullBuffer,
+        datatypes::{DataType, Field},
+    };
+    use byteorder::LittleEndian;
+    use dora_ros2_bridge_msg_gen::types::{
+        Member, MemberType, Message,
+        primitives::{BasicType, GenericString, NestableType},
+    };
+
+    use super::*;
+
+    /// A one-field message whose single member has the given name/type.
+    fn single_field_message(
+        field: &str,
+        ty: NestableType,
+    ) -> Arc<HashMap<String, HashMap<String, Message>>> {
+        let message = Message {
+            package: "test_msgs".to_string(),
+            name: "OneField".to_string(),
+            members: vec![Member {
+                name: field.to_string(),
+                r#type: MemberType::NestableType(ty),
+                default: None,
+            }],
+            constants: vec![],
+        };
+        let mut package = HashMap::new();
+        package.insert("OneField".to_string(), message);
+        let mut messages = HashMap::new();
+        messages.insert("test_msgs".to_string(), package);
+        Arc::new(messages)
+    }
+
+    fn struct_of(field: &str, data_type: DataType, column: ArrayRef) -> ArrayRef {
+        Arc::new(StructArray::from(vec![(
+            Arc::new(Field::new(field, data_type, true)),
+            column,
+        )])) as ArrayRef
+    }
+
+    fn serialize(
+        messages: &Arc<HashMap<String, HashMap<String, Message>>>,
+        value: &ArrayRef,
+    ) -> Result<Vec<u8>, String> {
+        let type_info = TypeInfo {
+            package_name: Cow::Borrowed("test_msgs"),
+            message_name: Cow::Borrowed("OneField"),
+            messages: messages.clone(),
+        };
+        let typed = TypedValue {
+            value,
+            type_info: &type_info,
+        };
+        cdr_encoding::to_vec::<_, LittleEndian>(&typed).map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn null_scalar_field_is_rejected() {
+        let messages = single_field_message("x", NestableType::BasicType(BasicType::I32));
+        // A present value serializes fine...
+        let ok = struct_of(
+            "x",
+            DataType::Int32,
+            Arc::new(Int32Array::from(vec![Some(7)])),
+        );
+        assert!(serialize(&messages, &ok).is_ok());
+        // ...but a null must be rejected rather than silently encoded as 0.
+        let null = struct_of("x", DataType::Int32, Arc::new(Int32Array::from(vec![None])));
+        let err = serialize(&messages, &null).unwrap_err();
+        assert!(
+            err.to_string().contains("null"),
+            "expected a null-rejection error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn null_string_field_is_rejected() {
+        let messages =
+            single_field_message("s", NestableType::GenericString(GenericString::String));
+        let ok = struct_of(
+            "s",
+            DataType::Utf8,
+            Arc::new(StringArray::from(vec![Some("hi")])),
+        );
+        assert!(serialize(&messages, &ok).is_ok());
+        let null = struct_of(
+            "s",
+            DataType::Utf8,
+            Arc::new(StringArray::from(vec![Option::<&str>::None])),
+        );
+        let err = serialize(&messages, &null).unwrap_err();
+        assert!(
+            err.to_string().contains("null"),
+            "expected a null-rejection error, got: {err}"
+        );
+    }
+
+    /// A null nested-message row must error too, not go out as its masked
+    /// child values (here `x = 7`).
+    #[test]
+    fn null_nested_message_field_is_rejected() {
+        let mut messages = Arc::unwrap_or_clone(single_field_message(
+            "inner",
+            NestableType::NamedType(dora_ros2_bridge_msg_gen::types::primitives::NamedType(
+                "Inner".to_string(),
+            )),
+        ));
+        let inner_message = Message {
+            package: "test_msgs".to_string(),
+            name: "Inner".to_string(),
+            members: vec![Member {
+                name: "x".to_string(),
+                r#type: MemberType::NestableType(NestableType::BasicType(BasicType::I32)),
+                default: None,
+            }],
+            constants: vec![],
+        };
+        messages
+            .get_mut("test_msgs")
+            .unwrap()
+            .insert("Inner".to_string(), inner_message);
+        let messages = Arc::new(messages);
+
+        let inner_fields = vec![Arc::new(Field::new("x", DataType::Int32, true))];
+        let value = |nulls| {
+            let inner = StructArray::new(
+                inner_fields.clone().into(),
+                vec![Arc::new(Int32Array::from(vec![7])) as ArrayRef],
+                nulls,
+            );
+            struct_of(
+                "inner",
+                DataType::Struct(inner_fields.clone().into()),
+                Arc::new(inner),
+            )
+        };
+        assert!(serialize(&messages, &value(None)).is_ok());
+        let err = serialize(&messages, &value(Some(NullBuffer::new_null(1)))).unwrap_err();
+        assert!(
+            err.contains("inner is null"),
+            "expected a null-rejection error, got: {err}"
+        );
+    }
+
+    /// A null element of a sequence or array of messages must error too: its
+    /// child columns still hold values (here `x = 0`).
+    #[test]
+    fn null_nested_message_element_is_rejected() {
+        use arrow::array::ListArray;
+        use arrow::buffer::OffsetBuffer;
+        use dora_ros2_bridge_msg_gen::types::primitives::NamedType;
+        use dora_ros2_bridge_msg_gen::types::sequences::{Array, Sequence};
+
+        let inner_type = || NestableType::NamedType(NamedType("Inner".to_string()));
+        let inner_fields = vec![Arc::new(Field::new("x", DataType::Int32, true))];
+        let items = |nulls| {
+            let inner = StructArray::new(
+                inner_fields.clone().into(),
+                vec![Arc::new(Int32Array::from(vec![1, 0])) as ArrayRef],
+                nulls,
+            );
+            let item_field = Arc::new(Field::new(
+                "item",
+                DataType::Struct(inner_fields.clone().into()),
+                true,
+            ));
+            let list = ListArray::new(
+                item_field.clone(),
+                OffsetBuffer::from_lengths([2]),
+                Arc::new(inner),
+                None,
+            );
+            struct_of("items", DataType::List(item_field), Arc::new(list))
+        };
+
+        for member_type in [
+            MemberType::Sequence(Sequence {
+                value_type: inner_type(),
+            }),
+            MemberType::Array(Array {
+                value_type: inner_type(),
+                size: 2,
+            }),
+        ] {
+            let messages = Arc::new(HashMap::from([(
+                "test_msgs".to_string(),
+                HashMap::from([
+                    (
+                        "OneField".to_string(),
+                        Message {
+                            package: "test_msgs".to_string(),
+                            name: "OneField".to_string(),
+                            members: vec![Member {
+                                name: "items".to_string(),
+                                r#type: member_type.clone(),
+                                default: None,
+                            }],
+                            constants: vec![],
+                        },
+                    ),
+                    (
+                        "Inner".to_string(),
+                        Message {
+                            package: "test_msgs".to_string(),
+                            name: "Inner".to_string(),
+                            members: vec![Member {
+                                name: "x".to_string(),
+                                r#type: MemberType::NestableType(NestableType::BasicType(
+                                    BasicType::I32,
+                                )),
+                                default: None,
+                            }],
+                            constants: vec![],
+                        },
+                    ),
+                ]),
+            )]));
+            assert!(
+                serialize(&messages, &items(None)).is_ok(),
+                "{member_type:?} without nulls must serialize"
+            );
+            let err = serialize(&messages, &items(Some(NullBuffer::from(vec![true, false]))))
+                .unwrap_err();
+            assert!(
+                err.contains("Inner message is null"),
+                "{member_type:?}: expected a null-rejection error, got: {err}"
+            );
+        }
+    }
 }

@@ -46,26 +46,31 @@
 //! Other message types are read-only telemetry; sending them inbound is
 //! out of scope for this PR.
 
+// SET_MODE is deprecated upstream (superseded by MAV_CMD_DO_SET_MODE) but
+// deliberately supported by the bridge for legacy autopilots.
+#[allow(deprecated)]
+use dora_mavlink2_bridge::mavlink::dialects::common::SET_MODE_DATA;
 use dora_mavlink2_bridge::{
     MavlinkArrow,
-    mavlink::common::{
-        COMMAND_LONG_DATA, HEARTBEAT_DATA, RC_CHANNELS_OVERRIDE_DATA, SET_MODE_DATA,
+    mavlink::dialects::common::{
+        COMMAND_LONG_DATA, HEARTBEAT_DATA, RC_CHANNELS_OVERRIDE_DATA,
         SET_POSITION_TARGET_GLOBAL_INT_DATA, SET_POSITION_TARGET_LOCAL_NED_DATA,
     },
     transport,
 };
 use dora_node_api::{
-    DoraNode, Event, MetadataParameters, TryRecvError,
-    arrow::array::{Array, ArrayRef, AsArray, RecordBatch, StructArray},
+    DoraNode, Event, MetadataParameters,
+    arrow_v59::array::{Array, ArrayRef, AsArray, RecordBatch, StructArray},
     dora_core::config::DataId,
-    flume,
 };
 use eyre::{Context, Result, bail, eyre};
 use mavlink::{
-    MavConnection, MavHeader, MavlinkVersion, Message, common::MavMessage, error::MessageReadError,
+    MavConnection, MavHeader, MavlinkVersion, Message, dialects::common::MavMessage,
+    error::MessageReadError,
 };
 use serde::Deserialize;
 use std::{
+    pin::pin,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -75,10 +80,48 @@ use std::{
 use url::Url;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// What woke the main loop in [`wait_for_event_or_frame`].
+enum Wake<T> {
+    /// A dora event, or `None` once the event stream has closed. A timeout
+    /// is `Some(Event::Error(..))`, as with [`recv_async_timeout`](dora_node_api::EventStream::recv_async_timeout).
+    Event(Option<Event>),
+    /// A telemetry frame the reader thread decoded.
+    Frame(T),
+    /// The reader thread exited: its sender is gone and the queue is empty.
+    ReaderGone,
+}
+
+/// Block until `event` (a pending event-stream receive, e.g.
+/// [`recv_async_timeout`](dora_node_api::EventStream::recv_async_timeout)) completes or the reader decodes a
+/// frame — whichever comes first.
+///
+/// Waiting on the event stream alone (`recv_timeout(POLL_INTERVAL)`) held
+/// every frame decoded during the wait for up to `POLL_INTERVAL` when no dora
+/// input was arriving (the common telemetry-only case), and once the bounded
+/// channel filled it blocked the reader, capping forwarding at roughly one
+/// channel's worth of frames per interval.
+///
+/// If the frame wins, `event` is dropped, which is the same cancellation
+/// `recv_async_timeout` performs on every timeout.
+fn wait_for_event_or_frame<T>(
+    event: impl Future<Output = Option<Event>>,
+    rx: &flume::Receiver<T>,
+) -> Wake<T> {
+    use dora_node_api::futures::{
+        executor::block_on,
+        future::{Either, select},
+    };
+    match block_on(select(pin!(event), rx.recv_async())) {
+        Either::Left((event, _)) => Wake::Event(event),
+        Either::Right((Ok(frame), _)) => Wake::Frame(frame),
+        Either::Right((Err(flume::RecvError::Disconnected), _)) => Wake::ReaderGone,
+    }
+}
 /// Belt-and-suspenders fallback for shutdown after the interrupt
 /// signals below have already fired. Covers the only transport mavlink
-/// 0.13 doesn't let us interrupt cleanly (serial: `SerialConnection`'s
-/// `SystemPort` is a private field, so we can't close it from another
+/// 0.18 doesn't let us interrupt cleanly (serial: `SerialConnection`'s
+/// port handles are private fields, so we can't close them from another
 /// thread). After this budget elapses we drop the `JoinHandle` and let
 /// the OS reap the reader on process exit, so `dora stop` /
 /// `--stop-after` don't hang until SIGKILL at the daemon's grace
@@ -92,20 +135,29 @@ const READER_SHUTDOWN_POLL: Duration = Duration::from_millis(20);
 /// budgeted retry rather than a one-shot connect.
 const CONNECT_RETRY_BUDGET: Duration = Duration::from_secs(5);
 const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(100);
-/// Minimum gap between `recv`-error warnings. mavlink-core 0.13's TCP
-/// transport returns `Err(WouldBlock)` every ~100 ms on a silent peer,
-/// so without rate-limiting a transient (or even a fatal, pre-fix) link
-/// would emit ~10 warns/second. We log at most one warning per this
-/// interval so a flaky or dead link doesn't flood the logs.
+/// Minimum gap between `recv`-error warnings. Routine read timeouts
+/// (`WouldBlock`/`TimedOut`) are classified `Silent` and never logged, so
+/// this only rate-limits genuine anomalies (`RecvDisposition::Transient`:
+/// corrupt frames, datagram I/O errors). A peer spraying garbage frames could
+/// still emit one per read otherwise, so we log at most one warning per
+/// interval to keep the logs readable.
 const RECV_WARN_INTERVAL: Duration = Duration::from_secs(5);
 
 /// How `run_reader` should react to an error returned by `conn.recv()`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RecvDisposition {
-    /// "No data yet" — a socket read timeout (`WouldBlock`/`TimedOut`),
-    /// an interrupted syscall, or a single corrupt frame on an
-    /// otherwise-live link. The reader keeps looping; the connection is
-    /// still usable.
+    /// "No data yet" — a socket read timeout (`WouldBlock`/`TimedOut`) or an
+    /// interrupted syscall on an otherwise-live link. This is the *routine*
+    /// path: mavlink-core 0.18's TCP transport returns `Err(WouldBlock)` every
+    /// ~100 ms read timeout whenever a frame isn't ready, so on a healthy but
+    /// low-rate link (e.g. a 1 Hz HEARTBEAT) it fires several times a second.
+    /// The reader keeps looping *without* logging — there is nothing wrong.
+    Silent,
+    /// A recoverable anomaly worth noting — a single corrupt/garbled frame
+    /// (CRC mismatch, unknown id, bad enum) or a transient datagram I/O error
+    /// (e.g. an ICMP port-unreachable from a restarting peer). The connection
+    /// is still usable, so the reader keeps looping, but it logs the error
+    /// (rate-limited) because, unlike a routine read timeout, it is unexpected.
     Transient,
     /// "Connection dead" — a fatal I/O error such as `UnexpectedEof`
     /// (peer closed the socket), `ConnectionReset`, or `BrokenPipe`.
@@ -121,22 +173,46 @@ enum RecvDisposition {
 /// every error the same way — sleeping 50 ms and warning forever —
 /// which turned a dead link into a logging zombie and could never
 /// distinguish a 100 ms read timeout from an EOF.
-fn classify_recv_error(err: &MessageReadError) -> RecvDisposition {
+///
+/// `datagram` selects UDP semantics: a datagram socket has no
+/// connection that can die, so every recv error leaves the socket
+/// usable and is ridden out (with the rate-limited warn below).
+/// mavlink 0.13 enforced this by swallowing UDP I/O errors in an
+/// internal retry loop; 0.18 surfaces them to the caller, which would
+/// otherwise turn routine events fatal — e.g. an ICMP port-unreachable
+/// from a restarting GCS/SITL peer (`WSAECONNRESET` on Windows,
+/// `ECONNREFUSED` on Linux) or a stray zero-length datagram
+/// (`UnexpectedEof` via mavlink's `PeekReader`), the latter being a
+/// remote single-packet kill switch if treated as a dead link.
+fn classify_recv_error(err: &MessageReadError, datagram: bool) -> RecvDisposition {
     match err {
         // A parse failure means a frame arrived but was garbled (CRC
         // mismatch, unknown id, bad enum). The link is still alive, so
         // skip the bad frame and keep reading.
         MessageReadError::Parse(_) => RecvDisposition::Transient,
         MessageReadError::Io(io_err) => match io_err.kind() {
+            // Routine "no data yet" on a live link — never log these, or a
+            // perfectly healthy connection warns forever (dora-rs#2034 fixed
+            // the fatal-vs-transient split; this keeps the transient path
+            // quiet on the common case).
             std::io::ErrorKind::WouldBlock
             | std::io::ErrorKind::TimedOut
-            | std::io::ErrorKind::Interrupted => RecvDisposition::Transient,
+            | std::io::ErrorKind::Interrupted => RecvDisposition::Silent,
+            // A datagram socket has no connection that can die, so any other
+            // I/O error is ridden out — but it is a genuine anomaly, so log it.
+            _ if datagram => RecvDisposition::Transient,
             _ => RecvDisposition::Fatal,
         },
     }
 }
 
+/// `deny_unknown_fields` turns a mistyped key into a hard parse error rather
+/// than silently ignoring it and falling back to the default. Without it,
+/// `systemid: 10` (missing underscore) is dropped and the node quietly runs
+/// with `system_id = 255`; a `MAVLINK_BRIDGE_CONFIG` typo would otherwise
+/// misconfigure the bridge with no diagnostic.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Config {
     endpoint: String,
     #[serde(default = "default_system_id")]
@@ -173,15 +249,16 @@ impl Config {
 /// Exits when:
 ///   * `tx` is dropped (main thread exited normally), OR
 ///   * `shutdown` is set AND `conn.recv()` returns. The flag check
-///     fires at the top of every loop iteration. mavlink-core 0.13's
+///     fires at the top of every loop iteration. mavlink-core 0.18's
 ///     **TCP** transport sets a 100 ms socket read_timeout, so each
 ///     `conn.recv()` returns `Err(WouldBlock)` within ~100 ms even on a
-///     silent peer, giving the flag a window to fire. **UDP** and
-///     **Serial** loop internally on errors (see `connection/udp.rs`
-///     and `connection/direct_serial.rs`); main wakes UDP via a
+///     silent peer, giving the flag a window to fire. **UDP** blocks in
+///     `recv_from` with no read timeout and **Serial** loops internally
+///     on non-EOF errors (see `connection/udp/sync.rs` and
+///     `connection/direct_serial/sync.rs`); main wakes UDP via a
 ///     self-loopback HEARTBEAT so the inner `recv_from` returns Ok
 ///     and we recheck the flag. Serial has no externally accessible
-///     wake path in mavlink 0.13, so it falls back to the OS-reap-on-
+///     wake path in mavlink 0.18, so it falls back to the OS-reap-on-
 ///     exit grace window in `main`, OR
 ///   * `conn.recv()` returns a **fatal** error (a dead link, e.g.
 ///     `UnexpectedEof`/`ConnectionReset`). Then it returns `Err` so
@@ -192,6 +269,7 @@ fn run_reader(
     conn: Arc<dyn MavConnection<MavMessage> + Send + Sync>,
     tx: flume::Sender<(DataId, ArrayRef)>,
     shutdown: Arc<AtomicBool>,
+    datagram: bool,
 ) -> Result<()> {
     /// Convert + queue a single decoded message; on a closed channel,
     /// short-circuit the reader by `return`-ing from the surrounding
@@ -247,7 +325,7 @@ fn run_reader(
                 if shutdown.load(Ordering::Relaxed) {
                     return Ok(());
                 }
-                match classify_recv_error(&e) {
+                match classify_recv_error(&e, datagram) {
                     RecvDisposition::Fatal => {
                         // Connection is dead. Surface the error so the
                         // node terminates and the daemon restarts it per
@@ -255,10 +333,15 @@ fn run_reader(
                         // with a link that will never recover.
                         return Err(eyre!("mavlink connection lost: {e}"));
                     }
+                    RecvDisposition::Silent => {
+                        // Routine "no data yet" (read timeout / interrupted
+                        // syscall) on a live link. Keep looping without
+                        // logging — warning here would spam a healthy link.
+                    }
                     RecvDisposition::Transient => {
-                        // "No data yet" (read timeout) or a single
-                        // corrupt frame. Keep looping quietly; rate-limit
-                        // the warn so a chatty-but-live link can't flood.
+                        // A recoverable anomaly (corrupt frame, or a datagram
+                        // I/O error). Keep looping, but log it — rate-limited
+                        // so a peer spraying garbage can't flood the logs.
                         let now = Instant::now();
                         let should_warn = last_warn
                             .is_none_or(|prev| now.duration_since(prev) >= RECV_WARN_INTERVAL);
@@ -274,15 +357,16 @@ fn run_reader(
 }
 
 /// Send a self-loopback HEARTBEAT to the bridge's own bound UDP port
-/// so mavlink-core 0.13's `UdpConnection::recv` (which loops internally
-/// on errors and never returns Err) sees a valid frame and returns
-/// `Ok`, letting `run_reader` re-check its shutdown flag and exit.
+/// so mavlink-core 0.18's `UdpConnection::recv` (which blocks in
+/// `recv_from` with no read timeout on a silent peer) sees a valid
+/// frame and returns `Ok`, letting `run_reader` re-check its shutdown
+/// flag and exit.
 ///
 /// For `udp://0.0.0.0:N` we redirect to `127.0.0.1:N` because sending
 /// to 0.0.0.0 isn't routable. Any send error is non-fatal — the grace
 /// window in `main` is the safety net.
 fn wake_udp_recv(url: &Url, system_id: u8, component_id: u8) -> std::io::Result<()> {
-    use mavlink::common::{
+    use mavlink::dialects::common::{
         HEARTBEAT_DATA, MavAutopilot, MavMessage, MavModeFlag, MavState, MavType,
     };
     use std::net::UdpSocket;
@@ -357,6 +441,9 @@ fn handle_input(
             let d: COMMAND_LONG_DATA = decode_input(data, id.as_str())?;
             MavMessage::COMMAND_LONG(d)
         }
+        // SET_MODE is deprecated upstream but kept for autopilots that
+        // don't accept MAV_CMD_DO_SET_MODE via COMMAND_LONG.
+        #[allow(deprecated)]
         "set_mode_cmd" => {
             let d: SET_MODE_DATA = decode_input(data, id.as_str())?;
             MavMessage::SET_MODE(d)
@@ -394,11 +481,16 @@ fn handle_input(
 /// that ignore the legacy request). Returns `false` only for the UDP
 /// server-mode case where `send` succeeds with 0 bytes because no client has
 /// connected yet; the caller retries until a peer appears (dora-rs/dora#2027).
+///
+/// REQUEST_DATA_STREAM is deprecated upstream (superseded by
+/// MAV_CMD_SET_MESSAGE_INTERVAL) but deliberately used here for legacy
+/// autopilots like ArduCopter 3.x.
+#[allow(deprecated)]
 fn attempt_data_stream_request(
     conn: &(dyn MavConnection<MavMessage> + Send + Sync),
     header: &MavHeader,
 ) -> bool {
-    let req = mavlink::common::REQUEST_DATA_STREAM_DATA {
+    let req = mavlink::dialects::common::REQUEST_DATA_STREAM_DATA {
         req_message_rate: 5,
         target_system: 0, // 0 = broadcast to whichever autopilot answers
         target_component: 0,
@@ -454,6 +546,8 @@ fn main() -> Result<()> {
     let conn_box = connect_with_retry(&url)?;
     let conn: Arc<dyn MavConnection<MavMessage> + Send + Sync> = Arc::from(conn_box);
 
+    // `sequence` is a placeholder: every mavlink-core transport stamps each
+    // outbound frame with its own per-connection counter, ignoring this one.
     let header = MavHeader {
         system_id: cfg.system_id,
         component_id: cfg.component_id,
@@ -481,16 +575,33 @@ fn main() -> Result<()> {
     let reader_handle = {
         let conn = Arc::clone(&conn);
         let shutdown = Arc::clone(&shutdown);
+        let datagram = url.scheme() == "udp";
         std::thread::Builder::new()
             .name("mavlink-reader".into())
-            .spawn(move || run_reader(conn, tx, shutdown))
+            .spawn(move || run_reader(conn, tx, shutdown, datagram))
             .context("spawning mavlink reader thread")?
     };
 
-    loop {
-        while let Ok((id, arr)) = rx.try_recv() {
-            node.send_output(id, MetadataParameters::default(), arr)
-                .map_err(|e| eyre!("send_output: {e}"))?;
+    // Set if a `send_output` failure ends the loop, so the reader is still
+    // shut down cleanly below but the failure is preserved as a non-zero exit
+    // status (see the end of `main`).
+    let mut send_failure: Option<eyre::Error> = None;
+    // A frame whose arrival woke the wait below; forwarded first on the next
+    // iteration, ahead of anything queued behind it.
+    let mut woken_frame = None;
+    'run: loop {
+        for (id, arr) in woken_frame.take().into_iter().chain(rx.try_iter()) {
+            if let Err(e) = node.send_output(id, MetadataParameters::default(), arr) {
+                // A `send_output` failure means the dora stream is gone (the
+                // daemon went away). Returning `?` here would skip the
+                // deliberate three-layer reader shutdown below and leak the
+                // reader thread blocked in `conn.recv()` — reaped only at
+                // process exit. Break out so we still run that shutdown, and
+                // remember the error so `main` still exits non-zero.
+                tracing::error!("send_output failed, shutting down: {e}");
+                send_failure = Some(eyre!("send_output: {e}"));
+                break 'run;
+            }
         }
 
         // If the reader thread exited on its own (a fatal transport
@@ -509,34 +620,32 @@ fn main() -> Result<()> {
             data_stream_requested = attempt_data_stream_request(conn.as_ref(), &header);
         }
 
-        let next = match events.recv_timeout(POLL_INTERVAL) {
-            Some(event) => Some(event),
-            // `recv_timeout` returns `None` for BOTH a timeout and a closed
-            // stream. Disambiguate with `try_recv`: a closed stream means the
-            // daemon went away without a `Stop` event, so exit instead of
-            // looping forever (dora-rs/dora#2027). `try_recv` also returns any
-            // event that raced in after the timeout, so none is lost.
-            None => match events.try_recv() {
-                Ok(event) => Some(event),
-                Err(TryRecvError::Closed) => break,
-                Err(TryRecvError::Empty) => None,
-            },
+        let event = match wait_for_event_or_frame(events.recv_async_timeout(POLL_INTERVAL), &rx) {
+            Wake::Frame(frame) => {
+                woken_frame = Some(frame);
+                continue;
+            }
+            // The reader exited on its own; the join below surfaces its error.
+            Wake::ReaderGone => break,
+            // The event stream closed: the daemon went away without a `Stop`
+            // event, so exit instead of looping forever (dora-rs/dora#2027).
+            Wake::Event(None) => break,
+            // A timeout surfaces as `Event::Error`, ignored below like before.
+            Wake::Event(Some(event)) => event,
         };
 
-        if let Some(event) = next {
-            match event {
-                Event::Input { id, data, .. } => {
-                    let array_ref: ArrayRef = data.into();
-                    if let Err(e) = handle_input(conn.as_ref(), &header, &id, &array_ref) {
-                        // Writer errors mean the dora node's command did NOT reach the
-                        // autopilot. Surface at error level so users debugging missions see
-                        // it in default log filters rather than treating it as routine noise.
-                        tracing::error!("writer error on input '{id}': {e:#}");
-                    }
+        match event {
+            Event::Input { id, data, .. } => {
+                let array_ref: ArrayRef = data.into();
+                if let Err(e) = handle_input(conn.as_ref(), &header, &id, &array_ref) {
+                    // Writer errors mean the dora node's command did NOT reach the
+                    // autopilot. Surface at error level so users debugging missions see
+                    // it in default log filters rather than treating it as routine noise.
+                    tracing::error!("writer error on input '{id}': {e:#}");
                 }
-                Event::Stop(_) => break,
-                _ => {}
             }
+            Event::Stop(_) => break,
+            _ => {}
         }
     }
 
@@ -549,7 +658,7 @@ fn main() -> Result<()> {
     }
 
     // Three-layer shutdown sequence — each layer covers a transport
-    // mavlink-core 0.13 leaves un-interruptible at the previous layer:
+    // mavlink-core 0.18 leaves un-interruptible at the previous layer:
     //
     //   1. Set the shutdown flag. `run_reader` checks it at the top of
     //      every loop iteration; **TCP** wakes within ~100 ms because
@@ -557,19 +666,19 @@ fn main() -> Result<()> {
     //      `recv()` returns `Err(WouldBlock)` and we revisit the flag.
     //
     //   2. Send a self-loopback HEARTBEAT for **UDP**, since
-    //      `UdpConnection::recv` loops internally on errors and never
-    //      returns Err — only a successfully parsed frame gets us back
+    //      `UdpConnection::recv` blocks in `recv_from` with no read
+    //      timeout — only an inbound packet gets us back
     //      to the flag check. The wake packet is a valid HEARTBEAT to
     //      our own bound port; the reader receives it, hits the flag,
     //      exits. Send errors are non-fatal (the grace window below
     //      catches us).
     //
     //   3. Bounded grace + detach. **Serial** has no externally usable
-    //      wake path in mavlink 0.13 (`SerialConnection`'s `SystemPort`
-    //      is private and `recv` loops internally), so on serial we
-    //      fall through to here, drop the JoinHandle, and let the OS
-    //      reap the reader thread on process exit. `dora stop` /
-    //      `--stop-after` get control back within
+    //      wake path in mavlink 0.18 (`SerialConnection`'s port handles
+    //      are private and `recv` loops internally on non-EOF errors),
+    //      so on serial we fall through to here, drop the JoinHandle,
+    //      and let the OS reap the reader thread on process exit.
+    //      `dora stop` / `--stop-after` get control back within
     //      `READER_SHUTDOWN_GRACE` regardless.
     shutdown.store(true, Ordering::Relaxed);
     if url.scheme() == "udp"
@@ -586,11 +695,11 @@ fn main() -> Result<()> {
         std::thread::sleep(READER_SHUTDOWN_POLL);
     }
 
-    if reader_handle.is_finished() {
+    let reader_result: Result<()> = if reader_handle.is_finished() {
         match reader_handle.join() {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => bail!("reader thread error: {e:#}"),
-            Err(panic) => bail!("reader thread panicked: {panic:?}"),
+            Ok(Err(e)) => Err(eyre!("reader thread error: {e:#}")),
+            Err(panic) => Err(eyre!("reader thread panicked: {panic:?}")),
         }
     } else {
         // Reader is still blocked in `conn.recv()` with no inbound
@@ -605,7 +714,22 @@ fn main() -> Result<()> {
         );
         drop(reader_handle);
         Ok(())
+    };
+
+    // A `send_output` failure is why we broke out of the loop; surface it as a
+    // non-zero exit (the behavior before the graceful-shutdown refactor, which
+    // used `?`) rather than masking it as a clean stop. It takes precedence
+    // over the reader result, but only after the reader has been shut down.
+    if let Some(e) = send_failure {
+        // The send failure is the exit reason we return, but the reader may
+        // also have errored or panicked during shutdown; log that rather than
+        // dropping `reader_result` silently when the send error takes over.
+        if let Err(reader_err) = &reader_result {
+            tracing::error!("mavlink reader also failed during shutdown: {reader_err:#}");
+        }
+        return Err(e).wrap_err("mavlink bridge exiting after send_output failure");
     }
+    reader_result
 }
 
 #[cfg(test)]
@@ -634,7 +758,7 @@ mod tests {
     }
 
     /// Silent UDP peer: no inbound traffic at all. Without the wake
-    /// path, mavlink-core 0.13's `UdpConnection::recv` loops in
+    /// path, mavlink-core 0.18's `UdpConnection::recv` blocks in
     /// `recv_from` forever. Setting the shutdown flag alone does
     /// nothing because the flag is only checked between iterations —
     /// the wake packet is what causes `recv_from` to return so
@@ -652,7 +776,7 @@ mod tests {
         let handle = std::thread::spawn({
             let conn = Arc::clone(&conn);
             let shutdown = Arc::clone(&shutdown);
-            move || run_reader(conn, tx, shutdown)
+            move || run_reader(conn, tx, shutdown, true)
         });
 
         // Let the reader thread settle into `recv_from`.
@@ -701,7 +825,7 @@ mod tests {
         let handle = std::thread::spawn({
             let conn = Arc::clone(&conn);
             let shutdown = Arc::clone(&shutdown);
-            move || run_reader(conn, tx, shutdown)
+            move || run_reader(conn, tx, shutdown, true)
         });
         std::thread::sleep(Duration::from_millis(150));
 
@@ -716,6 +840,58 @@ mod tests {
         handle.join().expect("panic").expect("err");
     }
 
+    /// Every outbound frame must carry an increasing sequence number, not a
+    /// constant 0, so receivers can detect dropped packets. The bridge sends
+    /// one fixed header and relies on mavlink-core stamping the sequence per
+    /// connection; this pins that, so a mavlink bump that stops doing it fails
+    /// here. The system/component id are preserved.
+    #[test]
+    fn transport_stamps_increasing_sequence_over_fixed_header() {
+        use mavlink::dialects::common::{
+            HEARTBEAT_DATA, MavAutopilot, MavModeFlag, MavState, MavType,
+        };
+
+        let peer = UdpSocket::bind("127.0.0.1:0").expect("bind peer");
+        peer.set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("read timeout");
+        let port = peer.local_addr().expect("local_addr").port();
+        let conn = mavlink::connect::<MavMessage>(&format!("udpout:127.0.0.1:{port}"))
+            .expect("udpout connect");
+
+        let header = MavHeader {
+            system_id: 42,
+            component_id: 7,
+            sequence: 0,
+        };
+        let hb = MavMessage::HEARTBEAT(HEARTBEAT_DATA {
+            custom_mode: 0,
+            mavtype: MavType::MAV_TYPE_GENERIC,
+            autopilot: MavAutopilot::MAV_AUTOPILOT_GENERIC,
+            base_mode: MavModeFlag::empty(),
+            system_status: MavState::MAV_STATE_UNINIT,
+            mavlink_version: 3,
+        });
+
+        let mut received = Vec::new();
+        for _ in 0..3 {
+            conn.send(&header, &hb).expect("send");
+            let mut buf = [0u8; 512];
+            let (n, _) = peer.recv_from(&mut buf).expect("recv");
+            let mut reader = mavlink::peek_reader::PeekReader::new(&buf[..n]);
+            let (h, _): (MavHeader, MavMessage) =
+                mavlink::read_v2_msg(&mut reader).expect("decode");
+            received.push(h);
+        }
+
+        let sequences: Vec<u8> = received.iter().map(|h| h.sequence).collect();
+        assert_eq!(sequences, [0, 1, 2]);
+        assert!(
+            received
+                .iter()
+                .all(|h| (h.system_id, h.component_id) == (42, 7))
+        );
+    }
+
     // ---- #2034: recv-error classification ----------------------------
     //
     // The reader must tell a transient "no data yet" read timeout apart
@@ -727,29 +903,40 @@ mod tests {
     }
 
     #[test]
-    fn would_block_is_transient() {
-        // TCP's 100 ms socket read timeout surfaces as WouldBlock; this
-        // is the normal "silent peer, no data yet" path and must NOT be
-        // treated as a dead link.
+    fn would_block_is_silent() {
+        // TCP's 100 ms socket read timeout surfaces as WouldBlock; this is the
+        // normal "silent peer, no data yet" path. It must NOT be treated as a
+        // dead link, and must NOT be logged (a healthy low-rate link produces
+        // several of these per second — warning on them spams the log).
         assert_eq!(
-            classify_recv_error(&io(std::io::ErrorKind::WouldBlock)),
-            RecvDisposition::Transient
+            classify_recv_error(&io(std::io::ErrorKind::WouldBlock), false),
+            RecvDisposition::Silent
         );
     }
 
     #[test]
-    fn timed_out_is_transient() {
+    fn timed_out_is_silent() {
         assert_eq!(
-            classify_recv_error(&io(std::io::ErrorKind::TimedOut)),
-            RecvDisposition::Transient
+            classify_recv_error(&io(std::io::ErrorKind::TimedOut), false),
+            RecvDisposition::Silent
         );
     }
 
     #[test]
-    fn interrupted_is_transient() {
+    fn interrupted_is_silent() {
         assert_eq!(
-            classify_recv_error(&io(std::io::ErrorKind::Interrupted)),
-            RecvDisposition::Transient
+            classify_recv_error(&io(std::io::ErrorKind::Interrupted), false),
+            RecvDisposition::Silent
+        );
+    }
+
+    #[test]
+    fn datagram_read_timeout_is_silent() {
+        // Even on a datagram socket, a routine read timeout is "no data yet",
+        // not an anomaly worth logging.
+        assert_eq!(
+            classify_recv_error(&io(std::io::ErrorKind::WouldBlock), true),
+            RecvDisposition::Silent
         );
     }
 
@@ -757,7 +944,8 @@ mod tests {
     fn parse_error_is_transient() {
         // A garbled frame on an otherwise-live link: skip it, keep reading.
         let err = MessageReadError::Parse(mavlink::error::ParserError::UnknownMessage { id: 9999 });
-        assert_eq!(classify_recv_error(&err), RecvDisposition::Transient);
+        assert_eq!(classify_recv_error(&err, false), RecvDisposition::Transient);
+        assert_eq!(classify_recv_error(&err, true), RecvDisposition::Transient);
     }
 
     #[test]
@@ -766,7 +954,7 @@ mod tests {
         // UnexpectedEof. This is the disconnect that previously turned
         // the reader into a logging zombie.
         assert_eq!(
-            classify_recv_error(&io(std::io::ErrorKind::UnexpectedEof)),
+            classify_recv_error(&io(std::io::ErrorKind::UnexpectedEof), false),
             RecvDisposition::Fatal
         );
     }
@@ -774,7 +962,7 @@ mod tests {
     #[test]
     fn connection_reset_is_fatal() {
         assert_eq!(
-            classify_recv_error(&io(std::io::ErrorKind::ConnectionReset)),
+            classify_recv_error(&io(std::io::ErrorKind::ConnectionReset), false),
             RecvDisposition::Fatal
         );
     }
@@ -782,9 +970,33 @@ mod tests {
     #[test]
     fn broken_pipe_is_fatal() {
         assert_eq!(
-            classify_recv_error(&io(std::io::ErrorKind::BrokenPipe)),
+            classify_recv_error(&io(std::io::ErrorKind::BrokenPipe), false),
             RecvDisposition::Fatal
         );
+    }
+
+    /// Datagram (UDP) policy: mavlink 0.18 surfaces recv errors that
+    /// 0.13 swallowed internally, but a datagram socket stays usable
+    /// through all of them, so none may kill the bridge.
+    #[test]
+    fn datagram_io_errors_are_transient() {
+        // ICMP port-unreachable from a restarting peer: WSAECONNRESET
+        // on Windows, ECONNREFUSED on Linux.
+        for kind in [
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::ConnectionRefused,
+            // A stray zero-length datagram surfaces as UnexpectedEof via
+            // mavlink's PeekReader; treating it as fatal would hand any
+            // host a single-packet remote kill switch.
+            std::io::ErrorKind::UnexpectedEof,
+            std::io::ErrorKind::BrokenPipe,
+        ] {
+            assert_eq!(
+                classify_recv_error(&io(kind), true),
+                RecvDisposition::Transient,
+                "datagram {kind:?} must not kill the bridge",
+            );
+        }
     }
 
     /// End-to-end of the fix: a real TCP peer that accepts then closes
@@ -824,7 +1036,7 @@ mod tests {
         let handle = std::thread::spawn({
             let conn = Arc::clone(&conn);
             let shutdown = Arc::clone(&shutdown);
-            move || run_reader(conn, tx, shutdown)
+            move || run_reader(conn, tx, shutdown, false)
         });
 
         // The reader must return promptly once the peer closes. The
@@ -879,7 +1091,7 @@ mod tests {
         };
         use arrow::buffer::NullBuffer;
         use arrow::datatypes::{DataType, Field};
-        use dora_mavlink2_bridge::mavlink::common::COMMAND_LONG_DATA;
+        use dora_mavlink2_bridge::mavlink::dialects::common::COMMAND_LONG_DATA;
         use std::sync::Arc;
 
         let fields = vec![
@@ -924,5 +1136,72 @@ mod tests {
             msg.contains("nullable") || msg.contains("null"),
             "error must mention null rows, got: {msg}"
         );
+    }
+
+    #[test]
+    fn config_parses_minimal_and_applies_defaults() {
+        let cfg: Config = serde_yaml::from_str("endpoint: udp://127.0.0.1:14550").unwrap();
+        assert_eq!(cfg.endpoint, "udp://127.0.0.1:14550");
+        assert_eq!(cfg.system_id, default_system_id());
+        assert_eq!(cfg.component_id, default_component_id());
+    }
+
+    #[test]
+    fn config_rejects_unknown_field() {
+        // A mistyped key (`systemid` instead of `system_id`) must be a hard
+        // error, not silently ignored — otherwise the node would run with the
+        // default system_id (255) and no diagnostic.
+        let err = serde_yaml::from_str::<Config>("endpoint: udp://127.0.0.1:14550\nsystemid: 10")
+            .expect_err("unknown config key must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("systemid") || msg.contains("unknown field"),
+            "error should name the unknown field, got: {msg}"
+        );
+    }
+
+    /// A frame the reader decodes while no dora event is arriving must wake
+    /// the main loop immediately rather than waiting for the event receive.
+    #[test]
+    fn frame_wakes_the_wait_before_the_event() {
+        let (tx, rx) = flume::bounded::<u32>(1);
+        let sender = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            tx.send(7).unwrap();
+        });
+        let wake = wait_for_event_or_frame(std::future::pending(), &rx);
+        assert!(matches!(wake, Wake::Frame(7)));
+        sender.join().unwrap();
+    }
+
+    #[test]
+    fn dora_event_wins_when_no_frame_arrives() {
+        let (_tx, rx) = flume::bounded::<u32>(1);
+        let event = async { Some(Event::Stop(dora_node_api::StopCause::Manual)) };
+        let wake = wait_for_event_or_frame(event, &rx);
+        assert!(matches!(wake, Wake::Event(Some(Event::Stop(_)))));
+    }
+
+    #[test]
+    fn closed_event_stream_is_reported() {
+        let (_tx, rx) = flume::bounded::<u32>(1);
+        let wake = wait_for_event_or_frame(async { None }, &rx);
+        assert!(matches!(wake, Wake::Event(None)));
+    }
+
+    #[test]
+    fn dropped_reader_sender_reports_reader_gone_after_the_queue_drains() {
+        let (tx, rx) = flume::bounded::<u32>(2);
+        tx.send(1).unwrap();
+        drop(tx);
+        // A frame still queued is delivered before the disconnect is reported.
+        assert!(matches!(
+            wait_for_event_or_frame(std::future::pending(), &rx),
+            Wake::Frame(1)
+        ));
+        assert!(matches!(
+            wait_for_event_or_frame(std::future::pending(), &rx),
+            Wake::ReaderGone
+        ));
     }
 }

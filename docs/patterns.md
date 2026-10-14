@@ -250,15 +250,19 @@ when using flush.
 ### Python
 
 ```python
-# Streaming metadata is a plain dict
-params = {
-    "session_id": session_id,
-    "segment_id": 1,
-    "seq": 0,
-    "fin": False,
-    "flush": True,  # flush older queued messages
-}
-node.send_output("text", data, metadata={"parameters": params})
+# `metadata` is a flat dict of parameter name -> value; there is no
+# enclosing "parameters" key.
+node.send_output(
+    "text",
+    data,
+    metadata={
+        "session_id": session_id,
+        "segment_id": 1,
+        "seq": 0,
+        "fin": False,
+        "flush": True,  # flush older queued messages
+    },
+)
 ```
 
 ## 5. Choosing a pattern
@@ -324,16 +328,101 @@ Python nodes use the same metadata conventions. Parameters are plain dicts
 with string keys:
 
 ```python
+# Service client -- `send_service_request` generates the request_id (uuid7,
+# time-ordered, matching the Rust API) and returns it to correlate on.
+request_id = node.send_service_request("request", data)
+
+# Service server -- echo the request's metadata back, which carries request_id
+node.send_service_response("response", result, metadata=event["metadata"])
+```
+
+`metadata` is a **flat** dict of parameter name -> value, the same shape
+`event["metadata"]` has on the receiving side:
+
+```python
+node.send_output("goal", data, metadata={"goal_id": goal_id})
+assert event["metadata"]["goal_id"] == goal_id
+```
+
+Wrapping it in an enclosing `{"parameters": ...}` key does not fail loudly:
+the dict is not a supported parameter type, so it is coerced to its string
+representation under a parameter literally named `parameters` (with a
+warning). The correlation key never arrives, and the peer sees no
+`request_id`/`goal_id` at all.
+
+If you need the id before sending -- or are not using the service helpers --
+set it yourself, still flat:
+
+```python
 import uuid
 
-# Service client (uuid7 for time-ordered IDs, matching Rust API)
-params = {"request_id": str(uuid.uuid7())}
-node.send_output("request", data, metadata={"parameters": params})
-
-# Service server -- pass through parameters
-node.send_output("response", result, metadata=event["metadata"])
+request_id = str(uuid.uuid7())
+node.send_output("request", data, metadata={"request_id": request_id})
 ```
 
 > **Note**: `uuid.uuid7()` requires Python 3.13+. On older versions, use the
 > `uuid_utils` package or `uuid.uuid4()` (random v4 also works for correlation,
 > but loses time-ordering).
+
+## 8. C++ compatibility
+
+The C++ node binding exposes the same primitives as the Rust API, generated
+into `dora-node-api.h` (dora-rs/dora#2686).
+
+| Rust | C++ |
+|------|-----|
+| `DoraNode::new_request_id` / `new_goal_id` | `new_request_id()` / `new_goal_id()` |
+| `DoraNode::send_service_request` | `send_service_request(...)` / `send_arrow_service_request(...)` |
+| `DoraNode::send_service_response` | `send_service_response(...)` |
+| `EventStream::recv_service_response` | `recv_service_response(...)` |
+| `EventStream::recv_action_result` | `recv_action_result(...)` |
+| `GOAL_STATUS_SUCCEEDED` / `_ABORTED` / `_CANCELED` | `goal_status_succeeded()` / `_aborted()` / `_canceled()` |
+| `PatternError` | `DoraPatternStatus` |
+
+Reading correlation keys off an incoming message needs
+`event_as_input_with_metadata` — the older `event_as_input` returns the
+payload only, which is not enough for the server side of an exchange.
+
+```cpp
+// Client: send and await the correlated reply.
+auto request = send_service_request(
+    node.send_output, "request", payload, new_metadata());
+if (!std::string(request.error).empty()) { /* send failed */ }
+
+auto reply = recv_service_response(
+    node.events, std::string(request.request_id), "server", 5000);
+switch (reply.status) {
+case DoraPatternStatus::Matched:
+    handle(event_as_input(std::move(reply.event)));
+    break;
+case DoraPatternStatus::Timeout:
+    fallback_path();
+    break;
+case DoraPatternStatus::ServerRestarted:
+    // in-flight request_id is orphaned; retry against the new instance
+    retry_with_new_instance();
+    break;
+default:
+    std::cerr << std::string(reply.error) << std::endl;
+}
+
+// Server: echo the request's metadata back so request_id survives.
+auto input = event_as_input_with_metadata(std::move(event));
+send_service_response(
+    node.send_output, "response", result, std::move(input.metadata));
+```
+
+For actions, set `goal_id` on the metadata (`metadata->set_goal_id(...)`),
+send with `send_output_with_metadata`, and wait with `recv_action_result`.
+The server tags feedback with `goal_id` only, and the terminal message with
+`goal_id` plus `goal_status`. As in Rust, feedback buffered during a
+`recv_action_result` wait is replayed by later `next_event` calls, so the
+main event loop still sees it.
+
+Both helpers return `DoraPatternResult`, whose `event` field also carries a
+matching `DoraEventType` (`Timeout` / `AllInputsClosed` / `Empty`), so code
+can branch on either `status` or the event type. A malformed
+`server_node_id` yields `DoraPatternStatus::InvalidArgument` rather
+than aborting the process.
+
+**Example**: `examples/c++-service-action/`

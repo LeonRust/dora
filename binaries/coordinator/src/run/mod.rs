@@ -29,6 +29,14 @@ pub(super) async fn spawn_dataflow(
     write_events_to: Option<PathBuf>,
 ) -> eyre::Result<SpawnedDataflow> {
     let nodes = dataflow.resolve_aliases_and_set_defaults()?;
+    // Neither the CLI nor the daemon validates a `dora start` descriptor
+    // (only `dora run` goes through `check_dataflow`), so check the timing
+    // fields here, before any daemon is contacted: the daemon feeds them to
+    // `Duration::from_secs_f64`, which panics on a negative, non-finite, or
+    // overflowing value and would take down every dataflow on that daemon.
+    for node in nodes.values() {
+        dora_core::descriptor::validate::check_node_timing_values(node)?;
+    }
     let uuid = Uuid::new_v7(Timestamp::now(NoContext));
 
     // Resolve each node to its target daemon, then group by daemon.
@@ -281,9 +289,10 @@ mod tests {
     /// `DaemonCoordinatorEvent` variant name from each incoming message,
     /// passes the variant to `reply_fn`, and resolves the pending oneshot.
     ///
-    /// Full deserialization of `Timestamped<DaemonCoordinatorEvent>` is
-    /// intentionally skipped because uhlc timestamps use u128, which does
-    /// not round-trip through `serde_json::Value`.
+    /// It also asserts that the params deserialize into a real
+    /// `Timestamped<DaemonCoordinatorEvent>`, so a malformed frame fails here
+    /// rather than being reduced to an empty variant name and silently taking
+    /// the `reply_fn` fallback branch.
     fn mock_daemon(
         reply_fn: impl Fn(&str) -> DaemonCoordinatorReply + Send + 'static,
     ) -> DaemonConnection {
@@ -296,6 +305,13 @@ mod tests {
             while let Some(msg) = rx.recv().await {
                 let v: serde_json::Value = serde_json::from_str(&msg).unwrap();
                 let id: Uuid = v["id"].as_str().unwrap().parse().unwrap();
+
+                // The whole frame must be a well-formed daemon command, not just
+                // something whose `inner` happens to have one key. This runs in
+                // the mock's task, so a failure surfaces as this panic plus the
+                // caller timing out waiting for a reply that never comes.
+                serde_json::from_value::<Timestamped<DaemonCoordinatorEvent>>(v["params"].clone())
+                    .expect("coordinator sent a malformed Timestamped<DaemonCoordinatorEvent>");
 
                 // Extract variant name from `params.inner`. The params field
                 // is embedded as raw JSON (not a string). For externally-tagged
@@ -432,13 +448,13 @@ mod tests {
                     {
                         "id": "node-a",
                         "path": "/tmp/dummy-a",
-                        "_unstable_deploy": { "machine": "aaa" },
+                        "deploy": { "machine": "aaa" },
                         "outputs": ["out"]
                     },
                     {
                         "id": "node-b",
                         "path": "/tmp/dummy-b",
-                        "_unstable_deploy": { "machine": "bbb" },
+                        "deploy": { "machine": "bbb" },
                         "inputs": { "in": "node-a/out" }
                     }
                 ]
@@ -467,6 +483,156 @@ mod tests {
         assert!(
             first_stop_received.load(std::sync::atomic::Ordering::SeqCst),
             "first daemon should have received StopDataflow for rollback"
+        );
+    }
+
+    /// A `dora start` descriptor is never run through `check_dataflow`, so
+    /// `spawn_dataflow` must reject a timing value the daemon would panic on
+    /// (`Duration::from_secs_f64`) before sending `Spawn` to any daemon.
+    #[tokio::test]
+    async fn spawn_rejects_invalid_timing_before_contacting_daemons() {
+        let clock = HLC::default();
+        for (node_field, input_field) in [
+            (r#""restart_delay": -1.0,"#, ""),
+            (r#""health_check_timeout": 1e300,"#, ""),
+            ("", r#", "input_timeout": -0.5"#),
+        ] {
+            let conn = mock_daemon(|variant| panic!("daemon must not be contacted: {variant}"));
+            let mut connections = DaemonConnections::default();
+            connections.add(DaemonId::new(None), conn);
+
+            let dataflow: Descriptor = serde_json::from_str(&format!(
+                r#"{{
+                    "nodes": [
+                        {{ "id": "src", "path": "/tmp/dummy-a", "outputs": ["out"] }},
+                        {{
+                            "id": "sink",
+                            "path": "/tmp/dummy-b",
+                            {node_field}
+                            "inputs": {{ "in": {{ "source": "src/out"{input_field} }} }}
+                        }}
+                    ]
+                }}"#
+            ))
+            .unwrap();
+
+            let err = spawn_dataflow(
+                None,
+                SessionId::generate(),
+                dataflow,
+                None,
+                &mut connections,
+                &clock,
+                false,
+                None,
+            )
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("spawn should fail for `{node_field}{input_field}`"));
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("sink"),
+                "error should name the offending node, got: {msg}"
+            );
+        }
+    }
+
+    /// Likewise an operator id the daemon would turn into an invalid `DataId`
+    /// (`DataId::from` panics) must be rejected before any daemon is contacted
+    /// (by descriptor resolution, which every coordinator path goes through).
+    #[tokio::test]
+    async fn spawn_rejects_invalid_operator_id_before_contacting_daemons() {
+        let clock = HLC::default();
+        let conn = mock_daemon(|variant| panic!("daemon must not be contacted: {variant}"));
+        let mut connections = DaemonConnections::default();
+        connections.add(DaemonId::new(None), conn);
+
+        let dataflow: Descriptor = serde_json::from_str(
+            r#"{ "nodes": [ { "id": "rt", "operators": [
+                { "id": "my op", "python": "op.py", "outputs": ["out"] }
+            ] } ] }"#,
+        )
+        .unwrap();
+
+        let err = spawn_dataflow(
+            None,
+            SessionId::generate(),
+            dataflow,
+            None,
+            &mut connections,
+            &clock,
+            false,
+            None,
+        )
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("spawn should fail for an invalid operator id"));
+        let msg = format!("{err:#}");
+        assert!(msg.contains("invalid operator id"), "got: {msg}");
+    }
+
+    /// The spawn-path check guards against the `Duration::from_secs_f64`
+    /// panic only; it must not newly reject a descriptor that `dora start`
+    /// accepts on 1.0.x. A dynamic node carrying a `startup_timeout` is the
+    /// case in point: `check_node_timing` rejects it as a descriptor-policy
+    /// matter, but the daemon ignores the value for a node it does not spawn
+    /// (`check_node_health` skips nodes with no process), so it never
+    /// panicked and must still start.
+    #[tokio::test]
+    async fn spawn_accepts_a_dynamic_node_with_a_startup_timeout() {
+        let clock = HLC::default();
+
+        let spawn_received = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let spawn_flag = spawn_received.clone();
+        let conn = mock_daemon(move |variant| match variant {
+            "Spawn" => {
+                spawn_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                DaemonCoordinatorReply::TriggerSpawnResult(Ok(()))
+            }
+            other => panic!("unexpected variant: {other}"),
+        });
+        let mut connections = DaemonConnections::default();
+        connections.add(DaemonId::new(None), conn);
+
+        let dataflow: Descriptor = serde_json::from_str(
+            r#"{
+                "nodes": [
+                    {
+                        "id": "dyn-src",
+                        "path": "dynamic",
+                        "startup_timeout": 30.0,
+                        "outputs": ["out"]
+                    },
+                    {
+                        "id": "sink",
+                        "path": "/tmp/dummy-b",
+                        "inputs": { "in": "dyn-src/out" }
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let result = spawn_dataflow(
+            None,
+            SessionId::generate(),
+            dataflow,
+            None,
+            &mut connections,
+            &clock,
+            false,
+            None,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "a dynamic node's ignored `startup_timeout` must not block `dora start`, got: {:#}",
+            result.err().unwrap()
+        );
+        assert!(
+            spawn_received.load(std::sync::atomic::Ordering::SeqCst),
+            "daemon should have been contacted with Spawn"
         );
     }
 }

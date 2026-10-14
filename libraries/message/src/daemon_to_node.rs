@@ -1,4 +1,8 @@
-use std::{net::SocketAddr, path::PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    net::SocketAddr,
+    path::PathBuf,
+};
 
 use std::sync::Arc;
 
@@ -31,6 +35,53 @@ pub struct NodeConfig {
     /// Number of times this node has been restarted. 0 on first run.
     #[serde(default)]
     pub restart_count: u32,
+    /// Per-output data-plane routing for the startup handshake, computed by the
+    /// daemon from the **actual** placement of the dataflow's nodes at spawn
+    /// time (the descriptor's `deploy` section is intent, not placement — label
+    /// scheduling can resolve differently).
+    ///
+    /// `None` means the node was spawned by an older daemon that doesn't
+    /// provide routing; the node then keeps every output on the reliable daemon
+    /// path (correct, just without the direct-zenoh fast path).
+    #[serde(default)]
+    pub output_routing: Option<BTreeMap<DataId, OutputRouting>>,
+}
+
+/// Data-plane routing for one node output — see
+/// [`NodeConfig::output_routing`].
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OutputRouting {
+    /// This output must stay on the reliable daemon path for the node's
+    /// lifetime; it gets no direct zenoh publisher. The daemon sets it when
+    /// some consumer runs under another daemon (only this node's daemon can
+    /// feed inter-daemon forwarding, dora #2738 — the direct node-to-node
+    /// zenoh mesh is same-machine only), when a remote static consumer has no
+    /// dialable endpoint or watches `input_timeout`, or when any consumer
+    /// declares `queue_policy: backpressure` (the direct zenoh ingress can
+    /// drop before the per-input policy applies). The full policy lives in
+    /// the daemon's `output_routing` module.
+    #[serde(default)]
+    pub daemon_only: bool,
+    /// The static same-daemon consumers whose startup acks the producer must
+    /// collect before switching this output from the reliable daemon path to
+    /// the direct node-to-node zenoh path. Dynamic consumers are never
+    /// required: they join at arbitrary times (or never), and nothing may wait
+    /// on them.
+    ///
+    /// The producer only collects these during a bounded startup window; an
+    /// acker that is slow to answer costs this output the fast path for the
+    /// whole run rather than upgrading it mid-stream (dora-rs/dora#2891).
+    #[serde(default)]
+    pub required_ackers: BTreeSet<RequiredAcker>,
+}
+
+/// Identity of one consumer input that must ack a producer's startup markers
+/// before the producer may switch the corresponding output to the direct zenoh
+/// path — see [`OutputRouting::required_ackers`].
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+pub struct RequiredAcker {
+    pub node_id: NodeId,
+    pub input_id: DataId,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -42,12 +93,52 @@ pub enum DaemonCommunication {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[must_use]
 #[allow(clippy::large_enum_variant)]
+#[non_exhaustive]
 pub enum DaemonReply {
     Result(Result<(), String>),
     NextEvents(Vec<Timestamped<NodeEvent>>),
-    NodeConfig { result: Result<NodeConfig, String> },
-    PinnedMemoryMetadata { metadata: Metadata },
+    NodeConfig {
+        result: Result<NodeConfig, String>,
+    },
+    /// Reply to [`DaemonRequest::ExtensionLoad`]. `None` means the key is not
+    /// in the table — either never stored, or already dropped.
+    ExtensionValue {
+        value: Option<Vec<u8>>,
+    },
     Empty,
+    /// Opaque reply to [`crate::node_to_daemon::DaemonRequest::ExtensionRequest`],
+    /// produced by the extension's daemon half. dora does not interpret it.
+    ///
+    /// Appended last so existing variants keep their postcard indices: the
+    /// Python node API ships separately (PyPI) from the daemon, so a
+    /// mixed-version pair must not misdecode older replies.
+    ExtensionReply {
+        #[serde(with = "crate::bulk_bytes::vec")]
+        payload: Vec<u8>,
+    },
+}
+
+impl DaemonReply {
+    /// Bulk bytes this reply will contribute to its encoding, for
+    /// [`crate::encode_presized`].
+    ///
+    /// `NextEvents` is a batch, so this sums the per-event hints rather than
+    /// relying on the single flat envelope allowance `encode_presized` adds:
+    /// the daemon drains up to `NODE_EVENT_CHANNEL_CAPACITY` events into one
+    /// reply, and a batch of a few dozen would otherwise realloc several times
+    /// on envelopes alone.
+    pub fn encode_size_hint(&self) -> usize {
+        match self {
+            DaemonReply::NextEvents(events) => {
+                events.iter().map(|e| e.inner.encode_size_hint()).sum()
+            }
+            // The extension value is opaque bytes handed straight back, so
+            // its own length is the whole hint.
+            DaemonReply::ExtensionValue { value } => value.as_ref().map_or(0, |bytes| bytes.len()),
+            DaemonReply::Result(_) | DaemonReply::NodeConfig { .. } | DaemonReply::Empty => 0,
+            DaemonReply::ExtensionReply { payload } => payload.len(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -86,9 +177,9 @@ pub enum NodeEvent {
     /// Sent when `dora param set` changes a parameter for this node.
     ///
     /// `value_json` carries JSON-encoded bytes rather than `serde_json::Value`:
-    /// this message is serialized with bincode on the daemon↔node TCP channel,
+    /// this message is serialized with postcard on the daemon↔node TCP channel,
     /// and `serde_json::Value::deserialize` uses `deserialize_any`, which
-    /// bincode does not support.
+    /// postcard (like any non-self-describing format) does not support.
     ParamUpdate {
         key: String,
         value_json: Vec<u8>,
@@ -108,4 +199,86 @@ pub enum NodeEvent {
         error: String,
         source_node_id: NodeId,
     },
+    /// An extension key this node stored or loaded has been dropped, by
+    /// another node or by the daemon reclaiming it.
+    ///
+    /// Delivered out of band: the event stream consumes it rather than
+    /// surfacing it to user code, so a language binding polls
+    /// `drain_dropped_extension_keys()` instead.
+    ExtensionDropped {
+        namespace: String,
+        key: String,
+    },
+}
+
+impl NodeEvent {
+    /// Bulk bytes this event will contribute to the encoding of the
+    /// [`DaemonReply`] that wraps it.
+    ///
+    /// Includes a flat per-event allowance for the `Timestamped` wrapper,
+    /// `Metadata` and ids, because these are batched: see
+    /// [`DaemonReply::encode_size_hint`].
+    pub fn encode_size_hint(&self) -> usize {
+        /// Measured at ~72 bytes for a typical `Input` (timestamp 25 +
+        /// `Metadata` 27 + tags and ids); rounded up so a batch of small events
+        /// still lands in one allocation.
+        const PER_EVENT_ENVELOPE: usize = 128;
+
+        let payload = match self {
+            NodeEvent::Input { data, .. } => data.as_ref().map_or(0, |d| d.len()),
+            NodeEvent::Stop
+            | NodeEvent::Reload { .. }
+            | NodeEvent::InputClosed { .. }
+            | NodeEvent::InputRecovered { .. }
+            | NodeEvent::NodeRestarted { .. }
+            | NodeEvent::AllInputsClosed
+            | NodeEvent::ParamDeleted { .. } => 0,
+            // Payload-carrying variants: count the variable-length field so the
+            // pre-sized buffer does not realloc on encode (matches the sibling
+            // `DaemonRequest::encode_size_hint`, which counts its own payloads).
+            NodeEvent::ParamUpdate { value_json, .. } => value_json.len(),
+            NodeEvent::NodeFailed { error, .. } => error.len(),
+            NodeEvent::ExtensionDropped { namespace, key } => namespace.len() + key.len(),
+        };
+        payload.saturating_add(PER_EVENT_ENVELOPE)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_size_hint_counts_param_update_payload() {
+        let value_json = vec![0u8; 10_000];
+        let event = NodeEvent::ParamUpdate {
+            key: "some_param".to_string(),
+            value_json: value_json.clone(),
+        };
+        // The hint feeds `encode_presized`, so it must cover the payload or the
+        // pre-sized buffer reallocates while encoding — the exact cost the hint
+        // exists to avoid. Before the fix, ParamUpdate reported a flat envelope.
+        assert!(
+            event.encode_size_hint() >= value_json.len(),
+            "ParamUpdate hint ({}) must include its {}-byte value_json",
+            event.encode_size_hint(),
+            value_json.len()
+        );
+    }
+
+    #[test]
+    fn encode_size_hint_counts_node_failed_error() {
+        let error = "e".repeat(4096);
+        let event = NodeEvent::NodeFailed {
+            affected_input_ids: Vec::new(),
+            error: error.clone(),
+            source_node_id: NodeId::from("upstream".to_string()),
+        };
+        assert!(
+            event.encode_size_hint() >= error.len(),
+            "NodeFailed hint ({}) must include its {}-byte error string",
+            event.encode_size_hint(),
+            error.len()
+        );
+    }
 }

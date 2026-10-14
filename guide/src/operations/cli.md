@@ -35,6 +35,12 @@ dora new my-robot --kind dataflow --lang rust
 # Run locally (no coordinator/daemon needed)
 dora run dataflow.yml
 
+# Exit as soon as every node has finished. Without this, a dataflow in
+# which any node consumes a `dora/timer/...` input never ends on its
+# own: a timer input has no upstream node, so it never closes, and the
+# node consuming it is never told its inputs are done.
+dora run dataflow.yml --exit-when-nodes-finish
+
 # Or use coordinator/daemon for production
 dora up
 dora start dataflow.yml --attach
@@ -176,14 +182,14 @@ nodes:
     send_stdout_as: raw_output    # route raw stdout as data output
     send_logs_as: log_entries     # route structured logs as data output
     max_log_size: "50MB"          # rotate log files at this size
-    max_rotated_files: 5          # number of rotated files to keep (1-100)
+    max_rotated_files: 5          # number of rotated files to keep (0-100)
 
     # --- Deployment ---
-    _unstable_deploy:
+    deploy:
       machine: A                  # target machine/daemon ID
 
 # Debug settings
-_unstable_debug:
+debug:
   enable_debug_inspection: true   # required for topic echo/hz/info
 ```
 
@@ -214,7 +220,8 @@ nodes:
       outputs:
         - bbox
 
-  # Multiple operators sharing a runtime
+  # List form with an explicit operator id (a runtime node holds exactly
+  # one operator; outputs are referenced as runtime-node/preprocessor/<output>)
   - id: runtime-node
     operators:
       - id: preprocessor
@@ -223,29 +230,23 @@ nodes:
           raw: sensor/data
         outputs:
           - processed
-      - id: analyzer
-        shared-library: ../../target/debug/libanalyze
-        inputs:
-          data: runtime-node/preprocessor/processed
-        outputs:
-          - result
 ```
 
 ### Distributed Deployment
 
-Assign nodes to specific machines using `_unstable_deploy`:
+Assign nodes to specific machines using `deploy`:
 
 ```yaml
 nodes:
   - id: camera-driver
-    _unstable_deploy:
+    deploy:
       machine: robot-arm
     path: ./target/debug/camera
     outputs:
       - frames
 
   - id: ml-inference
-    _unstable_deploy:
+    deploy:
       machine: gpu-server
     path: ./target/debug/inference
     inputs:
@@ -285,8 +286,9 @@ dora run <PATH> [OPTIONS]
 | `--uv` | false | Use `uv` for Python node management |
 | `--debug` | false | Enable debug topics (equivalent to `enable_debug_inspection: true`) |
 | `--allow-shell-nodes` | false | Enable shell-based node execution |
+| `--exit-when-nodes-finish[=BOOL]` | descriptor | Exit once all nodes finish, treating `dora/timer/...` inputs as a clock rather than as work. Overrides `exit_when_nodes_finish:` in the YAML; omit it and the YAML decides |
 | `--log-level <LEVEL>` | `stdout` | Min display level: `error\|warn\|info\|debug\|trace\|stdout` |
-| `--log-format <FORMAT>` | `pretty` | Output format: `pretty\|json\|compact` |
+| `--log-format <FORMAT>` | `pretty` | Output format: `pretty\|json\|compact`; `json` emits JSON Lines (one object per log message) |
 | `--log-filter <FILTER>` | | Per-node level overrides: `"node1=debug,node2=warn"` |
 | `--locked` | false | Use pinned git source commits from a build lockfile |
 | `--write-lockfile` | false | Write resolved git source commits to a lockfile during pre-run build |
@@ -317,9 +319,19 @@ Start coordinator and daemon in local mode.
 
 ```
 dora up
+dora up --recreate-store
 ```
 
 Spawns `dora coordinator` and `dora daemon` as background processes. Waits for both to be ready before returning. Idempotent: if already running, does nothing.
+
+| Flag | Description |
+|------|-------------|
+| `--auth` | Enable token authentication for the coordinator |
+| `--recreate-store` | Archive `~/.dora/coordinator.redb` and start with a fresh persistent store |
+
+If the coordinator cannot start, `dora up` reports its startup error directly. After an upgrade reports an incompatible redb schema, rerun with `--recreate-store`. The old store is preserved alongside the new one as `coordinator.redb.backup` (or a numbered variant).
+
+The spawned coordinator's stderr is captured to `~/.dora/coordinator-stderr.log` (truncated on each `dora up`) so post-startup errors stay inspectable. `--recreate-store` only operates on the local default store: it is refused when `DORA_COORDINATOR_ADDR` points at a non-loopback address, skipped (with a notice) when a coordinator is already running, and aborted when a process is listening on the coordinator port but the connection fails (e.g. an auth token mismatch) — so a live coordinator's store is never archived out from under it.
 
 #### `dora down` (alias: `dora destroy`)
 
@@ -331,8 +343,40 @@ dora down [OPTIONS]
 
 | Flag | Default | Description |
 |------|---------|-------------|
+| `--force` | false | Tear down even if the coordinator has running dataflows, terminating them immediately first |
 | `--coordinator-addr <IP>` | `127.0.0.1` | Coordinator address |
 | `--coordinator-port <PORT>` | `6013` | Coordinator port |
+
+> **This is machine-wide, not project-wide.** `dora down` has no notion of
+> "your" dataflow or checkout: it connects to whatever coordinator owns the
+> port and destroys it, along with its daemons and every dataflow running on
+> it. Two checkouts on one machine share `127.0.0.1:6013` by default, so a
+> `dora down` in one silently kills the other's work — indistinguishable from
+> a coordinator crash on the victim's side.
+>
+> Since [#2924] the command refuses when the target reports running
+> dataflows, listing them. `--force` proceeds, stopping each dataflow
+> first.
+>
+> Teardown does not leave nodes behind. Each daemon waits out the stop
+> grace period and kills whatever is still running before it exits, so a
+> node that ignores the cooperative stop is terminated rather than
+> orphaned ([#2980]). A wedged node therefore makes `dora down` take up
+> to the grace period; well-behaved ones exit immediately and cost
+> nothing.
+>
+> **To run instances side by side, give each its own port** — that is the
+> isolation mechanism, and every lifecycle command (`up`, `down`, `start`,
+> `stop`, `list`, `logs`) follows it:
+>
+> ```bash
+> DORA_COORDINATOR_PORT=6113 dora up
+> DORA_COORDINATOR_PORT=6113 dora start flow.yml
+> DORA_COORDINATOR_PORT=6113 dora down     # touches only this instance
+> ```
+
+[#2924]: https://github.com/dora-rs/dora/issues/2924
+[#2980]: https://github.com/dora-rs/dora/issues/2980
 
 #### `dora build`
 
@@ -351,7 +395,7 @@ dora build <PATH> [OPTIONS]
 
 **Type checking:** After expanding modules, `build` runs the same type checks as `validate`. Warnings are printed by default; use `--strict-types` (or set `strict_types: true` in the YAML) to fail the build on type mismatches. User-defined types in a `types/` directory next to the dataflow are loaded automatically.
 
-**Build strategy:** If nodes have `_unstable_deploy` sections and a coordinator is reachable, builds are distributed to target machines. Otherwise, builds run locally.
+**Build strategy:** If nodes have `deploy` sections and a coordinator is reachable, builds are distributed to target machines. Otherwise, builds run locally.
 
 **Git sources:** Nodes with a `git:` field are cloned/updated before building. The build command runs from the git repository root.
 
@@ -380,6 +424,7 @@ dora start <PATH> [OPTIONS]
 | `--debug` | false | Enable debug topics (equivalent to `enable_debug_inspection: true`) |
 | `--hot-reload` | false | Watch Python files and reload on change |
 | `--uv` | false | Use `uv` for Python nodes |
+| `--exit-when-nodes-finish[=BOOL]` | descriptor | Finish once all nodes have, treating `dora/timer/...` inputs as a clock rather than as work. Overrides `exit_when_nodes_finish:` in the YAML; omit it and the YAML decides |
 | `--coordinator-addr <IP>` | `127.0.0.1` | Coordinator address |
 | `--coordinator-port <PORT>` | `6013` | Coordinator port |
 
@@ -460,8 +505,15 @@ dora record <DATAFLOW_YAML> [OPTIONS]
 | `--topics <TOPICS>` | all | Comma-separated `node/output` topics to record |
 | `--proxy` | false | Stream via WebSocket instead of recording on target |
 | `--output-yaml <PATH>` | | Write modified YAML without running (dry run) |
+| `--queue-size <N>` | `100` | Per-topic queue depth for the injected record node |
 
 Default mode injects a record node into the dataflow. `--proxy` mode requires a running dataflow and `enable_debug_inspection: true`.
+
+**Recording completeness.** The injected record node writes to disk, so a producer burst or a stalled write can outrun it, and the messages it could not take are dropped before the writer sees them. `--queue-size` is how much slack each recorded topic gets; the depth also sizes the node's zenoh ingress channel, which is what zero-copy payloads (>=4 KB) actually overflow. Raise it to ride out longer stalls, at the cost of the memory the buffered payloads hold -- peak resident is roughly `2 x queue_size x payload size` per topic (the per-input scheduler queue and the shared ingress channel can each hold a full depth), which is a lot for video frames. For payloads at or above the zero-copy threshold, a buffered message also pins its shared-memory region: once a stalled recorder holds more than the producer's pool (`DORA_NODE_SHM_POOL_SIZE`, 8 MiB by default) can spare, that producer falls back to heap copies for all its consumers.
+
+Dropped messages are reported per topic when the run ends, and the summary says `INCOMPLETE`, so a short `.drec` is not mistaken for a whole one. A long capture also warns on stderr the first time it drops something. A clean run reports "no dropped messages detected" rather than "complete": producers publish with `CongestionControl::Drop`, so a message discarded in zenoh's egress never reaches the recorder's counters, and zero drops means nothing was lost on any path the recorder can see.
+
+The record node deliberately does *not* set `queue_policy: backpressure` on its inputs. That policy pins the producer's entire output to the daemon path for **every** consumer, so recording a dataflow would move its traffic off the zero-copy path and change what is being measured -- and it is not lossless anyway (it drops at `10x queue_size`). A recorder must not perturb the system it observes.
 
 #### `dora replay`
 
@@ -493,7 +545,7 @@ dora list [OPTIONS]
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--format <FMT>`, `-f` | `table` | Output format: `table\|json` |
+| `--format <FMT>`, `-f` | `table` | Output format: `table\|json`. JSON output uses JSON Lines (one object per line) |
 | `--status <STATUS>` | | Filter: `running\|finished\|failed` |
 | `--name <PATTERN>` | | Filter by name (case-insensitive substring) |
 | `--sort-by <FIELD>` | | Sort by: `cpu\|memory` |
@@ -513,7 +565,7 @@ dora clean [OPTIONS]
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--format <FMT>`, `-f` | `table` | Output format: `table\|json` |
+| `--format <FMT>`, `-f` | `table` | Output format: `table\|json`. JSON output uses JSON Lines (one object per line); each failure is also one JSON object line on stderr, followed by a plain-text error summary (exit code is non-zero) |
 | `--quiet`, `-q` | false | Print only cleaned UUIDs |
 | `--coordinator-addr <IP>` | `127.0.0.1` | Coordinator address |
 | `--coordinator-port <PORT>` | `6013` | Coordinator port |
@@ -547,7 +599,7 @@ Node selection is via the `--node <NAME>` flag (not positional, as of #1883).
 | `--since <DURATION>` | | Show logs newer than duration ago |
 | `--until <DURATION>` | | Show logs older than duration ago |
 | `--level <LEVEL>` | `stdout` | Min log level |
-| `--log-format <FORMAT>` | `pretty` | Output format |
+| `--log-format <FORMAT>` | `pretty` | Output format: `pretty\|json\|compact`; `json` emits JSON Lines (one object per log message) |
 | `--log-filter <FILTER>` | | Per-node level overrides |
 | `--grep <PATTERN>` | | Case-insensitive text search |
 | `--coordinator-addr <IP>` | `127.0.0.1` | Coordinator address |
@@ -631,7 +683,7 @@ dora topic list [OPTIONS]
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-d <DATAFLOW>`, `--dataflow` | interactive | Dataflow UUID or name |
-| `--format <FMT>` | `table` | Output format: `table\|json` |
+| `--format <FMT>` | `table` | Output format: `table\|json`. JSON output uses JSON Lines (one object per line) |
 
 #### `dora topic echo`
 
@@ -645,9 +697,9 @@ dora topic echo [OPTIONS] [DATA...]
 |------|---------|-------------|
 | `-d <DATAFLOW>`, `--dataflow` | required | Dataflow UUID or name |
 | `[DATA...]` | all outputs | Topics to echo (e.g., `node1/output`) |
-| `--format <FMT>` | `table` | Output format: `table\|json` |
+| `--format <FMT>` | `table` | Output format: `table\|json`. JSON output uses JSON Lines (one object per decoded message); diagnostics go to stderr |
 
-Requires `_unstable_debug.enable_debug_inspection: true` in the descriptor.
+Requires `debug.enable_debug_inspection: true` in the descriptor.
 
 #### `dora topic hz`
 
@@ -695,6 +747,12 @@ Lists nodes in a running dataflow with their status, CPU, memory, and restart co
 
 **Columns:** NODE, STATUS, PID, CPU%, MEMORY (MB), RESTARTS, DATAFLOW
 
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-d <DATAFLOW>`, `--dataflow` | all dataflows | Dataflow UUID or name |
+| `-f <FORMAT>`, `--format` | `table` | Output format: `table\|json`. JSON output uses JSON Lines (one object per line); all fields are formatted strings, and the `dataflow` field is omitted when `-d` is given |
+| `-q`, `--quiet` | | Print only node IDs, one per line (conflicts with `--format`) |
+
 ##### `dora node info`
 
 Show detailed information about a specific node including status, inputs, outputs, and metrics.
@@ -707,7 +765,7 @@ dora node info <NODE> [OPTIONS]
 |------|---------|-------------|
 | `<NODE>` | required | Node ID to inspect |
 | `-d <DATAFLOW>`, `--dataflow` | interactive | Dataflow UUID or name |
-| `-f <FORMAT>`, `--format` | `table` | Output format: `table\|json` |
+| `-f <FORMAT>`, `--format` | `table` | Output format: `table\|json`. JSON output is a single pretty-printed document |
 
 ##### `dora node restart`
 
@@ -779,7 +837,7 @@ dora param list <NODE> [OPTIONS]
 |------|---------|-------------|
 | `<NODE>` | required | Node ID |
 | `-d <DATAFLOW>`, `--dataflow` | interactive | Dataflow UUID or name |
-| `--format <FMT>` | `table` | Output format: `table\|json` |
+| `--format <FMT>` | `table` | Output format: `table\|json`. JSON output is a single pretty-printed document |
 
 ##### `dora param get`
 
@@ -936,6 +994,11 @@ dora status [OPTIONS]
 ```
 
 Reports coordinator connectivity, daemon status, and active dataflow count.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-f <FORMAT>`, `--format` | `table` | Output format: `table\|json`. JSON output is a single pretty-printed document, printed even when checks fail (failure detail goes to stderr; exit code is non-zero) |
+| `--dataflow <PATH>` | | Descriptor file to enable additional checks |
 
 #### `dora new`
 
@@ -1105,7 +1168,7 @@ All environment variables serve as fallbacks. CLI flags always take precedence.
 | Variable | Default | Commands | Description |
 |----------|---------|----------|-------------|
 | `DORA_COORDINATOR_ADDR` | `127.0.0.1` | All coordinator commands | Coordinator IP address |
-| `DORA_COORDINATOR_PORT` | `6013` | All coordinator commands | Coordinator WebSocket port |
+| `DORA_COORDINATOR_PORT` | `6013` | All coordinator commands | Coordinator WebSocket port. **This is how you isolate concurrent dora instances on one machine** — commands act on whichever coordinator owns the port, so two checkouts sharing the default will `down`/`stop` each other's dataflows |
 | `DORA_LOG_LEVEL` | `stdout` | `run`, `logs` | Default minimum log level |
 | `DORA_LOG_FORMAT` | `pretty` | `run`, `logs` | Default output format |
 | `DORA_LOG_FILTER` | | `run`, `logs` | Default per-node level overrides |
@@ -1250,7 +1313,7 @@ All inter-component messages are defined in `libraries/message/`:
 
 ```rust
 // Node identification
-struct NodeId(String);      // [a-zA-Z0-9_.-]
+struct NodeId(String);      // [a-zA-Z0-9_.-], no leading `.`, not `dora`
 struct DataId(String);      // same validation
 type DataflowId = uuid::Uuid;
 
@@ -1476,14 +1539,14 @@ class Operator:
 ### Setup
 
 ```bash
-# Machine A (coordinator + daemon)
-dora up
+# Machine A (coordinator + daemon, listening on the LAN address so B and C can reach it)
+dora up --interface 192.168.1.10
 
-# Machine B (daemon only, pointing to coordinator on Machine A)
-dora daemon --interface 0.0.0.0 --coordinator-addr 192.168.1.10 --machine-id B
+# Machine B (daemon only; runs the `robot` nodes — camera + actuator)
+dora daemon --coordinator-addr 192.168.1.10 --machine-id robot
 
-# Machine C (same)
-dora daemon --interface 0.0.0.0 --coordinator-addr 192.168.1.10 --machine-id C
+# Machine C (daemon only; runs the `gpu-server` node — inference)
+dora daemon --coordinator-addr 192.168.1.10 --machine-id gpu-server
 ```
 
 ### Dataflow with Machine Assignment
@@ -1491,14 +1554,14 @@ dora daemon --interface 0.0.0.0 --coordinator-addr 192.168.1.10 --machine-id C
 ```yaml
 nodes:
   - id: camera
-    _unstable_deploy:
+    deploy:
       machine: robot
     path: ./camera-driver
     outputs:
       - frames
 
   - id: inference
-    _unstable_deploy:
+    deploy:
       machine: gpu-server
     path: ./ml-model
     inputs:
@@ -1507,7 +1570,7 @@ nodes:
       - predictions
 
   - id: actuator
-    _unstable_deploy:
+    deploy:
       machine: robot
     path: ./actuator-driver
     inputs:
@@ -1517,6 +1580,10 @@ nodes:
 ### Build and Start
 
 ```bash
+# Point the CLI at the coordinator (otherwise it connects to 127.0.0.1 and
+# fails once the coordinator is bound to the LAN address with --interface)
+export DORA_COORDINATOR_ADDR=192.168.1.10
+
 # From any machine with coordinator access
 dora build dataflow.yml       # distributed build on target machines
 dora start dataflow.yml --name my-robot --attach
@@ -1563,7 +1630,7 @@ State is persisted to `~/.dora/coordinator.redb`. On restart, stale dataflows ar
 - Use `--debug` flag: `dora start dataflow.yml --debug` or `dora run dataflow.yml --debug`
 - Or add to your dataflow YAML:
   ```yaml
-  _unstable_debug:
+  debug:
     enable_debug_inspection: true
   ```
 - Required for `topic echo`, `topic hz`, `topic info`

@@ -30,7 +30,21 @@ pub fn datetime_module<'py>(py: Python<'py>) -> PyResult<&'py Bound<'py, PyModul
 
 /// Dora Event
 pub struct PyEvent {
-    pub event: MergedEvent<Py<PyAny>>,
+    pub event: MergedEvent<ExternalEvent>,
+}
+
+/// An event from an external source that was merged into a node's event loop
+/// (e.g. a ROS2 subscription via `Node.merge_external_events`).
+///
+/// Several external sources can be merged into the same node, so each event
+/// carries the `id` its source was merged under. It is surfaced to Python as
+/// the event dict's `"id"` key (dora-rs/dora#2801).
+pub struct ExternalEvent {
+    /// Identifies the merged source the event came from.
+    pub id: Arc<str>,
+    /// The external payload (e.g. a `pyarrow` array), or the exception object
+    /// if reading the external message failed.
+    pub value: Py<PyAny>,
 }
 
 /// Keeps the dora node alive until all event objects have been dropped.
@@ -152,7 +166,8 @@ impl PyEvent {
                 }
             }
             MergedEvent::External(event) => {
-                pydict.insert("value", event.clone_ref(py));
+                pydict.insert("id", PyString::new(py, &event.id).into_any().unbind());
+                pydict.insert("value", event.value.clone_ref(py));
             }
         }
 
@@ -210,7 +225,7 @@ impl PyEvent {
                 // creates an FFI_ArrowArray with a release callback. PyArrow's
                 // _import_from_c takes ownership and calls release when the Python
                 // object is GC'd, which drops the cloned Arcs. No leak.
-                let array_data = data.to_data().to_pyarrow(py)?.unbind();
+                let array_data = data.as_array().to_data().to_pyarrow(py)?.unbind();
                 Ok(Some(array_data))
             }
             MergedEvent::Dora(Event::ParamUpdate { value, .. }) => {
@@ -291,7 +306,7 @@ pub fn pydict_to_metadata(dict: Option<Bound<'_, PyDict>>) -> Result<MetadataPar
             {
                 let list: Vec<f64> = value.extract()?;
                 parameters.insert(key, Parameter::ListFloat(list))
-            } else if value.is_instance_of::<PyList>()
+            } else if (value.is_instance_of::<PyTuple>() || value.is_instance_of::<PyList>())
                 && value.len()? > 0
                 && value.get_item(0)?.is_exact_instance_of::<PyString>()
             {
@@ -429,7 +444,7 @@ pub fn metadata_to_pydict<'a>(
 
 #[cfg(test)]
 mod tests {
-    use std::{ptr::NonNull, sync::Arc};
+    use std::sync::Arc;
 
     use aligned_vec::{AVec, ConstAlign};
     use arrow::{
@@ -441,28 +456,25 @@ mod tests {
     };
 
     use arrow_schema::{DataType, Field};
-    use dora_node_api::arrow_utils::{
-        buffer_into_arrow_array, copy_array_into_sample, required_data_size,
-    };
+    use dora_node_api::DoraArray;
+    use dora_node_api::arrow_utils::{IpcPayload, decode_arrow_ipc_zero_copy, encode_arrow_ipc};
     use eyre::{Context, Result};
 
     fn assert_roundtrip(arrow_array: &ArrayData) -> Result<()> {
-        let size = required_data_size(arrow_array);
-        let mut sample: AVec<u8, ConstAlign<128>> = AVec::__from_elem(128, 0, size);
+        // The data plane is Arrow-IPC-only: encode to a self-describing IPC
+        // stream, then decode it back from a 128-byte-aligned buffer (as the
+        // receive path does).
+        let payload = DoraArray::from_array(arrow::array::make_array(arrow_array.clone()));
+        let ipc_bytes = encode_arrow_ipc(&payload)?;
+        let sample: AVec<u8, ConstAlign<128>> = AVec::from_slice(128, &ipc_bytes);
 
-        let info = copy_array_into_sample(&mut sample, arrow_array);
+        let serialized_deserialized_arrow_array =
+            decode_arrow_ipc_zero_copy(IpcPayload::from_aligned_vec(sample))?;
 
-        let serialized_deserialized_arrow_array = {
-            let ptr = NonNull::new(sample.as_ptr() as *mut _).unwrap();
-            let len = sample.len();
-
-            let raw_buffer = unsafe {
-                arrow::buffer::Buffer::from_custom_allocation(ptr, len, Arc::new(sample))
-            };
-            buffer_into_arrow_array(&raw_buffer, &info)?
-        };
-
-        assert_eq!(arrow_array, &serialized_deserialized_arrow_array);
+        assert_eq!(
+            arrow_array,
+            &serialized_deserialized_arrow_array.as_array().to_data()
+        );
 
         Ok(())
     }

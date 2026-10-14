@@ -12,6 +12,19 @@ use crate::descriptor;
 pub use crate::id::{DataId, NodeId, OperatorId};
 
 /// Filter for the `dora/logs` virtual input.
+///
+/// The wire form parsed by [`FromStr`] / rendered by [`Display`](fmt::Display)
+/// is `dora/logs/{level}/{node}`, so a `node_filter` can only be expressed
+/// together with a `min_level`. Parsing therefore never produces a filter with
+/// `node_filter: Some(_)` while `min_level` is `None`. That combination is still
+/// constructible directly (both fields are public); when it is rendered, the
+/// `stdout` level is emitted to keep the node restriction — see the
+/// [`Display`](fmt::Display) impl of [`InputMapping`]. A `Stdout` minimum is the
+/// most permissive level filter ([`LogLevelOrStdout::passes`](crate::common::LogLevelOrStdout::passes)
+/// lets every message through it), so it delivers the same messages as `None`
+/// (all levels, including stdout); such a value round-trips to
+/// `{ min_level: Some(stdout), node_filter }`, which is behaviorally equivalent
+/// to the original rather than exactly equal to it.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, JsonSchema)]
 pub struct LogSubscriptionFilter {
     /// Minimum log level to receive. `None` means all levels (including stdout).
@@ -38,18 +51,43 @@ pub enum QueuePolicy {
 impl QueuePolicy {
     /// Returns the effective capacity for a given configured queue size.
     ///
-    /// - `DropOldest`: returns `queue_size` as-is.
+    /// - `DropOldest`: returns `queue_size`, but never less than 1.
     /// - `Backpressure`: returns `10 * queue_size` (min 100) as a hard safety cap.
+    ///
+    /// A `DropOldest` cap of 0 would drop 100% of the input's events — the
+    /// runtime operator channel sets the just-queued event to `None` on every
+    /// `add_event`, so the operator never receives a single message and the
+    /// dataflow silently hangs. Clamp `queue_size: 0` to 1 (latest-only)
+    /// instead of turning the input into a dead port.
+    ///
+    /// ```
+    /// use dora_message::config::QueuePolicy;
+    ///
+    /// // DropOldest keeps `queue_size`, but never a dead 0-capacity port.
+    /// assert_eq!(QueuePolicy::DropOldest.effective_cap(5), 5);
+    /// assert_eq!(QueuePolicy::DropOldest.effective_cap(0), 1);
+    ///
+    /// // Backpressure buffers 10x the configured size, with a floor of 100.
+    /// assert_eq!(QueuePolicy::Backpressure.effective_cap(5), 100);
+    /// assert_eq!(QueuePolicy::Backpressure.effective_cap(50), 500);
+    /// ```
     pub fn effective_cap(&self, queue_size: usize) -> usize {
         match self {
-            Self::DropOldest => queue_size,
+            Self::DropOldest => queue_size.max(1),
             Self::Backpressure => queue_size.saturating_mul(10).max(100),
         }
     }
 }
 
 /// Contains the input and output configuration of the node.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+// Same rationale as `descriptor::Node`: these six fields are `#[serde(flatten)]`
+// into `CustomNode`, and `Node` declares the same six keys directly, so they
+// are top-level per-node YAML keys and a seventh I/O key must stay a minor
+// release. Marking this later would itself be the major change, so it cannot
+// wait for the conversion to be convenient. Construct with
+// `NodeRunConfig::default()`; the fields remain `pub`.
+#[non_exhaustive]
 pub struct NodeRunConfig {
     /// Inputs for the nodes as a map from input ID to `node_id/output_id`.
     ///
@@ -94,12 +132,26 @@ pub struct NodeRunConfig {
     pub shared_memory_pool_size: Option<ByteSize>,
 }
 
+/// A single input subscription of a node, as declared under `inputs:` in a
+/// dataflow descriptor.
+///
+/// In YAML an input is written either as a bare mapping string
+/// (`source_node/output`) or as a mapping plus per-input options; both forms
+/// deserialize into this struct (see [`InputDef`]).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(from = "InputDef", into = "InputDef")]
 pub struct Input {
+    /// What this input subscribes to (another node's output, a timer, or the
+    /// dataflow log stream).
     pub mapping: InputMapping,
+    /// Maximum number of buffered messages for this input. `None` uses
+    /// [`DEFAULT_QUEUE_SIZE`].
     pub queue_size: Option<usize>,
+    /// Deadline, in seconds, after which the input is considered stalled if no
+    /// message arrives. `None` disables the deadline.
     pub input_timeout: Option<f64>,
+    /// Policy applied when `queue_size` is exceeded. `None` uses the default
+    /// [`QueuePolicy`].
     pub queue_policy: Option<QueuePolicy>,
 }
 
@@ -196,16 +248,68 @@ impl From<InputDef> for Input {
     }
 }
 
+/// The source an [`Input`] subscribes to.
+///
+/// The wire form is a `/`-separated string; [`FromStr`] parses it and
+/// [`fmt::Display`] renders it back, so the two round-trip:
+///
+/// ```
+/// use dora_message::config::InputMapping;
+///
+/// let mapping: InputMapping = "camera/image".parse().unwrap();
+/// assert!(matches!(mapping, InputMapping::User(_)));
+/// assert_eq!(mapping.to_string(), "camera/image");
+///
+/// // Built-in timer source.
+/// let timer: InputMapping = "dora/timer/millis/100".parse().unwrap();
+/// assert_eq!(timer.to_string(), "dora/timer/millis/100");
+///
+/// // A mapping without a `/` separator is rejected.
+/// assert!("no-slash".parse::<InputMapping>().is_err());
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, JsonSchema)]
+#[schemars(transform = accept_input_mapping_string)]
 pub enum InputMapping {
+    /// A built-in timer that fires at a fixed `interval`.
+    ///
+    /// Syntax: `dora/timer/{unit}/{value}`, e.g. `dora/timer/millis/100`.
     Timer {
+        /// How often the timer fires.
         interval: Duration,
     },
     /// Subscribe to log messages from all (or filtered) nodes in the dataflow.
     ///
     /// Syntax: `dora/logs`, `dora/logs/{level}`, `dora/logs/{level}/{node_id}`
     Logs(LogSubscriptionFilter),
+    /// Subscribe to another node's output — the common case.
     User(UserInputMapping),
+}
+
+/// Adds the `/`-separated string to `InputMapping`'s JSON schema.
+///
+/// The derive describes the enum's shape, but the `Serialize`/`Deserialize`
+/// impls go through [`fmt::Display`]/[`FromStr`], so a dataflow only ever
+/// contains the string form. Without it the published schema rejects every
+/// input (#3701). The derived object alternatives stay: the dataflow YAML
+/// schema is frozen for 1.x, and dropping an accepted alternative is a
+/// breaking change there.
+///
+/// The pattern only asks for a `/`, which is all [`FromStr`] checks before
+/// dispatching on the source. Anything stricter would reject inputs that
+/// `dora` accepts.
+fn accept_input_mapping_string(schema: &mut schemars::Schema) {
+    if let Some(serde_json::Value::Array(alternatives)) = schema.get_mut("oneOf") {
+        alternatives.insert(
+            0,
+            serde_json::json!({
+                "description": "`<source>/<output>` for another node's output, \
+                    `dora/timer/{unit}/{value}` for a built-in timer, or \
+                    `dora/logs[/{level}[/{node_id}]]` for node logs.",
+                "type": "string",
+                "pattern": "/",
+            }),
+        );
+    }
 }
 
 impl fmt::Display for InputMapping {
@@ -217,11 +321,27 @@ impl fmt::Display for InputMapping {
             }
             InputMapping::Logs(filter) => {
                 write!(f, "dora/logs")?;
-                if let Some(level) = &filter.min_level {
-                    write!(f, "/{}", format_log_level(level))?;
-                    if let Some(node) = &filter.node_filter {
-                        write!(f, "/{node}")?;
+                // The wire grammar is `dora/logs/{level}/{node}`, so a node
+                // segment can only follow a level segment. A filter that
+                // restricts the node but leaves `min_level` unset must still
+                // render the node, otherwise the restriction is silently
+                // dropped and the subscription widens to every node (the more
+                // dangerous loss). Render `stdout` in that case: the daemon's
+                // level filter treats a `Stdout` minimum as the most permissive
+                // one (`LogLevelOrStdout::passes` lets every message through
+                // it), so `Some(Stdout)` delivers exactly what `None` does --
+                // all levels, including stdout -- while preserving the node
+                // scope. (`trace` would instead drop the node's stdout lines on
+                // re-parse, the same kind of silent change this guards against.)
+                match (&filter.min_level, &filter.node_filter) {
+                    (Some(level), node_filter) => {
+                        write!(f, "/{}", format_log_level(level))?;
+                        if let Some(node) = node_filter {
+                            write!(f, "/{node}")?;
+                        }
                     }
+                    (None, Some(node)) => write!(f, "/stdout/{node}")?,
+                    (None, None) => {}
                 }
                 Ok(())
             }
@@ -280,6 +400,10 @@ impl FromStr for InputMapping {
                                     "hz must be a positive finite number (got `{value}`)"
                                 ));
                             }
+                            // A very large hz makes `1/hz` round below 1ns, so
+                            // `try_from_secs_f64` returns `Ok(Duration::ZERO)`;
+                            // that zero interval is caught by the shared guard
+                            // after this `match`, together with `<unit>/0`.
                             Duration::try_from_secs_f64(1.0 / hz).map_err(|e| {
                                 format!("hz `{value}` produces an out-of-range interval: {e}")
                             })?
@@ -290,6 +414,19 @@ impl FromStr for InputMapping {
                             ));
                         }
                     };
+                    // A zero-length interval is invalid for every unit: the timer
+                    // task builds `tokio::time::interval(interval)`, which panics
+                    // (`period` must be non-zero). Reject it at parse time for all
+                    // units -- `secs/0`, `millis/0`, `micros/0`, `nanos/0`, and a
+                    // huge `hz` that rounds `1/hz` below 1ns -- so a bad descriptor
+                    // fails at load with a clear message instead of panicking a
+                    // daemon task later.
+                    if interval.is_zero() {
+                        return Err(format!(
+                            "timer interval must be non-zero (`{unit}/{value}` \
+                             produces a zero-length interval)"
+                        ));
+                    }
                     Self::Timer { interval }
                 }
                 Some(("logs", rest)) => {
@@ -375,6 +512,31 @@ fn format_log_level(level: &crate::common::LogLevelOrStdout) -> &'static str {
     }
 }
 
+/// A [`Duration`] wrapper whose [`Display`](fmt::Display) renders a timer
+/// interval as `<unit>/<count>`, choosing the coarsest unit that represents the
+/// interval *exactly*.
+///
+/// This is the inverse of how a `dora/timer/<unit>/<count>` input is parsed, so
+/// the rendered string round-trips back to the same `Duration`. Picking the
+/// coarsest exact unit matters: rendering a sub-millisecond interval as
+/// `millis/0` would parse back to a zero-length (busy-loop) timer
+/// (dora-rs#2031).
+///
+/// Usually constructed via [`format_duration`].
+///
+/// ```
+/// use std::time::Duration;
+/// use dora_message::config::format_duration;
+///
+/// // Coarsest exact unit is chosen: whole seconds render as `secs`.
+/// assert_eq!(format_duration(Duration::from_secs(2)).to_string(), "secs/2");
+/// assert_eq!(format_duration(Duration::from_millis(100)).to_string(), "millis/100");
+/// // 1500 ms is not a whole number of seconds, so it stays in `millis`.
+/// assert_eq!(format_duration(Duration::from_millis(1500)).to_string(), "millis/1500");
+/// // Sub-millisecond intervals keep their precision instead of truncating to 0.
+/// assert_eq!(format_duration(Duration::from_micros(500)).to_string(), "micros/500");
+/// assert_eq!(format_duration(Duration::from_nanos(333_333)).to_string(), "nanos/333333");
+/// ```
 pub struct FormattedDuration(pub Duration);
 
 impl fmt::Display for FormattedDuration {
@@ -396,6 +558,9 @@ impl fmt::Display for FormattedDuration {
     }
 }
 
+/// Wrap a [`Duration`] so it renders as a `dora/timer`-style `<unit>/<count>`
+/// string. See [`FormattedDuration`] for the exact formatting rules and a
+/// round-trip example.
 pub fn format_duration(interval: Duration) -> FormattedDuration {
     FormattedDuration(interval)
 }
@@ -419,53 +584,13 @@ impl<'de> Deserialize<'de> for InputMapping {
     }
 }
 
+/// A subscription to another node's output, written as `source/output` in YAML.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, JsonSchema)]
 pub struct UserInputMapping {
+    /// The id of the node that produces the output.
     pub source: NodeId,
+    /// The id of that node's output to subscribe to.
     pub output: DataId,
-}
-
-#[derive(Debug, Default, Serialize, Deserialize, JsonSchema, Clone)]
-#[serde(deny_unknown_fields, rename_all = "lowercase")]
-pub struct CommunicationConfig {
-    // see https://github.com/dtolnay/serde-yaml/issues/298
-    #[serde(
-        default,
-        with = "serde_yaml::with::singleton_map",
-        rename = "_unstable_local"
-    )]
-    #[schemars(with = "String")]
-    pub local: LocalCommunicationConfig,
-    #[serde(
-        default,
-        with = "serde_yaml::with::singleton_map",
-        rename = "_unstable_remote"
-    )]
-    #[schemars(with = "String")]
-    pub remote: RemoteCommunicationConfig,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum LocalCommunicationConfig {
-    #[default]
-    Tcp,
-}
-
-impl fmt::Display for LocalCommunicationConfig {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Tcp => write!(f, "tcp"),
-        }
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-#[serde(deny_unknown_fields, rename_all = "lowercase")]
-#[derive(Default)]
-pub enum RemoteCommunicationConfig {
-    #[default]
-    Tcp,
 }
 
 /// A byte size that can be deserialized from either an integer (raw bytes) or a
@@ -497,52 +622,67 @@ impl FromStr for ByteSize {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let s = s.trim();
-        let (num_part, unit_part) = match s.find(|c: char| c.is_alphabetic()) {
-            Some(pos) => (s[..pos].trim(), s[pos..].trim()),
-            None => {
-                let bytes: usize = s.parse().map_err(|_| format!("invalid byte size: `{s}`"))?;
-                return Ok(ByteSize(bytes));
-            }
-        };
-
-        let multiplier: usize = match unit_part.to_uppercase().as_str() {
-            "B" => 1,
-            "KB" | "K" => 1024,
-            "MB" | "M" => 1024 * 1024,
-            "GB" | "G" => 1024 * 1024 * 1024,
-            other => return Err(format!("unknown byte size unit: `{other}`")),
-        };
-
-        // Use integer parse when possible to avoid f64 rounding above 2^53.
-        if let Ok(num) = num_part.parse::<usize>() {
-            return num
-                .checked_mul(multiplier)
-                .map(ByteSize)
-                .ok_or_else(|| format!("byte size `{s}` is too large"));
-        }
-
-        let num: f64 = num_part
-            .parse()
-            .map_err(|_| format!("invalid number in byte size: `{num_part}`"))?;
-
-        // Casting a negative or non-finite f64 to usize saturates (negatives
-        // and NaN to 0, +inf to usize::MAX) instead of erroring, so reject
-        // them up front.
-        if !num.is_finite() || num < 0.0 {
-            return Err(format!(
-                "byte size must be a non-negative, finite number: `{s}`"
-            ));
-        }
-        let bytes = num * multiplier as f64;
-        // `usize::MAX as f64` rounds up to 2^64, and no f64 values exist
-        // between usize::MAX and 2^64, so `>=` rejects exactly the results
-        // that exceed usize::MAX.
-        if bytes >= usize::MAX as f64 {
-            return Err(format!("byte size `{s}` is too large"));
-        }
-        Ok(ByteSize(bytes as usize))
+        let bytes = parse_byte_count(s)?;
+        usize::try_from(bytes)
+            .map(ByteSize)
+            .map_err(|_| format!("byte size `{}` is too large", s.trim()))
     }
+}
+
+/// Parses a byte size with the same grammar as [`ByteSize`], as a `u64`.
+///
+/// Unlike [`ByteSize`], whose range is `usize`, this accepts sizes of 4 GiB
+/// and above on 32-bit targets. Use it for sizes that describe files or
+/// totals rather than in-memory buffers, e.g. a log file size limit.
+///
+/// ```
+/// assert_eq!(dora_message::config::parse_byte_count("8GB"), Ok(8 << 30));
+/// assert!(dora_message::config::parse_byte_count("-1KB").is_err());
+/// ```
+pub fn parse_byte_count(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    let (num_part, unit_part) = match s.find(|c: char| c.is_alphabetic()) {
+        Some(pos) => (s[..pos].trim(), s[pos..].trim()),
+        None => {
+            return s.parse().map_err(|_| format!("invalid byte size: `{s}`"));
+        }
+    };
+
+    let multiplier: u64 = match unit_part.to_uppercase().as_str() {
+        "B" => 1,
+        "KB" | "K" => 1024,
+        "MB" | "M" => 1024 * 1024,
+        "GB" | "G" => 1024 * 1024 * 1024,
+        other => return Err(format!("unknown byte size unit: `{other}`")),
+    };
+
+    // Use integer parse when possible to avoid f64 rounding above 2^53.
+    if let Ok(num) = num_part.parse::<u64>() {
+        return num
+            .checked_mul(multiplier)
+            .ok_or_else(|| format!("byte size `{s}` is too large"));
+    }
+
+    let num: f64 = num_part
+        .parse()
+        .map_err(|_| format!("invalid number in byte size: `{num_part}`"))?;
+
+    // Casting a negative or non-finite f64 to u64 saturates (negatives and
+    // NaN to 0, +inf to u64::MAX) instead of erroring, so reject them up
+    // front.
+    if !num.is_finite() || num < 0.0 {
+        return Err(format!(
+            "byte size must be a non-negative, finite number: `{s}`"
+        ));
+    }
+    let bytes = num * multiplier as f64;
+    // `u64::MAX as f64` rounds up to 2^64, and no f64 values exist between
+    // u64::MAX and 2^64, so `>=` rejects exactly the results that exceed
+    // u64::MAX.
+    if bytes >= u64::MAX as f64 {
+        return Err(format!("byte size `{s}` is too large"));
+    }
+    Ok(bytes as u64)
 }
 
 impl fmt::Display for ByteSize {
@@ -637,6 +777,23 @@ mod tests {
         let input: Input = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(input.queue_size, Some(5));
         assert_eq!(input.queue_policy, None);
+    }
+
+    #[test]
+    fn drop_oldest_cap_is_never_zero() {
+        // A `queue_size: 0` DropOldest input must keep at least the latest
+        // message; a cap of 0 would starve the operator entirely.
+        assert_eq!(QueuePolicy::DropOldest.effective_cap(0), 1);
+        // Non-zero sizes are unchanged.
+        assert_eq!(QueuePolicy::DropOldest.effective_cap(1), 1);
+        assert_eq!(QueuePolicy::DropOldest.effective_cap(5), 5);
+    }
+
+    #[test]
+    fn backpressure_cap_has_floor() {
+        assert_eq!(QueuePolicy::Backpressure.effective_cap(0), 100);
+        assert_eq!(QueuePolicy::Backpressure.effective_cap(5), 100);
+        assert_eq!(QueuePolicy::Backpressure.effective_cap(20), 200);
     }
 
     #[test]
@@ -746,6 +903,34 @@ mod tests {
             .parse::<InputMapping>()
             .unwrap_err();
         assert!(err.contains("hz"), "error should mention hz: {err}");
+    }
+
+    #[test]
+    fn parse_timer_rejects_zero_interval_for_every_unit() {
+        // A zero-length interval panics `tokio::time::interval` in the timer
+        // task (`period` must be non-zero), so every unit that can express it
+        // must be rejected at parse time -- not just `hz`. `<unit>/0` is the
+        // obvious case; a huge `hz` reaches the same zero interval because
+        // `1/hz` rounds below 1ns.
+        let cases = [
+            "dora/timer/secs/0",
+            "dora/timer/millis/0",
+            "dora/timer/micros/0",
+            "dora/timer/nanos/0",
+            "dora/timer/hz/1000000000000",
+        ];
+        for case in cases {
+            let err = case.parse::<InputMapping>().unwrap_err();
+            assert!(
+                err.contains("non-zero"),
+                "`{case}` should be rejected as a zero-length interval, got: {err}"
+            );
+        }
+        // Sanity check: the huge-hz conversion really does round to zero.
+        assert_eq!(
+            Duration::try_from_secs_f64(1.0 / 1_000_000_000_000.0),
+            Ok(Duration::ZERO)
+        );
     }
 
     /// Regression test for dora-rs#2031: the `Display` impl previously emitted
@@ -931,6 +1116,36 @@ mod tests {
     }
 
     #[test]
+    fn display_logs_node_without_level_keeps_node() {
+        use crate::common::LogLevelOrStdout;
+
+        // `{ min_level: None, node_filter: Some(_) }` is not producible via
+        // `FromStr` but is freely constructible directly. `Display` must not
+        // drop the node restriction (which would silently widen the
+        // subscription to every node); it renders the `stdout` level, which the
+        // daemon's filter treats as the most permissive one, so the node stays
+        // in the output without changing which messages are delivered.
+        let filter = InputMapping::Logs(LogSubscriptionFilter {
+            min_level: None,
+            node_filter: Some("mynode".parse().unwrap()),
+        });
+        assert_eq!(filter.to_string(), "dora/logs/stdout/mynode");
+
+        // The rendered form parses back to the node-scoped filter at `stdout`,
+        // which is behaviorally equivalent to `None` (all levels pass), and is
+        // idempotent afterwards.
+        let round: InputMapping = filter.to_string().parse().unwrap();
+        assert_eq!(
+            round,
+            InputMapping::Logs(LogSubscriptionFilter {
+                min_level: Some(LogLevelOrStdout::Stdout),
+                node_filter: Some("mynode".parse().unwrap()),
+            })
+        );
+        assert_eq!(round.to_string(), "dora/logs/stdout/mynode");
+    }
+
+    #[test]
     fn parse_logs_trailing_slash() {
         let mapping: InputMapping = "dora/logs/".parse().unwrap();
         assert!(matches!(
@@ -940,42 +1155,6 @@ mod tests {
                 node_filter: None,
             })
         ));
-    }
-
-    #[test]
-    fn communication_config_local_tcp_lowercase() {
-        let yaml = "_unstable_local: tcp\n";
-        let config: CommunicationConfig = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(config.local, LocalCommunicationConfig::Tcp);
-    }
-
-    #[test]
-    fn communication_config_remote_tcp_lowercase() {
-        let yaml = "_unstable_remote: tcp\n";
-        let config: CommunicationConfig = serde_yaml::from_str(yaml).unwrap();
-        assert!(matches!(config.remote, RemoteCommunicationConfig::Tcp));
-    }
-
-    #[test]
-    fn communication_config_unknown_local_variant_errors() {
-        let yaml = "_unstable_local: unixdomain\n";
-        assert!(serde_yaml::from_str::<CommunicationConfig>(yaml).is_err());
-    }
-
-    #[test]
-    fn local_communication_config_display() {
-        assert_eq!(LocalCommunicationConfig::Tcp.to_string(), "tcp");
-    }
-
-    #[test]
-    fn communication_config_roundtrip_local() {
-        let config = CommunicationConfig {
-            local: LocalCommunicationConfig::Tcp,
-            remote: RemoteCommunicationConfig::Tcp,
-        };
-        let yaml = serde_yaml::to_string(&config).unwrap();
-        let parsed: CommunicationConfig = serde_yaml::from_str(&yaml).unwrap();
-        assert_eq!(parsed.local, LocalCommunicationConfig::Tcp);
     }
 
     #[test]
@@ -1087,5 +1266,24 @@ mod tests {
         let yaml = "outputs:\n  - foo\n";
         let config: NodeRunConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(config.shared_memory_pool_size, None);
+    }
+
+    // #3701: inputs are strings in YAML, so the schema has to accept one,
+    // and its pattern has to agree with what `FromStr` accepts.
+    #[test]
+    fn input_mapping_schema_accepts_the_string_form() {
+        let schema = serde_json::to_value(schemars::schema_for!(InputMapping)).unwrap();
+        let alternatives = schema["oneOf"].as_array().expect("oneOf alternatives");
+        let string = alternatives
+            .iter()
+            .find(|alt| alt["type"] == "string")
+            .expect("InputMapping schema should accept the string form");
+        assert_eq!(string["pattern"], "/");
+
+        for valid in ["camera/image", "dora/timer/millis/100", "dora/logs"] {
+            assert!(valid.parse::<InputMapping>().is_ok(), "{valid}");
+            assert!(valid.contains('/'), "{valid} should match the pattern");
+        }
+        assert!("no-slash".parse::<InputMapping>().is_err());
     }
 }

@@ -1,41 +1,67 @@
 use std::{
     fs::File,
     io::Write,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
 use arrow::array::{Array, RecordBatch, StructArray};
 use arrow_schema::{DataType, Field, Schema};
 use colored::Colorize;
-use dora_core::{
-    metadata::ArrowTypeInfoExt,
-    uhlc::{self, HLC, NTP64, Timestamp},
-};
+use dora_core::uhlc::{self, HLC, NTP64, Timestamp};
 use dora_message::{
     common::{DataMessage, Timestamped},
     daemon_to_node::{DaemonReply, NodeEvent},
     integration_testing_format::{
         IncomingEvent, InputData, IntegrationTestInput, RecordingStatus, TimedIncomingEvent,
     },
-    metadata::{ArrowTypeInfo, Metadata},
+    metadata::Metadata,
     node_to_daemon::DaemonRequest,
 };
 use eyre::{Context, ContextCompat};
 
 use crate::{
-    arrow_utils::{copy_array_into_sample, required_data_size},
+    arrow_utils::encode_arrow_ipc,
     daemon_connection::json_to_arrow::read_json_value_as_arrow,
     event_stream::data_to_arrow_array,
     integration_testing::{TestingInput, TestingOptions, TestingOutput},
 };
 
+/// Convert an input event's `time_offset_secs` into the delay after replay
+/// start and the event's timestamp.
+///
+/// `Duration::from_secs_f64` panics on a negative, NaN or overflowing value
+/// and `NTP64::from` / `NTP64 + NTP64` panic past `u32::MAX` seconds, and the
+/// offset comes straight from a user-authored input file, so reject those
+/// values with an error instead.
+fn event_time(start: &NTP64, time_offset_secs: f64) -> eyre::Result<(Duration, NTP64)> {
+    let offset = Duration::try_from_secs_f64(time_offset_secs)
+        .map_err(|err| eyre::eyre!("invalid `time_offset_secs` {time_offset_secs}: {err}"))?;
+    let out_of_range = || eyre::eyre!("`time_offset_secs` {time_offset_secs} is out of range");
+    if offset.as_secs() > u64::from(u32::MAX) {
+        return Err(out_of_range());
+    }
+    let time = start
+        .0
+        .checked_add(NTP64::from(offset).0)
+        .ok_or_else(out_of_range)?;
+    Ok((offset, NTP64(time)))
+}
+
 pub struct IntegrationTestingEvents {
-    events: std::vec::IntoIter<TimedIncomingEvent>,
+    /// Input events sorted by offset, each with its delay after replay start
+    /// and its timestamp, both computed (and validated) once at load.
+    events: std::vec::IntoIter<(Duration, NTP64, TimedIncomingEvent)>,
     output_writer: OutputWriter,
     start_timestamp: uhlc::Timestamp,
     start_time: Instant,
     options: TestingOptions,
+    /// Set by `DoraNode::drop` so a mid-replay sleep in [`Self::next_event`]
+    /// can abort and let the testing daemon process CloseOutputs (dora-rs/dora#2855).
+    shutdown: Arc<AtomicBool>,
 }
 
 impl IntegrationTestingEvents {
@@ -43,6 +69,7 @@ impl IntegrationTestingEvents {
         input: TestingInput,
         output: TestingOutput,
         options: TestingOptions,
+        shutdown: Arc<AtomicBool>,
     ) -> eyre::Result<Self> {
         let mut node_info: IntegrationTestInput = match input {
             TestingInput::FromJsonFile(input_file_path) => serde_json::from_slice(
@@ -77,6 +104,22 @@ impl IntegrationTestingEvents {
             );
         }
 
+        let clock = HLC::default();
+        let start_timestamp = clock.new_timestamp();
+        // Reject a bad offset up front, naming the event, instead of panicking
+        // the testing daemon thread once replay reaches it. Runs before the
+        // output file is created, so a rejected input leaves it untouched.
+        let mut events = std::mem::take(&mut node_info.events)
+            .into_iter()
+            .enumerate()
+            .map(|(index, event)| {
+                let (delay, time) = event_time(start_timestamp.get_time(), event.time_offset_secs)
+                    .with_context(|| format!("invalid input event at index {index}"))?;
+                Ok((delay, time, event))
+            })
+            .collect::<eyre::Result<Vec<_>>>()?;
+        events.sort_by(|a, b| a.2.time_offset_secs.total_cmp(&b.2.time_offset_secs));
+
         let output_writer = match output {
             TestingOutput::ToFile(output_file_path) => {
                 let file = File::create(&output_file_path)
@@ -87,21 +130,14 @@ impl IntegrationTestingEvents {
             TestingOutput::ToChannel(sender) => OutputWriter::Channel(sender),
         };
 
-        node_info
-            .events
-            .as_mut_slice()
-            .sort_by(|a, b| a.time_offset_secs.total_cmp(&b.time_offset_secs));
-        let inputs = std::mem::take(&mut node_info.events).into_iter();
-
-        let clock = HLC::default();
-        let start_timestamp = clock.new_timestamp();
         let start_time = Instant::now();
         Ok(Self {
-            events: inputs,
+            events: events.into_iter(),
             output_writer,
             start_timestamp,
             start_time,
             options,
+            shutdown,
         })
     }
 
@@ -135,11 +171,16 @@ impl IntegrationTestingEvents {
                 println!("{}", "node reports EventStreamDropped".blue());
                 DaemonReply::Result(Ok(()))
             }
-            DaemonRequest::RegisterPinnedMemory { .. }
-            | DaemonRequest::ReadPinnedMemory { .. }
-            | DaemonRequest::FreePinnedMemory { .. } => DaemonReply::Result(Ok(())),
+            DaemonRequest::ExtensionRequest { namespace, .. } => {
+                eyre::bail!("extension {namespace} is not available in integration-testing mode")
+            }
             DaemonRequest::NodeConfig { .. } => {
                 eyre::bail!("unexpected NodeConfig in interactive mode")
+            }
+            // `DaemonRequest` is `#[non_exhaustive]`: a request this build
+            // predates is unsupported here.
+            other => {
+                eyre::bail!("unsupported request in integration-testing mode: {other:?}")
             }
         };
         Ok(reply)
@@ -169,6 +210,7 @@ impl IntegrationTestingEvents {
                 writeln!(writer.as_mut()).context("failed to write newline to output file")?;
             }
             OutputWriter::Channel(sender) => {
+                // Must not block: the node is waiting for this request's reply.
                 sender
                     .send(output)
                     .context("failed to send output to channel")?;
@@ -178,42 +220,59 @@ impl IntegrationTestingEvents {
     }
 
     fn next_event(&mut self) -> eyre::Result<Option<Timestamped<NodeEvent>>> {
-        let Some(event) = self.events.next() else {
+        if self.shutdown.load(Ordering::Relaxed) {
             return Ok(None);
-        };
-
-        let TimedIncomingEvent {
-            time_offset_secs,
-            event,
-        } = event;
-        let time_offset = Duration::from_secs_f64(time_offset_secs);
-        let elapsed = self.start_time.elapsed();
-        if let Some(wait_time) = time_offset.checked_sub(elapsed) {
-            std::thread::sleep(wait_time);
         }
 
-        let timestamp = Timestamp::new(
-            self.start_timestamp.get_time() + NTP64::from(time_offset),
-            *self.start_timestamp.get_id(),
-        );
+        let Some((
+            time_offset,
+            time,
+            TimedIncomingEvent {
+                time_offset_secs,
+                event,
+            },
+        )) = self.events.next()
+        else {
+            return Ok(None);
+        };
+        let elapsed = self.start_time.elapsed();
+        if let Some(wait_time) = time_offset.checked_sub(elapsed) {
+            // Sleep in short slices so `DoraNode::drop` can interrupt a
+            // scheduled wait and still get a CloseOutputs reply (#2855).
+            let deadline = Instant::now() + wait_time;
+            while Instant::now() < deadline {
+                if self.shutdown.load(Ordering::Relaxed) {
+                    return Ok(None);
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                std::thread::sleep(remaining.min(Duration::from_millis(10)));
+            }
+        }
+
+        let timestamp = Timestamp::new(time, *self.start_timestamp.get_id());
 
         let converted = match event {
             IncomingEvent::Stop => NodeEvent::Stop,
             IncomingEvent::Input { id, metadata, data } => {
-                let (data, type_info) = if let Some(data) = data {
+                let data = if let Some(data) = data {
                     let array = read_input_data(*data).with_context(|| {
                         format!("failed to read input event at offset {time_offset_secs}s ")
                     })?;
 
-                    let total_len = required_data_size(&array);
-                    let mut buf = vec![0; total_len];
-                    let type_info = copy_array_into_sample(buf.as_mut_slice(), &array);
+                    // The receive side decodes a self-describing Arrow IPC
+                    // stream, so encode the array into one here.
+                    let buf = encode_arrow_ipc(&dora_arrow_convert::internal::from_array_data(
+                        array,
+                    ))
+                    .with_context(|| {
+                        format!("failed to IPC-encode input event at offset {time_offset_secs}s ")
+                    })?;
 
-                    (Some(buf), type_info)
+                    Some(buf)
                 } else {
-                    (None, ArrowTypeInfo::empty())
+                    None
                 };
-                let mut meta = Metadata::new(timestamp, type_info);
+                let mut meta = Metadata::new(timestamp);
                 meta.parameters = metadata.unwrap_or_default();
                 NodeEvent::Input {
                     id,
@@ -235,7 +294,7 @@ impl IntegrationTestingEvents {
 
 enum OutputWriter {
     Writer(Box<dyn Write + Send>),
-    Channel(flume::Sender<serde_json::Map<String, serde_json::Value>>),
+    Channel(crate::integration_testing::OutputSender),
 }
 
 pub fn convert_output_to_json(
@@ -245,45 +304,259 @@ pub fn convert_output_to_json(
     start_timestamp: Timestamp,
     skip_output_time_offsets: bool,
 ) -> eyre::Result<serde_json::Map<String, serde_json::Value>> {
-    let mut output = serde_json::Map::new();
-    output.insert("id".into(), output_id.to_string().into());
-    if !skip_output_time_offsets {
-        let time_offset = metadata.timestamp().get_diff_duration(&start_timestamp);
-        output.insert("time_offset_secs".into(), time_offset.as_secs_f64().into());
-    }
+    let mut output = json_header(
+        output_id,
+        metadata,
+        start_timestamp,
+        skip_output_time_offsets,
+    );
     if data.is_some() {
-        let data_array =
-            data_to_arrow_array(data.clone().map(std::sync::Arc::unwrap_or_clone), metadata)
-                .context("failed to convert output to arrow array")?;
-
-        let data_type_json = serde_json::to_value(data_array.data_type())
-            .context("failed to serialize data type as JSON")?;
-
-        let batch = RecordBatch::try_from_iter([("inner", data_array)])
-            .context("failed to create RecordBatch")?;
-
-        let mut writer = arrow_json::ArrayWriter::new(Vec::new());
-        writer
-            .write(&batch)
-            .context("failed to encode data as JSON")?;
-        writer
-            .finish()
-            .context("failed to finish writing JSON data")?;
-        let json_data_encoded = writer.into_inner();
-
-        // Reparse the string using serde_json
-        let json_data: Vec<serde_json::Map<String, serde_json::Value>> =
-            serde_json::from_reader(json_data_encoded.as_slice())
-                .context("failed to parse JSON data again")?;
-        // remove `inner` field again
-        let json_data_flattened: Vec<_> = json_data
-            .into_iter()
-            .map(|mut m| m.remove("inner"))
-            .collect();
-        output.insert("data".into(), json_data_flattened.into());
-        output.insert("data_type".into(), data_type_json);
+        let data_array = data_to_arrow_array(data.clone().map(std::sync::Arc::unwrap_or_clone))
+            .context("failed to convert output to arrow array")?;
+        append_arrow_array_json(&mut output, data_array)?;
     }
     Ok(output)
+}
+
+/// Serialize an already-decoded Arrow array (e.g. an input received over the
+/// zenoh data plane) into the same JSON shape as [`convert_output_to_json`].
+///
+/// The daemon-path `Input` events reach the recorder as an encoded
+/// [`DataMessage`], but zenoh-delivered inputs arrive already decoded as an
+/// `ArrayData`, so this is the entry point for recording those.
+pub fn convert_arrow_input_to_json(
+    input_id: &dora_message::id::DataId,
+    metadata: &Metadata,
+    data: arrow::array::ArrayRef,
+    start_timestamp: Timestamp,
+    skip_output_time_offsets: bool,
+) -> eyre::Result<serde_json::Map<String, serde_json::Value>> {
+    let mut output = json_header(
+        input_id,
+        metadata,
+        start_timestamp,
+        skip_output_time_offsets,
+    );
+    append_arrow_array_json(&mut output, data)?;
+    Ok(output)
+}
+
+/// Build the `id` (+ optional `time_offset_secs`) prefix shared by every
+/// recorded input/output event.
+fn json_header(
+    id: &dora_message::id::DataId,
+    metadata: &Metadata,
+    start_timestamp: Timestamp,
+    skip_output_time_offsets: bool,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut output = serde_json::Map::new();
+    output.insert("id".into(), id.to_string().into());
+    if !skip_output_time_offsets {
+        let input_ts = metadata.timestamp();
+        // A zenoh-delivered input can carry a remote HLC timestamp that
+        // precedes this node's `start_timestamp` (a remote clock that is
+        // behind, or a producer that started earlier). `get_diff_duration` is
+        // an unguarded NTP64 (`u64`) subtraction that would underflow — a debug
+        // panic (which unwinds past `add_event`'s `Err` guard and kills the
+        // event loop) or a release wraparound to a garbage offset. Clamp to
+        // zero when the input predates start. The daemon path only ever records
+        // locally-timestamped inputs (always >= start), so this is a no-op
+        // there.
+        let time_offset = if input_ts.get_time() >= start_timestamp.get_time() {
+            input_ts.get_diff_duration(&start_timestamp)
+        } else {
+            std::time::Duration::ZERO
+        };
+        output.insert("time_offset_secs".into(), time_offset.as_secs_f64().into());
+    }
+    output
+}
+
+/// Encode `data_array` into the `data` / `data_type` fields of a recorded
+/// event's JSON object.
+fn append_arrow_array_json(
+    output: &mut serde_json::Map<String, serde_json::Value>,
+    data_array: arrow::array::ArrayRef,
+) -> eyre::Result<()> {
+    let data_type_json = serde_json::to_value(data_array.data_type())
+        .context("failed to serialize data type as JSON")?;
+
+    let source = data_array.clone();
+    let batch = RecordBatch::try_from_iter([("inner", data_array)])
+        .context("failed to create RecordBatch")?;
+
+    let mut writer = arrow_json::ArrayWriter::new(Vec::new());
+    writer
+        .write(&batch)
+        .context("failed to encode data as JSON")?;
+    writer
+        .finish()
+        .context("failed to finish writing JSON data")?;
+    let json_data_encoded = writer.into_inner();
+
+    // Reparse the string using serde_json
+    let json_data: Vec<serde_json::Map<String, serde_json::Value>> =
+        serde_json::from_reader(json_data_encoded.as_slice())
+            .context("failed to parse JSON data again")?;
+    // remove `inner` field again
+    let mut json_data_flattened: Vec<_> = json_data
+        .into_iter()
+        .map(|mut m| m.remove("inner"))
+        .collect();
+    restore_float_values(source.as_ref(), &mut json_data_flattened);
+    output.insert("data".into(), json_data_flattened.into());
+    output.insert("data_type".into(), data_type_json);
+    Ok(())
+}
+
+/// Re-encode float columns so a recorded float replays bit-identical:
+///
+/// - `arrow_json` writes NaN and the infinities as `null`, because JSON has no
+///   literal for either. Put them back as the strings the reader already
+///   accepts for a float column (`"NaN"` / `"Infinity"` / `"-Infinity"`), so a
+///   recorded non-finite float replays as itself rather than as a null.
+/// - For the same reason `arrow_json` does not guarantee finite floats either:
+///   it can emit a decimal that is one ULP off (`1e50` is written as
+///   `9.999999999999999e49`, which parses back one ULP low). Rewriting every
+///   finite value from the source with `Number::from_f64` (the shortest
+///   representation that round-trips) makes the recording lossless.
+///
+/// `json` holds one slot per row of `source`, `None` where the encoder wrote no
+/// value at all (a null row, which `arrow_json` omits). Struct fields and list
+/// elements are walked recursively, since dora outputs are commonly
+/// struct-shaped. Map and union children are not walked: `arrow_json` cannot
+/// round-trip those through the reader anyway.
+fn restore_float_values(source: &dyn arrow::array::Array, json: &mut [Option<serde_json::Value>]) {
+    use arrow::array::{
+        Array, FixedSizeListArray, Float32Array, Float64Array, LargeListArray, ListArray,
+        StructArray,
+    };
+
+    let source = source.as_any();
+    if let Some(a) = source.downcast_ref::<Float64Array>() {
+        overwrite_floats(
+            json,
+            (0..a.len()).map(|i| (!a.is_null(i)).then(|| a.value(i))),
+        );
+    } else if let Some(a) = source.downcast_ref::<Float32Array>() {
+        overwrite_floats(
+            json,
+            (0..a.len()).map(|i| (!a.is_null(i)).then(|| a.value(i) as f64)),
+        );
+    } else if let Some(a) = source.downcast_ref::<StructArray>() {
+        restore_in_struct_fields(a, json);
+    } else if let Some(a) = source.downcast_ref::<ListArray>() {
+        let offsets = a.value_offsets();
+        let ranges: Vec<_> = (0..a.len())
+            .map(|i| (offsets[i] as usize, offsets[i + 1] as usize))
+            .collect();
+        restore_in_list_elements(a.values(), &ranges, json);
+    } else if let Some(a) = source.downcast_ref::<LargeListArray>() {
+        let offsets = a.value_offsets();
+        let ranges: Vec<_> = (0..a.len())
+            .map(|i| (offsets[i] as usize, offsets[i + 1] as usize))
+            .collect();
+        restore_in_list_elements(a.values(), &ranges, json);
+    } else if let Some(a) = source.downcast_ref::<FixedSizeListArray>() {
+        let size = a.value_length() as usize;
+        let ranges: Vec<_> = (0..a.len()).map(|i| (i * size, (i + 1) * size)).collect();
+        restore_in_list_elements(a.values(), &ranges, json);
+    }
+}
+
+/// One non-finite float as the string the reader accepts for a float column;
+/// `None` for a finite value, which is encoded as a JSON number instead.
+fn encode_non_finite(value: f64) -> Option<serde_json::Value> {
+    if value.is_nan() {
+        Some("NaN".into())
+    } else if value == f64::INFINITY {
+        Some("Infinity".into())
+    } else if value == f64::NEG_INFINITY {
+        Some("-Infinity".into())
+    } else {
+        None
+    }
+}
+
+/// Overwrite every slot whose source value is a float, driven by the source's
+/// validity rather than the emitted JSON, so a genuine null (`None`) keeps its
+/// `null` and is never confused with a value: non-finite floats become the
+/// string markers the reader accepts, and finite floats become the shortest
+/// JSON number that parses back to the same bits.
+fn overwrite_floats(
+    json: &mut [Option<serde_json::Value>],
+    values: impl Iterator<Item = Option<f64>>,
+) {
+    for (slot, value) in json.iter_mut().zip(values) {
+        let Some(value) = value else { continue };
+        if let Some(encoded) = encode_non_finite(value) {
+            *slot = Some(encoded);
+        } else {
+            *slot = Some(
+                serde_json::Number::from_f64(value)
+                    .expect("finite f64 always maps to a JSON number")
+                    .into(),
+            );
+        }
+    }
+}
+
+/// Walk each struct field as a column of its own: lift the field out of every
+/// row's object, fix that column, then put it back. A field the encoder omitted
+/// (a null) stays omitted.
+fn restore_in_struct_fields(
+    source: &arrow::array::StructArray,
+    json: &mut [Option<serde_json::Value>],
+) {
+    for (field, child) in source.fields().iter().zip(source.columns()) {
+        let name = field.name();
+        let mut column: Vec<_> = json
+            .iter()
+            .map(|row| row.as_ref().and_then(|row| row.get(name)).cloned())
+            .collect();
+        restore_float_values(child.as_ref(), &mut column);
+        for (row, value) in json.iter_mut().zip(column) {
+            if let (Some(serde_json::Value::Object(row)), Some(value)) = (row.as_mut(), value) {
+                row.insert(name.clone(), value);
+            }
+        }
+    }
+}
+
+/// Walk a list's elements as one flat column, the shape the child array already
+/// has: gather every row's elements by their child index, fix the child array as
+/// a whole, then scatter the results back into the rows they came from.
+fn restore_in_list_elements(
+    values: &arrow::array::ArrayRef,
+    ranges: &[(usize, usize)],
+    json: &mut [Option<serde_json::Value>],
+) {
+    use arrow::array::Array;
+
+    let mut flat: Vec<Option<serde_json::Value>> = vec![None; values.len()];
+    for (row, &(start, end)) in json.iter().zip(ranges) {
+        let Some(serde_json::Value::Array(elements)) = row.as_ref() else {
+            continue;
+        };
+        for (index, element) in (start..end.min(flat.len())).zip(elements) {
+            if !element.is_null() {
+                flat[index] = Some(element.clone());
+            }
+        }
+    }
+
+    restore_float_values(values.as_ref(), &mut flat);
+
+    for (row, &(start, end)) in json.iter_mut().zip(ranges) {
+        let Some(serde_json::Value::Array(elements)) = row.as_mut() else {
+            continue;
+        };
+        for (index, element) in (start..end.min(flat.len())).zip(elements.iter_mut()) {
+            if let Some(fixed) = &flat[index] {
+                *element = fixed.clone();
+            }
+        }
+    }
 }
 
 fn read_input_data(data: InputData) -> eyre::Result<arrow::array::ArrayData> {
@@ -291,8 +564,26 @@ fn read_input_data(data: InputData) -> eyre::Result<arrow::array::ArrayData> {
         InputData::JsonObject { data, data_type } => {
             // input is JSON data
             let array = json_value_to_list(data);
-            let schema = match data_type {
-                Some(ty) => data_type_to_schema(ty)?,
+            // Resolve the declared element type up front, if the recording
+            // carried one. The recorder always writes `data_type`; only
+            // hand-authored fixtures may omit it.
+            let declared_schema = data_type.map(data_type_to_schema).transpose()?;
+            // A recorded zero-length output serializes to `"data": []`, which the
+            // JSON reader turns into no record batch at all ("no record batch in
+            // JSON"). A zero-length array is a legitimate value, so build an empty
+            // array of the declared type directly instead of routing it through
+            // the decoder (dora-rs/dora#3427). Handling it before schema inference
+            // also avoids inferring from an empty iterator on the untyped path.
+            if array.is_empty() {
+                let data_type = declared_schema
+                    .as_ref()
+                    .and_then(|schema| schema.fields().first())
+                    .map(|f| f.data_type().clone())
+                    .unwrap_or(DataType::Null);
+                return Ok(arrow::array::new_empty_array(&data_type).to_data());
+            }
+            let schema = match declared_schema {
+                Some(schema) => schema,
                 None => arrow_json::reader::infer_json_schema_from_iterator(array.iter().map(Ok))?,
             };
             let schema = Arc::new(schema);
@@ -367,4 +658,526 @@ fn wrap_value_into_object(value: serde_json::Value) -> serde_json::Value {
     map.insert("inner".into(), value);
 
     serde_json::Value::Object(map)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{ArrayRef, Float32Array, Float64Array, Int32Array, make_array};
+
+    /// A negative, non-finite or out-of-range offset in a user-authored input
+    /// file used to panic the testing daemon thread at replay time.
+    #[test]
+    fn invalid_time_offsets_are_rejected_at_load() {
+        for offset in [-0.1, f64::NAN, f64::INFINITY, 1e20, 5e9] {
+            let input = IntegrationTestInput::new(
+                "node".parse().unwrap(),
+                vec![TimedIncomingEvent {
+                    time_offset_secs: offset,
+                    event: IncomingEvent::Stop,
+                }],
+            );
+            let err = IntegrationTestingEvents::new(
+                TestingInput::Input(input),
+                TestingOutput::ToWriter(Box::new(std::io::sink())),
+                TestingOptions::default(),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .err()
+            .unwrap_or_else(|| panic!("offset {offset} should be rejected"));
+            assert!(
+                format!("{err:#}").contains("index 0"),
+                "error should name the event, got: {err:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn valid_time_offsets_are_accepted() {
+        let start = NTP64::from(Duration::from_secs(1_800_000_000));
+        let (delay, time) = event_time(&start, 1.5).unwrap();
+        assert_eq!(delay, Duration::from_millis(1500));
+        assert_eq!(time, start + NTP64::from(delay));
+        assert_eq!(event_time(&start, 0.0).unwrap().1, start);
+    }
+
+    /// Record an array via the recorder's encoder, then replay it back through
+    /// the reader — the property record/replay rests on.
+    fn roundtrip(array: ArrayRef) -> eyre::Result<arrow::array::ArrayData> {
+        let mut json = serde_json::Map::new();
+        append_arrow_array_json(&mut json, array)?;
+        read_input_data(InputData::JsonObject {
+            data: json.remove("data").expect("encoder always writes `data`"),
+            data_type: Some(
+                json.remove("data_type")
+                    .expect("encoder always writes `data_type`"),
+            ),
+        })
+    }
+
+    #[test]
+    fn finite_floats_round_trip_bit_identical() {
+        // The JSON writer does not always emit the shortest representation that
+        // round-trips, so some finite f64 values come back one ULP off
+        // (dora-rs/dora#3427). Tracking a float's exact bits makes the
+        // controller's assertions independent of the peeked value.
+        let values = [1.5, 1e50, 6.507048294634909e50, -5.0170334694796705e243];
+        let array: ArrayRef = Arc::new(Float64Array::from(
+            values.into_iter().map(Some).collect::<Vec<_>>(),
+        ));
+        let back = Float64Array::from(roundtrip(array).expect("finite floats should replay"));
+
+        for (i, &expected) in values.iter().enumerate() {
+            assert_eq!(
+                back.value(i).to_bits(),
+                expected.to_bits(),
+                "float at index {i} drifted by one ULP"
+            );
+        }
+    }
+
+    #[test]
+    fn recorded_finite_floats_use_shortest_round_trip_encoding() {
+        // Pins the on-disk shape for finite floats: each value is written as the
+        // shortest JSON number that parses back to the same bits, rather than
+        // whatever decimal `arrow_json` happened to emit.
+        let array: ArrayRef = Arc::new(Float64Array::from(vec![
+            Some(1.5),
+            Some(1e50),
+            Some(-5.0170334694796705e243),
+        ]));
+        let mut json = serde_json::Map::new();
+        append_arrow_array_json(&mut json, array).expect("should encode");
+
+        assert_eq!(
+            json["data"],
+            serde_json::json!([1.5, 1e50, -5.0170334694796705e243]),
+        );
+    }
+
+    #[test]
+    fn finite_floats_nested_in_a_list_round_trip() {
+        // The walk descends into list elements, so a drift-prone finite float
+        // inside a list survives bit-identical as well (dora-rs/dora#3427).
+        use arrow::array::ListArray;
+        use arrow::datatypes::Float64Type;
+
+        let values = [1e50, 6.507048294634909e50];
+        let list = ListArray::from_iter_primitive::<Float64Type, _, _>(vec![Some(vec![
+            Some(values[0]),
+            Some(values[1]),
+            None,
+        ])]);
+        let back = roundtrip(Arc::new(list)).expect("should replay");
+        let back = ListArray::from(back);
+        let first = Float64Array::from(back.value(0).to_data());
+
+        assert!(first.is_null(2));
+        assert_eq!(first.null_count(), 1);
+        assert_eq!(first.value(0).to_bits(), values[0].to_bits());
+        assert_eq!(first.value(1).to_bits(), values[1].to_bits());
+    }
+
+    #[test]
+    fn finite_floats_nested_in_a_struct_round_trip() {
+        // Same for struct fields, the most common dora output shape.
+        use arrow::array::StructArray;
+        use arrow::datatypes::{Field, Fields};
+
+        let value = 1e50;
+        let floats: ArrayRef = Arc::new(Float64Array::from(vec![Some(value), None]));
+        let fields = Fields::from(vec![Field::new("value", DataType::Float64, true)]);
+        let array = StructArray::new(fields.clone(), vec![floats], None);
+        let back = StructArray::from(roundtrip(Arc::new(array)).expect("should replay"));
+        let values = Float64Array::from(back.column(0).to_data());
+
+        assert_eq!(values.value(0).to_bits(), value.to_bits());
+        assert!(values.is_null(1));
+        assert_eq!(values.null_count(), 1);
+    }
+
+    #[test]
+    fn finite_f32_round_trips_bit_identical() {
+        let value = 0.1f32;
+        let array: ArrayRef = Arc::new(Float32Array::from(vec![Some(value), None]));
+        let back = Float32Array::from(roundtrip(array).expect("should replay"));
+
+        assert_eq!(back.value(0).to_bits(), value.to_bits());
+        assert!(back.is_null(1));
+        assert_eq!(back.null_count(), 1);
+    }
+
+    #[test]
+    fn empty_array_round_trips() {
+        // A zero-length output serializes to `"data": []`. Previously the reader
+        // failed with "no record batch in JSON" and the value could not be
+        // replayed at all (dora-rs/dora#3427).
+        let array: ArrayRef = Arc::new(Int32Array::from(Vec::<i32>::new()));
+        let back = make_array(roundtrip(array).expect("empty array should replay"));
+        assert_eq!(back.len(), 0);
+        assert_eq!(back.data_type(), &DataType::Int32);
+    }
+
+    #[test]
+    fn non_finite_floats_round_trip() {
+        // JSON has no NaN or infinity literal, so `arrow_json` writes all three
+        // as `null`. They are now re-encoded as the strings the reader already
+        // accepts, so they replay as themselves instead of as nulls
+        // (dora-rs/dora#3427).
+        let array: ArrayRef = Arc::new(Float64Array::from(vec![
+            Some(1.5),
+            Some(f64::NAN),
+            Some(f64::INFINITY),
+            Some(f64::NEG_INFINITY),
+            None,
+        ]));
+        let back = Float64Array::from(roundtrip(array).expect("should replay"));
+
+        assert_eq!(back.value(0), 1.5);
+        assert!(back.value(1).is_nan());
+        assert_eq!(back.value(2), f64::INFINITY);
+        assert_eq!(back.value(3), f64::NEG_INFINITY);
+        // The genuine null is still the only null: a NaN must not be
+        // indistinguishable from a missing value.
+        assert_eq!(back.null_count(), 1);
+        assert!(back.is_null(4));
+    }
+
+    #[test]
+    fn non_finite_f32_round_trips() {
+        let array: ArrayRef = Arc::new(Float32Array::from(vec![
+            Some(1.5f32),
+            Some(f32::NAN),
+            Some(f32::NEG_INFINITY),
+        ]));
+        let back = Float32Array::from(roundtrip(array).expect("should replay"));
+
+        assert_eq!(back.value(0), 1.5);
+        assert!(back.value(1).is_nan());
+        assert_eq!(back.value(2), f32::NEG_INFINITY);
+        assert_eq!(back.null_count(), 0);
+    }
+
+    #[test]
+    fn recorded_non_finite_floats_use_string_encoding() {
+        // Pins the on-disk shape. This is the recording format, so a change
+        // here is a format change and should be deliberate.
+        let array: ArrayRef = Arc::new(Float64Array::from(vec![
+            Some(1.5),
+            Some(f64::NAN),
+            Some(f64::INFINITY),
+            Some(f64::NEG_INFINITY),
+            None,
+        ]));
+        let mut json = serde_json::Map::new();
+        append_arrow_array_json(&mut json, array).expect("should encode");
+
+        assert_eq!(
+            json["data"],
+            serde_json::json!([1.5, "NaN", "Infinity", "-Infinity", null]),
+        );
+    }
+
+    #[test]
+    fn recordings_written_before_the_string_encoding_still_read() {
+        // A recording produced by the previous writer has `null` where a
+        // non-finite value used to be. Those must keep reading as nulls rather
+        // than failing, so existing recordings stay replayable.
+        let decoded = read_input_data(InputData::JsonObject {
+            data: serde_json::json!([1.5, null]),
+            data_type: Some(serde_json::json!("Float64")),
+        })
+        .expect("an older recording should still read");
+        let decoded = Float64Array::from(decoded);
+
+        assert_eq!(decoded.value(0), 1.5);
+        assert!(decoded.is_null(1));
+    }
+    #[test]
+    fn non_finite_floats_nested_in_a_list_round_trip() {
+        // The walk descends into list elements, so a non-finite float inside a
+        // list survives too -- list-shaped outputs are common in dora graphs
+        // (dora-rs/dora#3427).
+        use arrow::array::ListArray;
+        use arrow::datatypes::Float64Type;
+
+        let list = ListArray::from_iter_primitive::<Float64Type, _, _>(vec![
+            Some(vec![Some(1.5), Some(f64::NAN), None]),
+            Some(vec![Some(f64::INFINITY), Some(f64::NEG_INFINITY)]),
+        ]);
+        let back = roundtrip(Arc::new(list)).expect("should replay");
+        let back = ListArray::from(back);
+        let first = Float64Array::from(back.value(0).to_data());
+        let second = Float64Array::from(back.value(1).to_data());
+
+        assert_eq!(first.value(0), 1.5);
+        assert!(first.value(1).is_nan());
+        assert!(first.is_null(2));
+        // The element null is still the only null in that row.
+        assert_eq!(first.null_count(), 1);
+        assert_eq!(second.value(0), f64::INFINITY);
+        assert_eq!(second.value(1), f64::NEG_INFINITY);
+        assert_eq!(second.null_count(), 0);
+    }
+
+    #[test]
+    fn non_finite_floats_nested_in_a_struct_round_trip() {
+        // dora outputs are frequently struct-shaped, so the struct case carries
+        // most of the practical weight of this fix.
+        use arrow::array::StructArray;
+        use arrow::datatypes::{Field, Fields};
+
+        let floats: ArrayRef = Arc::new(Float64Array::from(vec![
+            Some(f64::NAN),
+            Some(f64::INFINITY),
+            None,
+        ]));
+        let ints: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
+        let fields = Fields::from(vec![
+            Field::new("value", DataType::Float64, true),
+            Field::new("seq", DataType::Int32, false),
+        ]);
+        let array = StructArray::new(fields, vec![floats, ints], None);
+        let back = StructArray::from(roundtrip(Arc::new(array)).expect("should replay"));
+        let values = Float64Array::from(back.column(0).to_data());
+        let seq = Int32Array::from(back.column(1).to_data());
+
+        assert!(values.value(0).is_nan());
+        assert_eq!(values.value(1), f64::INFINITY);
+        assert!(values.is_null(2));
+        assert_eq!(values.null_count(), 1);
+        assert_eq!(seq.values(), &[1, 2, 3]);
+    }
+
+    #[test]
+    fn recorded_nested_non_finite_floats_use_string_encoding() {
+        // Pins the on-disk shape for the nested case as well.
+        use arrow::array::ListArray;
+        use arrow::datatypes::Float64Type;
+
+        let list = ListArray::from_iter_primitive::<Float64Type, _, _>(vec![Some(vec![
+            Some(1.5),
+            Some(f64::NAN),
+            None,
+        ])]);
+        let mut json = serde_json::Map::new();
+        append_arrow_array_json(&mut json, Arc::new(list)).expect("should encode");
+
+        assert_eq!(json["data"], serde_json::json!([[1.5, "NaN", null]]));
+    }
+
+    #[test]
+    fn non_empty_array_still_round_trips() {
+        // Guard against the empty-array short-circuit affecting the normal path.
+        let array: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
+        let back = make_array(roundtrip(array).expect("array should replay"));
+        let back = back
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("expected an Int32 array");
+        assert_eq!(back.values(), &[1, 2, 3]);
+    }
+
+    /// Properties over the same record/replay round-trip the example tests
+    /// above check at fixed values. The examples pin the cases that were
+    /// actually broken (dora-rs/dora#3427); these check that the contract holds
+    /// across the whole input range, which is where the original ULP drift and
+    /// the NaN-to-null collapse were hiding.
+    ///
+    /// Nightly re-runs every `proptest`-named test at 1000 cases
+    /// (`scripts/qa/all.sh`).
+    mod proptest_properties {
+        use super::*;
+        use arrow::array::{BooleanArray, Int64Array, StringArray, UInt64Array};
+        use proptest::prelude::*;
+
+        /// Bit-compare a float array against the values that went in, so NaN
+        /// payloads and signed zeros are held to their exact representation
+        /// rather than to float equality.
+        fn assert_f64_bits(before: &[Option<f64>], after: &Float64Array) {
+            assert_eq!(after.len(), before.len(), "length changed");
+            for (i, expected) in before.iter().enumerate() {
+                match expected {
+                    Some(v) => {
+                        assert!(!after.is_null(i), "value at {i} came back null");
+                        assert_eq!(
+                            after.value(i).to_bits(),
+                            v.to_bits(),
+                            "float at {i} changed: {v:e} -> {:e}",
+                            after.value(i),
+                        );
+                    }
+                    None => assert!(after.is_null(i), "null at {i} came back as a value"),
+                }
+            }
+        }
+
+        proptest! {
+            /// Signed integers survive exactly, including the magnitudes above
+            /// 2^53 that a JSON parser routing through `f64` would round.
+            #[test]
+            fn roundtrip_i64(values in prop::collection::vec(any::<Option<i64>>(), 1..32)) {
+                let before = values.clone();
+                let back = Int64Array::from(
+                    roundtrip(Arc::new(Int64Array::from(values))).unwrap(),
+                );
+                for (i, expected) in before.iter().enumerate() {
+                    prop_assert_eq!(back.is_null(i), expected.is_none());
+                    if let Some(v) = expected {
+                        prop_assert_eq!(back.value(i), *v);
+                    }
+                }
+            }
+
+            /// Unsigned integers are the other half of that range.
+            #[test]
+            fn roundtrip_u64(values in prop::collection::vec(any::<Option<u64>>(), 1..32)) {
+                let before = values.clone();
+                let back = UInt64Array::from(
+                    roundtrip(Arc::new(UInt64Array::from(values))).unwrap(),
+                );
+                for (i, expected) in before.iter().enumerate() {
+                    prop_assert_eq!(back.is_null(i), expected.is_none());
+                    if let Some(v) = expected {
+                        prop_assert_eq!(back.value(i), *v);
+                    }
+                }
+            }
+
+            /// Every finite `f64` replays bit-identical. This is the general
+            /// form of `finite_floats_round_trip_bit_identical`: the shortest
+            /// round-trip encoding has to hold across the range, not just at
+            /// the four values that were known to drift.
+            #[test]
+            fn roundtrip_finite_f64(
+                values in prop::collection::vec(
+                    proptest::option::of(any::<f64>().prop_filter("finite", |f| f.is_finite())),
+                    1..32,
+                ),
+            ) {
+                let before = values.clone();
+                let back = Float64Array::from(
+                    roundtrip(Arc::new(Float64Array::from(values))).unwrap(),
+                );
+                assert_f64_bits(&before, &back);
+            }
+
+            /// Same for `f32`, which takes a separate branch in the encoder.
+            #[test]
+            fn roundtrip_finite_f32(
+                values in prop::collection::vec(
+                    proptest::option::of(any::<f32>().prop_filter("finite", |f| f.is_finite())),
+                    1..32,
+                ),
+            ) {
+                let before = values.clone();
+                let back = Float32Array::from(
+                    roundtrip(Arc::new(Float32Array::from(values))).unwrap(),
+                );
+                prop_assert_eq!(back.len(), before.len());
+                for (i, expected) in before.iter().enumerate() {
+                    match expected {
+                        Some(v) => {
+                            prop_assert!(!back.is_null(i));
+                            prop_assert_eq!(back.value(i).to_bits(), v.to_bits());
+                        }
+                        None => prop_assert!(back.is_null(i)),
+                    }
+                }
+            }
+
+            /// Non-finite floats and genuine nulls stay distinguishable at any
+            /// mix. A NaN must never come back as a null, and a null must never
+            /// come back as a value -- the validity bitmap is what a node's
+            /// `is_null()` branches read.
+            #[test]
+            fn roundtrip_preserves_the_validity_bitmap(
+                values in prop::collection::vec(
+                    prop_oneof![
+                        Just(None),
+                        Just(Some(f64::NAN)),
+                        Just(Some(f64::INFINITY)),
+                        Just(Some(f64::NEG_INFINITY)),
+                        any::<f64>().prop_filter("finite", |f| f.is_finite()).prop_map(Some),
+                    ],
+                    1..32,
+                ),
+            ) {
+                let before = values.clone();
+                let back = Float64Array::from(
+                    roundtrip(Arc::new(Float64Array::from(values))).unwrap(),
+                );
+                prop_assert_eq!(
+                    back.null_count(),
+                    before.iter().filter(|v| v.is_none()).count(),
+                );
+                assert_f64_bits(&before, &back);
+            }
+
+            /// Strings survive exactly, including empty and non-ASCII content.
+            #[test]
+            fn roundtrip_strings(
+                values in prop::collection::vec(proptest::option::of(".{0,24}"), 1..16),
+            ) {
+                let refs: Vec<Option<&str>> = values.iter().map(|v| v.as_deref()).collect();
+                let back = StringArray::from(
+                    roundtrip(Arc::new(StringArray::from(refs))).unwrap(),
+                );
+                for (i, expected) in values.iter().enumerate() {
+                    match expected {
+                        Some(v) => prop_assert_eq!(back.value(i), v.as_str()),
+                        None => prop_assert!(back.is_null(i)),
+                    }
+                }
+            }
+
+            #[test]
+            fn roundtrip_bools(values in prop::collection::vec(any::<Option<bool>>(), 1..32)) {
+                let before = values.clone();
+                let back = BooleanArray::from(
+                    roundtrip(Arc::new(BooleanArray::from(values))).unwrap(),
+                );
+                for (i, expected) in before.iter().enumerate() {
+                    match expected {
+                        Some(v) => prop_assert_eq!(back.value(i), *v),
+                        None => prop_assert!(back.is_null(i)),
+                    }
+                }
+            }
+
+            /// Totality: decoding reports an error for anything it cannot
+            /// represent and never panics. By the time a recording is replayed
+            /// it is just a file -- it may have been hand-edited, truncated, or
+            /// written by a different dora version, so the reader has to treat
+            /// its contents as untrusted.
+            #[test]
+            fn read_input_data_never_panics(
+                data in prop::collection::vec(
+                    prop_oneof![
+                        Just(serde_json::Value::Null),
+                        any::<i64>().prop_map(|v| serde_json::json!(v)),
+                        any::<bool>().prop_map(|v| serde_json::json!(v)),
+                        ".{0,8}".prop_map(|v: String| serde_json::json!(v)),
+                        Just(serde_json::json!("NaN")),
+                        Just(serde_json::json!([1, 2])),
+                        Just(serde_json::json!({"inner": 1})),
+                    ],
+                    0..8,
+                ),
+                declared in prop_oneof![
+                    Just(None),
+                    Just(Some(serde_json::json!("Int64"))),
+                    Just(Some(serde_json::json!("Float64"))),
+                    Just(Some(serde_json::json!("Utf8"))),
+                    Just(Some(serde_json::json!("Boolean"))),
+                    Just(Some(serde_json::json!("NotAType"))),
+                ],
+            ) {
+                let _ = read_input_data(InputData::JsonObject {
+                    data: serde_json::Value::Array(data),
+                    data_type: declared,
+                });
+            }
+        }
+    }
 }

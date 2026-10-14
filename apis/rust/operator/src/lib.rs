@@ -18,36 +18,143 @@
 #![warn(unsafe_op_in_unsafe_fn)]
 #![allow(clippy::missing_safety_doc)]
 
-pub use dora_arrow_convert::*;
+use dora_arrow_convert::internal::array_ref;
+pub use dora_arrow_convert::{DoraArray, IntoArrow, into_vec};
 pub use dora_operator_api_macros::register_operator;
 pub use dora_operator_api_types as types;
 pub use types::DoraStatus;
-use types::{
-    Metadata, Output, SendOutput,
-    arrow::{self, array::Array},
-};
+use types::{Metadata, Output, SendOutput, arrow};
+
+/// dora's **internal** Arrow major, re-exported under a name that states it.
+///
+/// Enabled by the `arrow-v59` feature, which also unlocks
+/// [`DoraArray::as_array`] / [`DoraArray::from_array`] and `IntoArrow for
+/// ArrayRef`. Together they are what lets an operator read and send a typed
+/// Arrow array:
+///
+/// ```
+/// use dora_operator_api::{Event, arrow_v59::array::ArrayRef};
+///
+/// fn handle(event: &Event) {
+///     if let Event::Input { data, .. } = event {
+///         let array: &ArrayRef = data.as_array();
+///         println!("received {} rows", array.len());
+///     }
+/// }
+/// ```
+///
+/// This is deliberately not a bare `pub use arrow;`, for the same reason
+/// `dora_node_api::arrow_v59` is not: an unversioned re-export changes meaning
+/// silently when dora bumps its internal major, whereas `arrow_v59` either
+/// resolves or does not.
+#[cfg(feature = "arrow-v59")]
+pub use types::arrow as arrow_v59;
 
 pub mod raw;
 
+/// An event delivered to an operator's [`DoraOperator::on_event`] callback.
+///
+/// The dataflow runtime dispatches one `Event` per occurrence: a received
+/// input, a failed input decode, an input that will produce no more data, a
+/// runtime error on the event stream, or a request to shut down. The enum is
+/// `#[non_exhaustive]`, so implementations must include a catch-all arm to stay
+/// forward-compatible with future variants.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Event<'a> {
+    /// A new input arrived on one of the operator's declared inputs.
     Input {
+        /// The input id, as declared in the dataflow YAML.
         id: &'a str,
+        /// Metadata associated with this input (e.g. OpenTelemetry context).
         metadata: &'a types::Metadata,
-        data: ArrowData,
+        /// The Arrow-encoded payload.
+        data: DoraArray,
     },
+    /// The payload for an input could not be decoded into an Arrow array.
+    ///
+    /// The input id and a human-readable description are provided so the
+    /// operator can log or surface the failure.
     InputParseError {
+        /// The input id whose payload failed to decode.
         id: &'a str,
+        /// A human-readable description of the decode failure.
         error: String,
     },
+    /// An input was closed: its source finished, so no further `Input` events
+    /// will be delivered for this id.
     InputClosed {
+        /// The input id that was closed.
         id: &'a str,
     },
+    /// The runtime requested a graceful shutdown. The operator should finish
+    /// any pending work and return [`DoraStatus::Stop`].
     Stop,
+    /// The runtime reported an error on the event stream itself — for example a
+    /// payload that could not be deserialized, an unrecognized daemon event, or
+    /// a fatal stream failure.
+    ///
+    /// This is distinct from [`InputParseError`](Event::InputParseError), which
+    /// is tied to a specific input id; an `Error` concerns the stream as a
+    /// whole. The operator can log or surface it and decide how to proceed;
+    /// returning `Err` from `on_event` reports it as fatal and stops the
+    /// operator.
+    Error {
+        /// A human-readable description of the error.
+        error: &'a str,
+    },
 }
 
+/// Trait implemented by every dora operator.
+///
+/// An operator is driven by the dataflow runtime: it is constructed via
+/// [`Default`] and then receives a stream of [`Event`]s through
+/// [`on_event`](DoraOperator::on_event), sending outputs back through the
+/// [`DoraOutputSender`]. Register your implementation with the
+/// [`register_operator!`](crate::register_operator) macro so the runtime can
+/// load it.
+///
+/// # Example
+///
+/// ```
+/// use dora_operator_api::{DoraOperator, DoraOutputSender, DoraStatus, Event, IntoArrow};
+///
+/// #[derive(Default)]
+/// struct ExampleOperator {
+///     ticks: u64,
+/// }
+///
+/// impl DoraOperator for ExampleOperator {
+///     fn on_event(
+///         &mut self,
+///         event: &Event,
+///         output_sender: &mut DoraOutputSender,
+///     ) -> Result<DoraStatus, String> {
+///         match event {
+///             Event::Input { id, .. } if *id == "tick" => {
+///                 self.ticks += 1;
+///                 output_sender.send("count", self.ticks.into_arrow())?;
+///                 Ok(DoraStatus::Continue)
+///             }
+///             Event::InputParseError { id, error } => {
+///                 Err(format!("failed to parse input `{id}`: {error}"))
+///             }
+///             Event::Stop => Ok(DoraStatus::Stop),
+///             // Ignore other inputs, input-closed notifications, and any
+///             // future (non_exhaustive) variants.
+///             _ => Ok(DoraStatus::Continue),
+///         }
+///     }
+/// }
+/// ```
 pub trait DoraOperator: Default {
+    /// Handle a single [`Event`].
+    ///
+    /// Return [`DoraStatus::Continue`] to keep running or [`DoraStatus::Stop`]
+    /// to shut this operator down (the rest of the dataflow keeps running).
+    /// [`DoraStatus::StopAll`] is reserved for stopping the whole dataflow but
+    /// is not yet implemented — see its documentation. Returning `Err` reports
+    /// a fatal error to the runtime and stops the operator.
     #[allow(clippy::result_unit_err)] // we use a () error type only for testing
     fn on_event(
         &mut self,
@@ -56,15 +163,22 @@ pub trait DoraOperator: Default {
     ) -> Result<DoraStatus, String>;
 }
 
+/// Handle passed to [`DoraOperator::on_event`] for emitting outputs back
+/// into the dataflow.
+///
+/// Call [`DoraOutputSender::send`] with an `output_id` declared in your
+/// dataflow YAML and the data to publish. See the crate-level example for
+/// a full operator implementation.
 pub struct DoraOutputSender<'a>(&'a SendOutput);
 
 impl DoraOutputSender<'_> {
     ///  Send an output from the operator:
     ///  - `id` is the `output_id` as defined in your dataflow.
     ///  - `data` is the data that should be sent
-    pub fn send(&mut self, id: &str, data: impl Array) -> Result<(), String> {
+    pub fn send(&mut self, id: &str, data: impl IntoArrow) -> Result<(), String> {
+        let data = data.into_arrow();
         let (data_array, schema) =
-            arrow::ffi::to_ffi(&data.into_data()).map_err(|err| err.to_string())?;
+            arrow::ffi::to_ffi(&array_ref(&data).to_data()).map_err(|err| err.to_string())?;
         let result = self.0.send_output.call(Output {
             id: id.to_owned().into(),
             data_array,
@@ -77,6 +191,34 @@ impl DoraOutputSender<'_> {
     }
 }
 
+/// Guards the `arrow-v59` passthrough feature (see `Cargo.toml`). Operators
+/// are handed `DoraArray` and send `impl IntoArrow`; both the borrowing
+/// accessor and `IntoArrow for ArrayRef` live behind
+/// `dora-arrow-convert/arrow-v59`, which this crate has to forward for an
+/// operator author to be able to enable it at all.
+#[cfg(all(test, feature = "arrow-v59"))]
+mod arrow_v59_tests {
+    use super::*;
+    use arrow_v59::array::{ArrayRef, Int32Array};
+    use std::sync::Arc;
+
+    #[test]
+    fn typed_array_round_trips_through_dora_array() {
+        let array: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
+
+        // Send side: `DoraOutputSender::send` takes `impl IntoArrow`.
+        let payload: DoraArray = array.into_arrow();
+        assert_eq!(payload.len(), 3);
+
+        // Receive side: `Event::Input { data: DoraArray, .. }`.
+        let received: &ArrayRef = payload.as_array();
+        assert_eq!(received.len(), 3);
+
+        // And building a payload from a concrete Arrow array.
+        assert_eq!(DoraArray::from_array(Int32Array::from(vec![7])).len(), 1);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -85,6 +227,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingOperator {
         parse_errors: Vec<(String, String)>,
+        stream_errors: Vec<String>,
     }
 
     impl DoraOperator for RecordingOperator {
@@ -93,8 +236,14 @@ mod tests {
             event: &Event,
             _output_sender: &mut DoraOutputSender,
         ) -> Result<DoraStatus, String> {
-            if let Event::InputParseError { id, error } = event {
-                self.parse_errors.push((id.to_string(), error.clone()));
+            match event {
+                Event::InputParseError { id, error } => {
+                    self.parse_errors.push((id.to_string(), error.clone()));
+                }
+                Event::Error { error } => {
+                    self.stream_errors.push(error.to_string());
+                }
+                _ => {}
             }
             Ok(DoraStatus::Continue)
         }
@@ -207,6 +356,61 @@ mod tests {
         assert_eq!(op.parse_errors[1].0, "z");
     }
 
+    /// A stream-level `Event::Error` is populated by the runtime into
+    /// `RawEvent::error`; the FFI dispatch must deliver it to `on_event` rather
+    /// than silently dropping it (the runtime builds it for decode/stream
+    /// failures, and it previously fell through to the "unknown event" arm).
+    #[test]
+    fn stream_error_dispatched_to_on_event() {
+        let sender = noop_send_output();
+        let mut op = RecordingOperator::default();
+        let ctx: *mut std::ffi::c_void = (&mut op as *mut RecordingOperator).cast();
+
+        let mut event = types::RawEvent {
+            input: None,
+            input_closed: None,
+            stop: false,
+            error: Some("fatal event stream error".to_string().into()),
+        };
+
+        let result =
+            unsafe { crate::raw::dora_on_event::<RecordingOperator>(&mut event, &sender, ctx) };
+
+        assert!(
+            result.result.error.is_none(),
+            "a handled stream error must not itself surface as a dispatch error"
+        );
+        assert!(matches!(result.status, DoraStatus::Continue));
+        assert_eq!(
+            op.stream_errors,
+            vec!["fatal event stream error".to_string()]
+        );
+    }
+
+    /// A truly empty `RawEvent` (no input/close/stop/error) is still ignored as
+    /// an unknown event, without reaching `on_event`.
+    #[test]
+    fn empty_raw_event_is_ignored() {
+        let sender = noop_send_output();
+        let mut op = RecordingOperator::default();
+        let ctx: *mut std::ffi::c_void = (&mut op as *mut RecordingOperator).cast();
+
+        let mut event = types::RawEvent {
+            input: None,
+            input_closed: None,
+            stop: false,
+            error: None,
+        };
+
+        let result =
+            unsafe { crate::raw::dora_on_event::<RecordingOperator>(&mut event, &sender, ctx) };
+
+        assert!(result.result.error.is_none());
+        assert!(matches!(result.status, DoraStatus::Continue));
+        assert!(op.stream_errors.is_empty());
+        assert!(op.parse_errors.is_empty());
+    }
+
     #[test]
     fn send_output_is_send_sync() {
         // Compile-time proof that SendOutput (backed by ArcDynFn1) satisfies
@@ -258,5 +462,60 @@ mod tests {
             matches!(result.status, DoraStatus::Stop),
             "panic must stop the operator"
         );
+    }
+
+    struct PanicInDefault;
+
+    impl Default for PanicInDefault {
+        fn default() -> Self {
+            panic!("missing MODEL env var");
+        }
+    }
+
+    impl DoraOperator for PanicInDefault {
+        fn on_event(
+            &mut self,
+            _event: &Event,
+            _output_sender: &mut DoraOutputSender,
+        ) -> Result<DoraStatus, String> {
+            Ok(DoraStatus::Continue)
+        }
+    }
+
+    /// A panic in the operator's `Default` impl must come back as an init
+    /// error, not unwind out of the `extern "C"` shim and abort the runtime.
+    #[test]
+    fn init_panic_is_reported_as_error() {
+        let result = unsafe { raw::dora_init_operator::<PanicInDefault>() };
+        let error = result.result.error.expect("init panic must be an error");
+        assert!(error.contains("operator init panicked: missing MODEL env var"));
+        assert!(result.operator_context.is_null());
+    }
+
+    struct PanicInDrop;
+
+    impl Drop for PanicInDrop {
+        fn drop(&mut self) {
+            panic!("teardown failed");
+        }
+    }
+
+    /// Likewise, a panic in the operator's `Drop` impl must be reported.
+    #[test]
+    fn drop_panic_is_reported_as_error() {
+        let ptr: *mut PanicInDrop = Box::leak(Box::new(PanicInDrop));
+        let result = unsafe { raw::dora_drop_operator::<PanicInDrop>(ptr.cast()) };
+        let error = result.error.expect("drop panic must be an error");
+        assert!(error.contains("operator drop panicked: teardown failed"));
+    }
+
+    #[test]
+    fn init_and_drop_succeed_without_panic() {
+        let result = unsafe { raw::dora_init_operator::<RecordingOperator>() };
+        assert!(result.result.error.is_none());
+        assert!(!result.operator_context.is_null());
+        let dropped =
+            unsafe { raw::dora_drop_operator::<RecordingOperator>(result.operator_context) };
+        assert!(dropped.error.is_none());
     }
 }

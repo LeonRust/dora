@@ -40,8 +40,8 @@ nodes:
 | `strict_types` | bool | `false` | Treat type warnings as errors in `validate` and `build` |
 | `type_rules` | list | `[]` | User-defined type compatibility rules (see [Type Annotations](types.md#user-defined-compatibility-rules)) |
 | `health_check_interval` | float | `5.0` | Seconds between daemon health check sweeps. For each node with `health_check_timeout` set, the daemon checks whether the node has communicated within its timeout; if not, the node is killed and its `restart_policy` is evaluated |
-| `_unstable_deploy` | object | -- | Root-level deployment config (see [Deployment](#deployment)) |
-| `_unstable_debug` | object | -- | Debug options (see [Debug](#debug)) |
+| `deploy` | object | -- | Root-level deployment config (see [Deployment](#deployment)) |
+| `debug` | object | -- | Debug options (see [Debug](#debug)) |
 
 ## Node Configuration
 
@@ -277,7 +277,8 @@ For a complete guide to all logging features, see [Logging](logging.md).
 | `restart_delay` | float | -- | Initial backoff in seconds. Doubles each attempt |
 | `max_restart_delay` | float | -- | Cap for exponential backoff |
 | `restart_window` | float | -- | Time window for counting restarts. The counter resets after this many seconds since the first restart in the current window. Enables "N restarts per M seconds" semantics with `max_restarts` |
-| `health_check_timeout` | float | -- | If the node does not communicate with the daemon (send outputs, subscribe, etc.) for this many seconds, the daemon kills the process and evaluates the `restart_policy` |
+| `health_check_timeout` | float | -- | Once the node has connected (subscribed to events), if it then does not communicate with the daemon (send outputs, acknowledge ticks, etc.) for this many seconds, the daemon kills the process and evaluates the `restart_policy`. Covers **post-connection** liveness only |
+| `startup_timeout` | float | -- | If the node process fails to connect (subscribe to events) within this many seconds after process spawn, the daemon kills the process and evaluates the `restart_policy`. Bounds startup/initialization time. Evaluated on each `health_check_interval` tick (default 5s) |
 
 Restart policies:
 
@@ -300,18 +301,18 @@ Example with exponential backoff:
 
 ### Deployment
 
-Assign nodes to specific machines using `_unstable_deploy`:
+Assign nodes to specific machines using `deploy`:
 
 ```yaml
 - id: camera-driver
-  _unstable_deploy:
+  deploy:
     machine: robot-arm
   path: ./target/debug/camera
   outputs:
     - frames
 
 - id: ml-inference
-  _unstable_deploy:
+  deploy:
     machine: gpu-server
     labels:
       gpu: "true"
@@ -363,13 +364,14 @@ The `id` field is optional for single operators (defaults to the node `id`):
       - bbox
 ```
 
-### Multiple Operators
+### The `operators` List
 
-Each operator in `operators` **requires** a unique `id`:
+`operators` is the list form of `operator`. Its entry **requires** an `id`, which becomes part of every reference to its outputs (`<node>/<operator>/<output>`).
 
+A runtime node holds exactly one operator: the operator runtime refuses to start with zero or several, so validation rejects such a node. To run several operators, give each one its own node:
 
 ```yaml
-- id: runtime-node
+- id: preprocess
   operators:
     - id: preprocessor
       shared-library: ../../target/debug/libpreprocess
@@ -377,10 +379,12 @@ Each operator in `operators` **requires** a unique `id`:
         raw: sensor/data
       outputs:
         - processed
+- id: analyze
+  operators:
     - id: analyzer
       shared-library: ../../target/debug/libanalyze
       inputs:
-        data: runtime-node/preprocessor/processed
+        data: preprocess/preprocessor/processed
       outputs:
         - result
 ```
@@ -396,7 +400,22 @@ Operators also support `inputs`, `outputs`, `build`, `send_stdout_as`, `send_log
 
 ## ROS2 Bridge
 
-Declare a node as a ROS2 bridge to automatically convert between ROS2 DDS messages and Dora's Arrow format. No custom code needed.
+Declare a node as a ROS2 bridge to automatically convert between ROS2 messages and Dora's Arrow format. DDS is the default; native `rmw_zenoh_cpp` compatibility is selected explicitly.
+
+```yaml
+ros2:
+  transport:
+    kind: zenoh
+    compatibility: humble # or rep2016
+    config_uri: /etc/zenoh/session.json5 # optional
+  topic: /chatter
+  message_type: std_msgs/String
+  direction: subscribe
+```
+
+`config_uri` overrides `ZENOH_SESSION_CONFIG_URI`; otherwise the embedded
+Zenoh default is used. The selected profile and `ROS_DOMAIN_ID` must match the
+ROS peers.
 
 ### Single Topic
 
@@ -485,7 +504,7 @@ QoS can be set at the bridge level (applies to all topics) or per-topic:
 ## Debug
 
 ```yaml
-_unstable_debug:
+debug:
   enable_debug_inspection: true
 ```
 
@@ -507,7 +526,7 @@ See [Communication Patterns](../../../docs/patterns.md) for details and examples
 ```yaml
 health_check_interval: 10.0
 
-_unstable_debug:
+debug:
   enable_debug_inspection: true
 
 nodes:

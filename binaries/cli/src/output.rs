@@ -46,6 +46,22 @@ fn should_display(
     msg_level.passes(effective_level)
 }
 
+/// Returns whether `msg` passes the configured minimum-level / per-node level
+/// filters. Exposed so the `logs` command can drop filtered-out messages
+/// *before* applying `--tail`, so tail counts only lines that will be shown.
+pub(crate) fn message_passes_level_filter(msg: &LogMessage, config: &LogOutputConfig) -> bool {
+    let node_id_str = msg.node_id.as_ref().map(|n| n.to_string());
+    should_display(&msg.level, node_id_str.as_deref(), config)
+}
+
+/// Returns whether the configured level filters can drop any message. When
+/// this is true, `--tail` must be applied client-side (after filtering) rather
+/// than pre-tailed at the coordinator, otherwise older matching lines are
+/// trimmed away before the level filter ever sees them.
+pub(crate) fn level_filter_is_active(config: &LogOutputConfig) -> bool {
+    !matches!(config.min_level, LogLevelOrStdout::Stdout) || !config.node_filters.is_empty()
+}
+
 pub fn print_log_message(log_message: LogMessage, config: &LogOutputConfig) {
     let node_id_str = log_message.node_id.as_ref().map(|n| n.to_string());
     if !should_display(&log_message.level, node_id_str.as_deref(), config) {
@@ -60,6 +76,23 @@ pub fn print_log_message(log_message: LogMessage, config: &LogOutputConfig) {
 }
 
 fn print_pretty(log_message: LogMessage, config: &LogOutputConfig) {
+    let is_system = log_message.node_id.is_none();
+    let is_lifecycle = is_system && is_lifecycle_message(&log_message.message);
+    let line = format_pretty_line(&log_message, config);
+
+    if is_lifecycle {
+        println!();
+    }
+    println!("{line}");
+    if is_lifecycle {
+        println!();
+    }
+}
+
+/// Render a single log message as a colored one-line string for the `pretty`
+/// format. Kept separate from [`print_pretty`] so the exact column spacing is
+/// unit-testable without capturing stdout.
+fn format_pretty_line(log_message: &LogMessage, config: &LogOutputConfig) -> String {
     let LogMessage {
         build_id: _,
         dataflow_id,
@@ -75,9 +108,7 @@ fn print_pretty(log_message: LogMessage, config: &LogOutputConfig) {
         fields: _,
     } = log_message;
 
-    let is_system = node_id.is_none();
-
-    let level_str = match &level {
+    let level_str = match level {
         LogLevelOrStdout::LogLevel(level) => match level {
             log::Level::Error => "ERROR ".red(),
             log::Level::Warn => "WARN  ".yellow(),
@@ -94,19 +125,22 @@ fn print_pretty(log_message: LogMessage, config: &LogOutputConfig) {
         }
         _ => String::new().cyan(),
     };
-    let daemon = match daemon_id {
-        Some(id) if config.print_daemon_name => match id.machine_id() {
+    let daemon = if config.print_daemon_name {
+        // A daemon with no machine id (or no daemon at all) is the default
+        // daemon; both render the same, with no trailing space so the colon
+        // that follows a node-scoped label abuts it directly.
+        match daemon_id.as_ref().and_then(|id| id.machine_id()) {
             Some(machine_id) => format!("on daemon `{machine_id}`"),
-            None => "on default daemon ".to_string(),
-        },
-        None if config.print_daemon_name => "on default daemon".to_string(),
-        _ => String::new(),
+            None => "on default daemon".to_string(),
+        }
+    } else {
+        String::new()
     }
     .bright_black();
     let time = format!("{}", timestamp.with_timezone(&Local).format("%H:%M:%S"));
     let colon = ":".bright_black().bold();
     let node = match node_id {
-        Some(ref node_id) => {
+        Some(node_id) => {
             let colored_id = node_id
                 .to_string()
                 .bold()
@@ -128,13 +162,12 @@ fn print_pretty(log_message: LogMessage, config: &LogOutputConfig) {
         None => "".normal(),
     };
 
-    if is_system && is_lifecycle_message(&message) {
-        println!();
-    }
-    println!("{time} {level_str} {dataflow} {node}{target} {message}");
-    if is_system && is_lifecycle_message(&message) {
-        println!();
-    }
+    // `dataflow` and `target` already carry their own trailing space when
+    // present and are empty strings otherwise, so they must abut the next
+    // field directly — inserting a literal space around them here produced a
+    // spurious double space on every line where they were empty (the default,
+    // i.e. almost all output).
+    format!("{time} {level_str} {dataflow}{node}{target}{message}")
 }
 
 fn is_lifecycle_message(message: &str) -> bool {
@@ -183,19 +216,25 @@ pub fn parse_jsonl_line(line: &str) -> Option<LogMessage> {
     let v: serde_json::Value = serde_json::from_str(line).ok()?;
     let ts = v.get("ts")?.as_str()?;
     let timestamp = chrono::DateTime::parse_from_rfc3339(ts).ok()?.to_utc();
-    let level_str = v.get("level")?.as_str().unwrap_or("stdout");
-    let level = match level_str {
-        "error" => LogLevelOrStdout::LogLevel(log::Level::Error),
-        "warn" => LogLevelOrStdout::LogLevel(log::Level::Warn),
-        "info" => LogLevelOrStdout::LogLevel(log::Level::Info),
-        "debug" => LogLevelOrStdout::LogLevel(log::Level::Debug),
-        "trace" => LogLevelOrStdout::LogLevel(log::Level::Trace),
-        _ => LogLevelOrStdout::Stdout,
-    };
+    // A missing `level` key, a non-string value, or an unrecognized level all
+    // default to stdout, so that externally-produced JSONL log lines are still
+    // shown rather than silently dropped. Reuse `parse_log_level_str` (the
+    // single source of truth for level names) so a capitalized level such as
+    // "INFO" is classified correctly instead of falling through to stdout.
+    let level = v
+        .get("level")
+        .and_then(|l| l.as_str())
+        .and_then(|s| parse_log_level_str(s).ok())
+        .unwrap_or(LogLevelOrStdout::Stdout);
+    // Parse fallibly: `NodeId::from` panics on any id that fails validation,
+    // and this input is untrusted -- it comes from a log file that may have
+    // been written by an older dora version (whose id rules were laxer) or by
+    // an external producer. A malformed id degrades to `None` (rendered as the
+    // default node label) instead of aborting the whole `dora logs` command.
     let node_id = v
         .get("node")
         .and_then(|n| n.as_str())
-        .map(|s| dora_message::id::NodeId::from(s.to_string()));
+        .and_then(|s| s.parse::<dora_message::id::NodeId>().ok());
     let message = v
         .get("msg")
         .and_then(|m| m.as_str())
@@ -205,6 +244,12 @@ pub fn parse_jsonl_line(line: &str) -> Option<LogMessage> {
         .get("target")
         .and_then(|t| t.as_str())
         .map(|s| s.to_string());
+    // The daemon writes a node's structured `tracing` fields here; keep them
+    // so `--log-format json` shows them. A malformed value is dropped rather
+    // than failing the line.
+    let fields = v
+        .get("fields")
+        .and_then(|f| serde::Deserialize::deserialize(f).ok());
 
     Some(LogMessage {
         build_id: None,
@@ -218,11 +263,33 @@ pub fn parse_jsonl_line(line: &str) -> Option<LogMessage> {
         line: None,
         message,
         timestamp,
-        fields: None,
+        fields,
     })
 }
 
-/// Parse a log filter string like "sensor=debug,processor=warn".
+/// Parse a log filter string like `"sensor=debug,processor=warn"` into a
+/// per-node level map.
+///
+/// Segments are comma-separated `node=level` pairs; surrounding whitespace is
+/// trimmed and empty segments are skipped. A segment without `=`, or one whose
+/// level is not one of `error|warn|info|debug|trace|stdout` (see
+/// [`parse_log_level_str`]), is an error.
+///
+/// ```
+/// # fn main() -> Result<(), String> {
+/// use dora_cli::output::parse_log_filter;
+///
+/// let map = parse_log_filter("sensor=debug, processor=warn")?;
+/// assert_eq!(map.len(), 2);
+///
+/// // Trailing/empty segments are ignored.
+/// assert_eq!(parse_log_filter("sensor=info,")?.len(), 1);
+///
+/// // A segment without `=` is rejected.
+/// assert!(parse_log_filter("sensor").is_err());
+/// # Ok(())
+/// # }
+/// ```
 pub fn parse_log_filter(s: &str) -> Result<HashMap<String, LogLevelOrStdout>, String> {
     let mut map = HashMap::new();
     for pair in s.split(',') {
@@ -239,6 +306,18 @@ pub fn parse_log_filter(s: &str) -> Result<HashMap<String, LogLevelOrStdout>, St
     Ok(map)
 }
 
+/// Parse a single log-level token into a [`LogLevelOrStdout`].
+///
+/// Accepts `error|warn|info|debug|trace|stdout`, case-insensitively; any other
+/// value is an error.
+///
+/// ```
+/// use dora_cli::output::parse_log_level_str;
+///
+/// assert!(parse_log_level_str("INFO").is_ok());
+/// assert!(parse_log_level_str("stdout").is_ok());
+/// assert!(parse_log_level_str("verbose").is_err());
+/// ```
 pub fn parse_log_level_str(s: &str) -> Result<LogLevelOrStdout, String> {
     match s.to_lowercase().as_str() {
         "error" => Ok(LogLevelOrStdout::LogLevel(log::Level::Error)),
@@ -348,6 +427,89 @@ fn calculate_char_sum(s: &str) -> f32 {
 mod tests {
     use super::*;
 
+    // --- format_pretty_line spacing ---
+
+    fn pretty_message(node: Option<&str>, target: Option<&str>, message: &str) -> LogMessage {
+        LogMessage {
+            build_id: None,
+            dataflow_id: None,
+            node_id: node.map(|n| dora_message::id::NodeId::from(n.to_string())),
+            daemon_id: None,
+            level: LogLevelOrStdout::LogLevel(log::Level::Info),
+            target: target.map(|t| t.to_string()),
+            module_path: None,
+            file: None,
+            line: None,
+            message: message.to_string(),
+            timestamp: chrono::Utc::now(),
+            fields: None,
+        }
+    }
+
+    /// The rendered line is `"<time> <rest>"`; the time has no spaces, so this
+    /// returns everything after the first space for a timezone-independent
+    /// assertion.
+    fn rendered_rest(msg: LogMessage, config: &LogOutputConfig) -> String {
+        colored::control::set_override(false);
+        let line = format_pretty_line(&msg, config);
+        line.split_once(' ').unwrap().1.to_string()
+    }
+
+    #[test]
+    fn pretty_line_default_has_no_double_space() {
+        // The common case: no dataflow id, no daemon name, no target. The
+        // `dataflow`/`target` fields are empty here, so they must not each
+        // contribute a stray separator space (regression: `node:  message`).
+        let config = LogOutputConfig::default();
+        let rest = rendered_rest(pretty_message(Some("sensor"), None, "hello"), &config);
+        assert_eq!(rest, "INFO   sensor: hello");
+        assert!(
+            !rest.contains("sensor:  hello"),
+            "double space before message: {rest:?}"
+        );
+    }
+
+    #[test]
+    fn pretty_line_with_target_single_space() {
+        let config = LogOutputConfig::default();
+        let rest = rendered_rest(
+            pretty_message(Some("sensor"), Some("mymod"), "hello"),
+            &config,
+        );
+        assert_eq!(rest, "INFO   sensor: mymod hello");
+        assert!(
+            !rest.contains("mymod  hello"),
+            "double space before message: {rest:?}"
+        );
+    }
+
+    #[test]
+    fn pretty_line_system_message_no_double_space() {
+        let config = LogOutputConfig::default();
+        let rest = rendered_rest(pretty_message(None, None, "coordinator ready"), &config);
+        assert_eq!(rest, "INFO   [dora]: coordinator ready");
+    }
+
+    #[test]
+    fn pretty_line_default_daemon_no_space_before_colon() {
+        // A node-scoped message on the unnamed/default daemon (a `DaemonId`
+        // with no machine id) with `print_daemon_name` on must render the same
+        // way the named-daemon path does — no stray space before the colon
+        // (regression: `sensor on default daemon : hello`).
+        let config = LogOutputConfig {
+            print_daemon_name: true,
+            ..LogOutputConfig::default()
+        };
+        let mut msg = pretty_message(Some("sensor"), None, "hello");
+        msg.daemon_id = Some(dora_message::common::DaemonId::new(None));
+        let rest = rendered_rest(msg, &config);
+        assert_eq!(rest, "INFO   sensor on default daemon: hello");
+        assert!(
+            !rest.contains("on default daemon :"),
+            "stray space before the colon: {rest:?}"
+        );
+    }
+
     // --- parse_log_level_str ---
 
     #[test]
@@ -450,6 +612,82 @@ mod tests {
             LogLevelOrStdout::LogLevel(log::Level::Info)
         ));
         assert_eq!(msg.node_id.unwrap().to_string(), "sensor");
+    }
+
+    #[test]
+    fn parse_jsonl_daemon_compact_keeps_fields() {
+        let line = r#"{"ts":"2025-01-01T00:00:00Z","level":"info","node":"sensor","msg":"reading","target":null,"fields":{"sensor_id":"temp-01"}}"#;
+        let msg = parse_jsonl_line(line).unwrap();
+        assert_eq!(
+            msg.fields,
+            Some(std::collections::BTreeMap::from([(
+                "sensor_id".to_string(),
+                "temp-01".to_string()
+            )]))
+        );
+
+        let line = r#"{"ts":"2025-01-01T00:00:00Z","level":"info","msg":"m","fields":null}"#;
+        assert_eq!(parse_jsonl_line(line).unwrap().fields, None);
+        let line = r#"{"ts":"2025-01-01T00:00:00Z","level":"info","msg":"m","fields":[1]}"#;
+        assert_eq!(parse_jsonl_line(line).unwrap().fields, None);
+    }
+
+    #[test]
+    fn parse_jsonl_missing_level_defaults_to_stdout() {
+        // A line without a `level` key must still be parsed (defaulting to
+        // stdout), not silently dropped.
+        let line = r#"{"ts":"2025-01-01T00:00:00Z","node":"sensor","msg":"hello"}"#;
+        let msg = parse_jsonl_line(line).expect("line without level should still parse");
+        assert_eq!(msg.message, "hello");
+        assert!(matches!(msg.level, LogLevelOrStdout::Stdout));
+        assert_eq!(msg.node_id.unwrap().to_string(), "sensor");
+    }
+
+    #[test]
+    fn parse_jsonl_non_string_level_defaults_to_stdout() {
+        let line = r#"{"ts":"2025-01-01T00:00:00Z","level":42,"msg":"hi"}"#;
+        let msg = parse_jsonl_line(line).expect("line with non-string level should still parse");
+        assert!(matches!(msg.level, LogLevelOrStdout::Stdout));
+    }
+
+    #[test]
+    fn parse_jsonl_capitalized_level_is_classified() {
+        // An external tool emitting a capitalized level must be classified,
+        // not silently treated as stdout.
+        let line = r#"{"ts":"2025-01-01T00:00:00Z","level":"INFO","msg":"hi"}"#;
+        let msg = parse_jsonl_line(line).unwrap();
+        assert!(matches!(
+            msg.level,
+            LogLevelOrStdout::LogLevel(log::Level::Info)
+        ));
+    }
+
+    #[test]
+    fn parse_jsonl_unknown_level_defaults_to_stdout() {
+        let line = r#"{"ts":"2025-01-01T00:00:00Z","level":"bogus","msg":"hi"}"#;
+        let msg = parse_jsonl_line(line).unwrap();
+        assert!(matches!(msg.level, LogLevelOrStdout::Stdout));
+    }
+
+    #[test]
+    fn parse_jsonl_invalid_node_id_does_not_panic() {
+        // Log files written by an older dora (or by an external producer) can
+        // carry a node id that today's `validate_node_id` rejects -- notably
+        // the now-reserved `dora`. Parsing must degrade to `node_id: None`
+        // rather than panicking, which would abort the whole `dora logs` run
+        // on a single bad line.
+        for node in ["dora", "bad id", "node/out", ".hidden", ""] {
+            let line = format!(
+                r#"{{"ts":"2025-01-01T00:00:00Z","level":"info","node":"{node}","msg":"hello"}}"#
+            );
+            let msg = parse_jsonl_line(&line)
+                .unwrap_or_else(|| panic!("line with node `{node}` should still parse"));
+            assert_eq!(msg.message, "hello");
+            assert!(
+                msg.node_id.is_none(),
+                "invalid node id `{node}` must not yield a NodeId"
+            );
+        }
     }
 
     #[test]

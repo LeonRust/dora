@@ -1,6 +1,46 @@
 # ROS2 Bridge
 
-Dora talks to the ROS2 ecosystem (topics, services, actions, parameters) over a **pure-Rust DDS/RTPS stack** (`ros2-client` + `rustdds`) -- it never links `rcl`/`rclcpp`, and data crosses as Apache Arrow `StructArray`, converted to/from ROS2 CDR at the boundary.
+Dora talks to the ROS2 ecosystem (topics, services, actions, parameters) through an explicitly selected transport. DDS uses the pure-Rust `ros2-client` + `rustdds` stack and remains the default. Native Zenoh speaks the `rmw_zenoh_cpp` wire protocol directly. Neither path links `rcl`/`rclcpp`; data crosses as Apache Arrow `StructArray`, converted to/from ROS2 CDR at the boundary.
+
+## Transport selection
+
+Omitting `transport` preserves DDS behavior. Native Zenoh must select an
+identity profile explicitly:
+
+```yaml
+ros2:
+  transport:
+    kind: zenoh
+    compatibility: humble # legacy TypeHashNotSupported identity
+    config_uri: /etc/zenoh/session.json5 # optional
+  topic: /chatter
+  message_type: std_msgs/String
+  direction: subscribe
+```
+
+Use `compatibility: humble` with the Humble `rmw_zenoh_cpp` line and
+`compatibility: rep2016` with distributions that publish REP-2016 type hashes.
+The profile is never auto-detected: choosing the wrong one deliberately yields
+an empty graph instead of guessing an incompatible wire identity.
+
+The wire contract follows the upstream
+[`rmw_zenoh` design](https://github.com/ros2/rmw_zenoh/blob/rolling/docs/design.md),
+including CDR payloads, attachments, keys, and liveliness tokens. The modern
+profile derives identities from [REP-2016](https://www.ros.org/reps/rep-2016.html)
+type-description hashes.
+
+Start the distribution's `rmw_zenohd` before the dataflow. Zenoh configuration
+precedence is the explicit `config_uri`, then `ZENOH_SESSION_CONFIG_URI`, then
+the embedded default. An explicitly empty URI is invalid. `ROS_DOMAIN_ID`
+defaults to `0`; graph and data keys are domain-scoped, and namespaces remain
+part of the ROS fully-qualified endpoint name.
+
+Supported neutral QoS includes reliability, volatile/transient-local
+durability, keep-last/keep-all history, and automatic/manual liveliness.
+Transient-local replay is bounded by the configured history. A
+`zenoh-bridge-ros2dds` process is not a substitute for this mode: it bridges a
+DDS graph, while native mode must match `rmw_zenoh_cpp` data keys, liveliness
+tokens, attachments, and type identities directly.
 
 There are **two ways** to use the bridge, covered in this guide:
 
@@ -43,20 +83,20 @@ How a Dora node reaches the ROS2 wire, and what each surface offers:
                 │                                    │
                 └──────────────┬─────────────────────┘
                                │  serialize ↔ Arrow ↔ CDR
-                  ┌────────────▼─────────────┐
-                  │  PURE-RUST DDS/RTPS STACK │   ← never links rcl / rclcpp
-                  │  ros2-client · rustdds     │
-                  └────────────┬─────────────┘
-                               │  RTPS over UDP (SPDP discovery)
+                 ┌─────────────▼────────────────────────┐
+                 │ selected transport                    │
+                 │ DDS: ros2-client/rustdds              │
+                 │ Zenoh: native rmw_zenoh wire adapter  │
+                 └─────────────┬────────────────────────┘
+                               │  RTPS or Zenoh
         ╔══════════════════════▼═══════════════════════════════════╗
-        ║  DDS WIRE  ──  ROS2 ECOSYSTEM (rclcpp / rclpy nodes,       ║
-        ║                turtlesim, ros2 CLI, Nav2, ...)            ║
+        ║  ROS2 ECOSYSTEM (rclcpp / rclpy nodes, CLI, Nav2, ...)   ║
         ╚═══════════════════════════════════════════════════════════╝
 ```
 
-Both surfaces ride the same `ros2-client` / `rustdds` stack. "Client" = a Dora
-node calling into ROS2 (dora→ROS2); "server" = a Dora node serving ROS2 clients
-(ROS2→dora).
+Both surfaces preserve DDS as their default. Selecting native Zenoh uses its
+own graph and endpoint implementations. "Client" = a Dora node calling into
+ROS2 (dora→ROS2); "server" = a Dora node serving ROS2 clients (ROS2→dora).
 
 **Capability × surface (all supported):**
 
@@ -78,18 +118,31 @@ Runnable examples for every cell live under
 When the Dora descriptor resolver encounters a `ros2:` key on a node, it converts it into a `Custom` node pointing to the `dora-ros2-bridge-node` binary. The bridge config is serialized as JSON into the `DORA_ROS2_BRIDGE_CONFIG` environment variable.
 
 ```
-User Node <--(Arrow/SharedMem)--> Bridge Binary <--(CDR/DDS)--> ROS2
+User Node <--(Arrow/SharedMem)--> Bridge Binary <--(CDR over DDS or Zenoh)--> ROS2
 ```
 
 The bridge binary:
 
 1. Reads `AMENT_PREFIX_PATH` to locate installed ROS2 message packages
 2. Parses message/service/action definitions at startup
-3. Creates a `ros2_client` node and the appropriate publishers, subscribers, clients, or servers
+3. Creates a neutral bridge node and backend-specific publishers, subscribers, clients, or servers
 4. Converts incoming ROS2 CDR messages to Arrow `StructArray` (subscribe/response/feedback)
 5. Converts incoming Arrow `StructArray` to ROS2 CDR messages (publish/request/goal)
 
 Your user nodes never link against ROS2 -- all ROS2 communication is isolated in the bridge binary.
+
+### Native Zenoh troubleshooting
+
+- **Empty graph:** confirm `rmw_zenohd` is running, both processes use the same
+  `ROS_DOMAIN_ID`, and Dora selected the profile for the peer distribution.
+- **Missing type hash:** `rep2016` needs the package's installed JSON type
+  descriptions in `AMENT_PREFIX_PATH`. Humble instead advertises the legacy
+  `TypeHashNotSupported` identity.
+- **Router unavailable:** verify the configured endpoint and configuration-file
+  permissions. An explicit `config_uri` overrides `ZENOH_SESSION_CONFIG_URI`.
+- **Calls hang despite visible endpoints:** confirm the ROS peer actually uses
+  `rmw_zenoh_cpp`; a DDS RMW or `zenoh-bridge-ros2dds` graph is a different wire
+  contract. Set `DORA_ROS2_ZENOH_TRACE=1` to print native liveliness activity.
 
 ---
 
@@ -100,6 +153,26 @@ Your user nodes never link against ROS2 -- all ROS2 communication is isolated in
 - **For service client**: A ROS2 service server must be running (or use a companion server dataflow)
 - **For action client**: A ROS2 action server must be running *before* starting the dataflow (no `wait_for_action_server` mechanism)
 - **For action server**: A ROS2 action client sends goals to the bridge (e.g., `ros2 action send_goal`)
+
+### Building for your ROS distro
+
+Published bridge builds target Humble. On another distro, build with the matching feature before running a dataflow, or the bridge logs `ROS_DISTRO='jazzy' but ros2-client was built for 'humble'`.
+
+The `ros2-humble` (default), `ros2-iron`, `ros2-jazzy`, and `ros2-kilted` features are a single choice for the whole build, not an additive set. `ros2-client` compiles for the newest distro feature it sees, so `ros2-jazzy` replaces Humble's 24-byte `Gid` with Jazzy's 16-byte one rather than adding Jazzy support alongside Humble, and no dora feature turns that back off. Because Cargo unifies `ros2-client`'s features across the whole build, enabling a newer distro in any other crate switches the bridge too -- including a crate that depends on `ros2-client` with its default features, since its own default is `jazzy`. Humble is only the floor the workspace pins, so there is no way to force exactly Humble. Nothing warns at build time; check the startup `ROS_DISTRO` log, which `ros2-client` logs as an error on a mismatch and as a warning when `ROS_DISTRO` is unset.
+
+- **YAML bridge**: `dora-ros2-bridge-node` isn't shipped with the CLI, so install it for your distro and keep it on `PATH` (the resolver spawns it by name):
+
+  ```bash
+  cargo install --git https://github.com/dora-rs/dora dora-ros2-bridge-node --features ros2-jazzy
+  ```
+
+- **In-process Python (`from dora import Ros2Context`)**: the `dora-rs` wheel links the bridge, so rebuild it with maturin:
+
+  ```bash
+  maturin build -m apis/python/node/Cargo.toml --features ros2-jazzy
+  ```
+
+- **C++ nodes**: `dora-node-api-cxx` has no `ros2-*` features of its own and gets the Humble default, so enable `dora-ros2-bridge/ros2-jazzy` directly to target another distro.
 
 ---
 
@@ -169,14 +242,16 @@ Multi-topic mode supports up to 64 topics per bridge node.
 
 ### Input/Output ID Mapping
 
-By default, topic names are converted to Dora IDs by stripping the leading `/` and replacing remaining `/` with `_`:
+A topic name maps to a *derived* Dora ID by stripping the leading `/` and replacing remaining `/` with `_`:
 
-| ROS2 Topic | Default Dora ID |
+| ROS2 Topic | Derived Dora ID |
 |------------|------------------|
 | `/turtle1/pose` | `turtle1_pose` |
 | `/camera/image_raw` | `camera_image_raw` |
 
-In multi-topic mode, you can override this with explicit `output` (for subscribe) or `input` (for publish) fields. In single-topic mode, the node's declared `outputs` or `inputs` are used directly.
+In multi-topic mode, you can override this with explicit `output` (for subscribe) or `input` (for publish) fields; without an override the derived id must be one of the node's declared ports, or the dataflow is rejected.
+
+In single-topic mode there is no `output`/`input` field, so the node's declared port is used directly: `topic: /turtle1/pose` with `outputs: [pose]` binds to `pose`. When the node declares several ports the choice is ambiguous and the dataflow is rejected — unless one of them *is* the derived id, which then wins (so a bridge can still declare an extra `send_stdout_as` output). Use multi-topic mode with an explicit mapping when you need several ports and a custom name.
 
 ---
 
@@ -471,22 +546,30 @@ nodes:
 In multi-topic mode, each topic can override the bridge-level QoS:
 
 ```yaml
-ros2:
-  topics:
-    - topic: /fast_sensor
-      message_type: sensor_msgs/Imu
-      direction: subscribe
+nodes:
+  - id: sensor_bridge
+    ros2:
+      topics:
+        - topic: /fast_sensor
+          message_type: sensor_msgs/Imu
+          direction: subscribe
+          qos:
+            reliable: false          # override: best effort for this topic
+            keep_last: 1
+        - topic: /cmd
+          message_type: geometry_msgs/Twist
+          direction: publish
+          # inherits bridge-level QoS (reliable: true)
       qos:
-        reliable: false          # override: best effort for this topic
-        keep_last: 1
-    - topic: /cmd
-      message_type: geometry_msgs/Twist
-      direction: publish
-      # inherits bridge-level QoS (reliable: true)
-  qos:
-    reliable: true               # default for all topics
-    keep_last: 10
+        reliable: true               # default for all topics
+        keep_last: 10
+    inputs:
+      cmd: planner/cmd               # the `/cmd` publish topic's dora input
+    outputs:
+      - fast_sensor                  # the `/fast_sensor` subscribe topic's dora output
 ```
+
+Neither topic sets `output:`/`input:`, so both use the topic-derived ids (`fast_sensor`, `cmd`) — and, as everywhere else, those must be declared on the node or the config is rejected.
 
 ### Validation Rules
 

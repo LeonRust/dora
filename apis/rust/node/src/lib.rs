@@ -38,7 +38,9 @@
 //!
 //! ### Receiving Events
 //!
-//! The [`EventStream`] is an [`AsyncIterator`][std::async_iter::AsyncIterator] that yields the incoming [`Event`]s.
+//! The [`EventStream`] implements the [`Stream`](futures::Stream) trait, yielding the incoming
+//! [`Event`]s. Iterate it asynchronously with [`StreamExt::next`](futures::StreamExt::next), or use
+//! the synchronous [`recv`](EventStream::recv) loop.
 //!
 //! Nodes should iterate over this event stream and react to events that they are interested in.
 //! Typically, the most important event type is [`Event::Input`].
@@ -86,15 +88,59 @@
 
 #![warn(missing_docs)]
 
-pub use arrow;
-pub use dora_arrow_convert::*;
-pub use dora_core::{self, uhlc};
+/// Apache Arrow 59, dora's current **internal** major.
+///
+/// Enabled by the `arrow-v59` feature, which pulls no extra dependency: this
+/// is the same copy of Arrow 59 dora itself links, so
+/// [`DoraArray::as_array`] hands it back for free and arrays built with it
+/// need no conversion.
+///
+/// This is deliberately not `pub use arrow;`. A bare `arrow` re-export changes
+/// meaning silently when dora bumps its internal major; `arrow_v59` either
+/// exists and means Arrow 59, or it is visibly gone. See
+/// `docs/plan-arrow-version-decoupling.md`.
+#[cfg(feature = "arrow-v59")]
+pub use arrow as arrow_v59;
+/// Apache Arrow 58, for nodes that name that major.
+///
+/// Enabled by the `arrow-v58` feature. Arrow 58 is **not** dora's internal
+/// major, so payloads cross a C Data Interface hop, exposed as `TryFrom`
+/// impls in both directions (`DoraArray::try_from(&arr as &dyn arrow58 Array)`
+/// and `arrow_v58::array::ArrayRef::try_from(&dora)`). The hop is fallible —
+/// hence `TryFrom` and not `From` — but does not copy buffers.
+#[cfg(feature = "arrow-v58")]
+pub use arrow58 as arrow_v58;
+// Deliberately *not* a glob re-export: `dora_arrow_convert::internal` is an
+// Arrow-typed, semver-exempt seam for dora's own crates and must not become
+// reachable through the frozen `dora-node-api` surface.
+pub use dora_arrow_convert::{DoraArray, IntoArrow, into_vec};
+pub use dora_core::uhlc;
+
+/// The subset of [`dora_core`] that is part of dora's public API.
+///
+/// Deliberately not `pub use dora_core::self`. Re-exporting the whole crate
+/// froze `dora_core`'s descriptor, topics, build, manifest and type-registry
+/// surface into dora's 1.0 guarantee, none of which a node needs — the only
+/// items reached through this path anywhere are the three id types below and
+/// `uhlc`, which is re-exported at the crate root.
+///
+/// The `config` path is preserved verbatim because
+/// `dora_node_api::dora_core::config::DataId` is what `dora new` scaffolds and
+/// what the Rust API reference documents.
+pub mod dora_core {
+    /// Identifier types used in node and dataflow configuration.
+    pub mod config {
+        pub use dora_core::config::{DataId, NodeId, OperatorId};
+    }
+    pub use dora_core::uhlc;
+}
 pub use dora_message::{
     DataflowId,
     metadata::{
         self, FIN, FLUSH, GOAL_ID, GOAL_STATUS, GOAL_STATUS_ABORTED, GOAL_STATUS_CANCELED,
-        GOAL_STATUS_SUCCEEDED, Metadata, MetadataParameters, Parameter, REQUEST_ID, SEGMENT_ID,
-        SEQ, SESSION_ID, get_bool_param, get_integer_param, get_string_param,
+        GOAL_STATUS_SUCCEEDED, Metadata, MetadataParameters, OPEN_TELEMETRY_CONTEXT, Parameter,
+        REQUEST_ID, SEGMENT_ID, SEQ, SESSION_ID, get_bool_param, get_integer_param,
+        get_string_param,
     },
 };
 use dora_message::{
@@ -107,13 +153,12 @@ pub use event_stream::{
     input_tracker::{InputState, InputTracker},
     merged,
 };
-pub use flume;
-pub use flume::Receiver;
 pub use futures;
 #[cfg(feature = "tracing")]
 pub use node::init_tracing;
 pub use node::{
-    DataSample, DoraNode, DoraNodeBuilder, StreamSegment, ZERO_COPY_THRESHOLD, arrow_utils,
+    DataSample, DoraNode, DoraNodeBuilder, EncodedSample, SampleAllocator, StreamSegment,
+    ZERO_COPY_THRESHOLD, arrow_utils,
 };
 pub use uuid;
 
@@ -122,14 +167,16 @@ use tokio::sync::oneshot;
 
 mod daemon_connection;
 mod error;
-mod event_stream;
+/// Asynchronous event stream and daemon communication.
+pub mod event_stream;
 pub mod integration_testing;
 mod node;
+mod orphan_guard;
 
 pub use error::{NodeError, NodeResult, PatternError};
 
-/// Backward-compatible alias so code using the old `DoraNode` name still compiles.
-/// Backward-compatible alias for [`Event`].
+/// Backward-compatible alias for [`Event`], so code using the old `DoraEvent`
+/// name still compiles.
 pub use Event as DoraEvent;
 
 #[derive(Debug)]
@@ -138,6 +185,9 @@ enum DaemonCommunicationWrapper {
     Testing {
         channel:
             tokio::sync::mpsc::Sender<(Timestamped<DaemonRequest>, oneshot::Sender<DaemonReply>)>,
+        /// Shared with the testing daemon so Drop can interrupt a scheduled
+        /// `next_event` sleep (dora-rs/dora#2855).
+        shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
     },
 }
 

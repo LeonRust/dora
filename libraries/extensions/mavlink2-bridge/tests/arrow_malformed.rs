@@ -8,7 +8,7 @@
 use arrow::array::{Float32Array, RecordBatch, StringArray, UInt8Array, UInt32Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use dora_mavlink2_bridge::MavlinkArrow;
-use dora_mavlink2_bridge::mavlink::common::COMMAND_LONG_DATA;
+use dora_mavlink2_bridge::mavlink::dialects::common::COMMAND_LONG_DATA;
 use std::sync::Arc;
 
 /// All seven `paramN` fields are f32; we keep a single shared row so each
@@ -63,7 +63,7 @@ fn rejects_wrong_column_type() {
 fn rejects_zero_row_batch() {
     // Same schema, but every column has zero rows. `value(0)` would
     // panic out-of-bounds; we want a decode error instead.
-    let schema = COMMAND_LONG_DATA::schema();
+    let schema = (*COMMAND_LONG_DATA::schema()).clone();
     let cols: Vec<arrow::array::ArrayRef> = vec![
         Arc::new(Float32Array::from(Vec::<f32>::new())),
         Arc::new(Float32Array::from(Vec::<f32>::new())),
@@ -92,7 +92,7 @@ fn rejects_multi_row_batch() {
     // Two commands in one batch: row 0 is TAKEOFF, row 1 is LAND. Reading
     // only row 0 would silently drop the LAND command — safety-relevant
     // data loss — so the whole batch must be rejected.
-    let schema = COMMAND_LONG_DATA::schema();
+    let schema = (*COMMAND_LONG_DATA::schema()).clone();
     let cols: Vec<arrow::array::ArrayRef> = vec![
         Arc::new(Float32Array::from(vec![1.0, 101.0])),
         Arc::new(Float32Array::from(vec![2.0, 102.0])),
@@ -152,7 +152,7 @@ fn rejects_null_row_zero() {
 /// distinguishable from a regression in the validation paths.
 #[test]
 fn accepts_well_formed_batch() {
-    let schema = COMMAND_LONG_DATA::schema();
+    let schema = (*COMMAND_LONG_DATA::schema()).clone();
     let batch =
         RecordBatch::try_new(Arc::new(schema), good_command_long_columns()).expect("build batch");
     let decoded = COMMAND_LONG_DATA::from_record_batch(&batch).expect("decode");

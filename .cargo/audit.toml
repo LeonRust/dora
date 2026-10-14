@@ -2,12 +2,27 @@
 # (cargo-deny enforces the same policy; both run in `make qa-audit`).
 [advisories]
 ignore = [
-    # pyo3 0.28 OOB read in PyList/PyTuple iterator nth/nth_back. The
-    # affected APIs are not used in this workspace; the pyo3 0.29 upgrade
-    # is tracked in https://github.com/dora-rs/dora/issues/2157.
-    # Review: 2026-07.
-    "RUSTSEC-2026-0176",
-    # pyo3 0.28 missing Sync bound on PyCFunction::new_closure — unused
-    # in this workspace; same upgrade tracked in #2157.
-    "RUSTSEC-2026-0177",
+    # owned-alloc 0.2 double-free if a value's Drop panics inside
+    # OwnedAlloc::drop_in_place. Transitive via zenoh-transport -> lockfree's
+    # shared-memory queue; lockfree does not call either affected
+    # drop_in_place API. No fixed release; waiting for Zenoh to replace the
+    # abandoned dependency chain. Review: 2026-12.
+    "RUSTSEC-2026-0291",
+    # owned-alloc unmaintained: no release since 2018 and the maintainer is
+    # unresponsive. Same abandoned crate as RUSTSEC-2026-0291 above, reached
+    # through the same zenoh-transport -> lockfree SHM queue; no safe upgrade
+    # exists. Waiting for Zenoh to replace the dependency chain. Review: 2026-12.
+    "RUSTSEC-2026-0299",
+    # lz4_flex 0.10 uninitialized-memory leak on invalid input. Transitive
+    # via zenoh-transport (pins ^0.10); dora does not enable zenoh's
+    # compression, so the decompression path is not reachable. Waiting for
+    # upstream zenoh bump. Review: 2026-12.
+    "RUSTSEC-2026-0041",
+    # quick-xml <0.41 quadratic attribute check / NsReader memory-exhaustion
+    # DoS. Our own parser (ros2 msg-gen) is on fixed 0.41; remaining copies
+    # are transitive via self_update (parses release listings during explicit
+    # `dora self update`) and mavlink-bindgen (build-time codegen over local
+    # MAVLink XML). Waiting for upstream bumps. Review: 2026-12.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
 ]

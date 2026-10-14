@@ -8,7 +8,7 @@ This guide covers how to run, write, and troubleshoot tests across the Dora work
 
 ## Prerequisites
 
-- Rust toolchain — MSRV is the workspace `rust-version` in `Cargo.toml` (currently 1.88.0)
+- Rust toolchain — MSRV is the workspace `rust-version` in `Cargo.toml` (currently 1.95.0)
 - Python 3 with `numpy` and `pyarrow` installed (`pip install numpy pyarrow`) — required for Python smoke tests
 
 ## Quick Start (5-minute validation)
@@ -20,7 +20,7 @@ Run these three commands to validate that the workspace is healthy:
 cargo fmt --all -- --check
 
 # 2. Lint (~60s first run, cached after)
-cargo clippy --all \
+cargo clippy --all --all-targets \
   --exclude dora-node-api-python \
   --exclude dora-operator-api-python \
   --exclude dora-ros2-bridge-python \
@@ -28,6 +28,7 @@ cargo clippy --all \
 
 # 3. Unit + integration tests (~90s first run)
 cargo test --all \
+  --exclude dora-runtime-python \
   --exclude dora-node-api-python \
   --exclude dora-operator-api-python \
   --exclude dora-ros2-bridge-python
@@ -40,7 +41,7 @@ All three must pass before opening a PR. Python packages are excluded because th
 | Tier | What it covers | Command | Speed |
 |------|---------------|---------|-------|
 | **Format** | Code style | `cargo fmt --all -- --check` | ~5s |
-| **Lint** | Warnings, correctness | `cargo clippy --all ...` | ~60s |
+| **Lint** | Warnings, correctness | `cargo clippy --all --all-targets ...` | ~60s |
 | **Unit** | Individual functions | `cargo test --all ...` | ~90s |
 | **CLI** | Command parsing, validation | `cargo test -p dora-cli` | ~5s |
 | **Integration** | Node I/O via env vars | `cargo test --test example-tests` | ~30s |
@@ -218,17 +219,18 @@ Topics covered: health check, list/stop/destroy requests, invalid JSON/params, c
 
 ## CI Pipeline
 
-Two workflows split by cadence (#1716):
+Two workflows split by cadence (#1716), plus one gated on a path:
 
 - **`.github/workflows/ci.yml`** — runs on every PR and push to `main`. Linux-only. **Blocks merge.** Target ~30-45 min critical path.
 - **`.github/workflows/nightly.yml`** — daily 06:40 UTC cron + manual dispatch. Cross-platform. **Does NOT block PRs**; auto-files `nightly-regression` issue on failure. ~3-4 hours wall-clock.
+- **`.github/workflows/docker-image.yml`** — only on `docker/**` changes, so most PRs never see it. Builds the `dora-slim` image, runs a dataflow inside it (`docker/slim/smoke.sh`), and publishes to `ghcr.io` on merges to `main`. Locally: `make qa-docker-slim`. It smokes the *published* `dora-rs-cli`, not the workspace — see `qa-runbook.md` §3.15 before reading a failure as yours.
 
 ### PR CI (`ci.yml`) — fast Linux-only gate
 
 | Job | Runner | What runs |
 |-----|--------|-----------|
 | **fmt** | ubuntu-latest | `cargo fmt --all -- --check` |
-| **clippy** | ubuntu-latest | `cargo clippy --all ... -- -D warnings` |
+| **clippy** | ubuntu-latest | `cargo clippy --all --all-targets ... -- -D warnings` |
 | **test** | ubuntu-latest | `cargo check`, `cargo build`, `cargo test --all ...` (excluding Python crates and `dora-examples`) plus fast CLI smoke/semantic checks |
 | **e2e** | ubuntu-latest | `ws-cli-e2e` and `fault-tolerance-e2e` |
 | **contract-tests** | ubuntu-latest | `tests/example-smoke.rs::contract_*` behavior contracts |
@@ -303,14 +305,14 @@ fn test_main_function() -> eyre::Result<()> {
     let inputs = TestingInput::Input(
         IntegrationTestInput::new("node_id".parse().unwrap(), events),
     );
-    let (tx, rx) = flume::unbounded();
+    let (tx, mut rx) = integration_testing::output_channel();
     let outputs = TestingOutput::ToChannel(tx);
     let options = TestingOptions { skip_output_time_offsets: true };
 
     integration_testing::setup_integration_testing(inputs, outputs, options);
     crate::main()?;
 
-    let outputs = rx.try_iter().collect::<Vec<_>>();
+    let outputs = integration_testing::drain_outputs(&mut rx);
     assert_eq!(outputs, expected_outputs);
     Ok(())
 }
@@ -354,7 +356,7 @@ Add new test files in the `tests/` directory. For tests that need the full CLI s
 2. Clean up stale processes with `dora down`
 3. Start cluster with `dora up`
 4. Run dataflow with `dora start --detach`
-5. Poll `dora list --json` for completion
+5. Poll `dora list --format json` for completion
 6. Clean up with `dora stop --all` and `dora down`
 
 **Local pattern** (single-process, in-process coordinator):
@@ -378,6 +380,7 @@ Add new test files in the `tests/` directory. For tests that need the full CLI s
 Always exclude Python packages:
 ```bash
 cargo test --all \
+  --exclude dora-runtime-python \
   --exclude dora-node-api-python \
   --exclude dora-operator-api-python \
   --exclude dora-ros2-bridge-python
@@ -437,3 +440,18 @@ MyCustomIdent = "MyCustomIdent"
 - CI runs on Ubuntu; check for platform-specific assumptions (paths, process signals)
 - CI uses `rust-cache` so dependency versions may differ from your local lockfile
 - Ensure `cargo fmt --all -- --check` passes (CI enforces this)
+# ROS2 native Zenoh interoperability
+
+The real-peer matrix uses digest-pinned ROS images and version-pinned
+`rmw_zenoh_cpp` packages:
+
+```bash
+scripts/ros2-zenoh-interop.sh humble all
+scripts/ros2-zenoh-interop.sh kilted all
+```
+
+Run one case by replacing `all` with `topic-pub`, `topic-sub`,
+`service-client`, `service-server`, `action-client`, `action-server`, `graph`,
+`domain`, `namespace`, or `qos-transient-local`. The driver has bounded waits
+and always removes its containers. An environment-dependent skip is not proof
+of compatibility and must keep that profile incomplete.

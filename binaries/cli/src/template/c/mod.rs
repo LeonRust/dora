@@ -1,5 +1,5 @@
 use dora_node_api_c::HEADER_NODE_API;
-use eyre::{Context, bail};
+use eyre::Context;
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -31,12 +31,7 @@ fn create_dataflow(
 ) -> Result<(), eyre::ErrReport> {
     const DATAFLOW_YML: &str = include_str!("dataflow-template.yml");
 
-    if name.contains('/') {
-        bail!("dataflow name must not contain `/` separators");
-    }
-    if !name.is_ascii() {
-        bail!("dataflow name must be ASCII");
-    }
+    super::validate_name("dataflow", &name, false)?;
 
     // create directories
     let root = path.as_deref().unwrap_or_else(|| Path::new(&name));
@@ -80,7 +75,7 @@ fn create_cmakefile(root: PathBuf, use_path_deps: bool) -> Result<(), eyre::ErrR
     const CMAKEFILE: &str = include_str!("cmake-template.txt");
 
     let cmake_file = if use_path_deps {
-        CMAKEFILE.replace("__DORA_PATH__", super::workspace_dir()?)
+        CMAKEFILE.replace("__DORA_PATH__", &super::workspace_dir()?)
     } else {
         CMAKEFILE.replace("__DORA_PATH__", "")
     };
@@ -99,12 +94,7 @@ fn create_custom_node(
     template_scripts: &str,
     use_path_deps: bool,
 ) -> Result<(), eyre::ErrReport> {
-    if name.contains('/') {
-        bail!("node name must not contain `/` separators");
-    }
-    if !name.is_ascii() {
-        bail!("node name must be ASCII");
-    }
+    super::validate_name("node", &name, false)?;
 
     // create directories
     let root = path.as_deref().unwrap_or_else(|| Path::new(&name));
@@ -136,7 +126,7 @@ fn create_node_cmakefile(
     let cmake_content = if use_path_deps {
         NODE_CMAKE
             .replace("___name___", name)
-            .replace("__DORA_PATH__", super::workspace_dir()?)
+            .replace("__DORA_PATH__", &super::workspace_dir()?)
     } else {
         NODE_CMAKE
             .replace("___name___", name)

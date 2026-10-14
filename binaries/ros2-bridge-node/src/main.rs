@@ -2,36 +2,125 @@ use std::{
     borrow::Cow,
     collections::{BTreeMap, HashMap},
     path::Path,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::Arc,
     time::Duration,
 };
 
 use arrow::array::{ArrayData, StructArray};
 use dora_message::{
-    descriptor::{Ros2BridgeConfig, Ros2Direction, Ros2QosConfig, Ros2Role, Ros2TopicConfig},
+    descriptor::{
+        Ros2BridgeConfig, Ros2Direction, Ros2QosConfig, Ros2Role, Ros2TopicConfig,
+        Ros2TransportConfig,
+    },
     metadata::{Parameter, get_string_param},
 };
 use dora_node_api::{
     DoraNode, Event,
     merged::{MergeExternal, MergedEvent},
 };
+use dora_ros2_bridge::transport::action::zenoh::{
+    ActionClient as ZenohActionClient, ActionKeys, ActionServer as ZenohActionServer, ActionTokens,
+};
+use dora_ros2_bridge::transport::action::{ConcurrentGoalLimit, GoalSlots, MAX_CONCURRENT_GOALS};
+use dora_ros2_bridge::transport::zenoh::{
+    Context as ZenohContext, ContextOptions as ZenohContextOptions,
+    compatibility::{TypeDescriptionResolver, resolve_action, resolve_message, resolve_service},
+    keyexpr::{DataKey, TopicToken},
+    pubsub::{NodePublisher, NodeSubscription, PubSubError},
+    qos::ZenohQosMapping,
+    service::{NodeServiceClient, NodeServiceServer},
+};
+use dora_ros2_bridge::transport::{Durability, History, Liveliness, Reliability, Ros2Qos};
 use dora_ros2_bridge::{ros2_client, rustdds};
 use dora_ros2_bridge_arrow::{
     BridgeActionType, BridgeMessage, BridgeServiceType, TypeInfo, TypeInfoGuard, TypedValue,
-    deserialize::StructDeserializer,
+    deserialize::StructDeserializer, deserialize_cdr, deserialize_raw_cdr, serialize_cdr,
+    serialize_raw_cdr,
 };
 use dora_ros2_bridge_msg_gen::types::Message;
 use eyre::{Context, ContextCompat, eyre};
 use futures::{StreamExt, task::SpawnExt};
 
-/// Maximum number of concurrent in-flight action goals.
-const MAX_CONCURRENT_GOALS: usize = 8;
-
 /// Maximum pending service requests before dropping new ones.
 const MAX_PENDING_REQUESTS: usize = 64;
+
+/// Warn and return `None` for a failure that ends only this message or call:
+/// a peer that misbehaves, or one message whose values cannot be encoded
+/// (such as a null nested-message or sequence row).
+fn value_or_warn<T, E: std::fmt::Display>(result: Result<T, E>, operation: &str) -> Option<T> {
+    match result {
+        Ok(value) => Some(value),
+        Err(error) => {
+            tracing::warn!("{operation}: {error}");
+            None
+        }
+    }
+}
+
+/// Why one DDS service or action call failed.
+#[derive(Debug)]
+enum DdsCallFailure {
+    Write(rustdds::dds::result::WriteError<()>),
+    Read(rustdds::dds::result::ReadError),
+    TimedOut(Duration),
+}
+
+impl From<ros2_client::service::CallServiceError<()>> for DdsCallFailure {
+    fn from(e: ros2_client::service::CallServiceError<()>) -> Self {
+        match e {
+            ros2_client::service::CallServiceError::WriteError(e) => Self::Write(e),
+            ros2_client::service::CallServiceError::ReadError(e) => Self::Read(e),
+        }
+    }
+}
+
+impl std::fmt::Display for DdsCallFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Write(e) => write!(f, "{e}"),
+            Self::Read(e) => write!(f, "{e}"),
+            Self::TimedOut(after) => write!(f, "timed out after {after:?}"),
+        }
+    }
+}
+
+impl DdsCallFailure {
+    /// Whether this failure ends the bridge node rather than only the call.
+    ///
+    /// `Poisoned` and `Internal` mean the DDS participant itself is broken,
+    /// which rustdds documents as not recoverable. Everything else only fails
+    /// this call: a timeout, an I/O error, a blocked writer, an undecodable
+    /// peer response, and a `Serialization` error. Serialization runs inside
+    /// the DDS write and rejects the values of one message (such as a null
+    /// nested-message or sequence row, #3678), so the next message of the
+    /// same type may go out fine; it is dropped like on the Zenoh path.
+    fn is_fatal(&self) -> bool {
+        use rustdds::dds::result::{ReadError, WriteError};
+        match self {
+            Self::Write(e) => {
+                matches!(e, WriteError::Poisoned { .. } | WriteError::Internal { .. })
+            }
+            Self::Read(e) => matches!(e, ReadError::Poisoned { .. } | ReadError::Internal { .. }),
+            Self::TimedOut(_) => false,
+        }
+    }
+}
+
+/// Warn about a recoverable DDS call failure, or return a fatal one as an
+/// error that ends the bridge node.
+fn dds_call_or_warn<T>(
+    result: Result<T, DdsCallFailure>,
+    operation: &str,
+) -> eyre::Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(failure) if failure.is_fatal() => Err(eyre!("{operation}: {failure}")),
+        Err(failure) => {
+            tracing::warn!("{operation}: {failure}");
+            Ok(None)
+        }
+    }
+}
 
 use dora_message::metadata::{
     GOAL_ID, GOAL_STATUS, GOAL_STATUS_ABORTED, GOAL_STATUS_CANCELED, GOAL_STATUS_SUCCEEDED,
@@ -48,6 +137,16 @@ fn main() -> eyre::Result<()> {
 
     let messages = load_messages()?;
 
+    if matches!(config.transport, Ros2TransportConfig::Zenoh { .. }) {
+        return run_zenoh_mode(config, messages);
+    }
+
+    if std::env::var("RMW_IMPLEMENTATION").ok().as_deref() == Some("rmw_zenoh_cpp") {
+        tracing::warn!(
+            "DDS transport selected while RMW_IMPLEMENTATION=rmw_zenoh_cpp; set transport.kind: zenoh explicitly"
+        );
+    }
+
     // Dispatch based on bridge mode
     if config.service.is_some() {
         return run_service_mode(config, messages);
@@ -58,6 +157,1074 @@ fn main() -> eyre::Result<()> {
 
     // Topic mode (existing behavior)
     run_topic_mode(config, messages)
+}
+
+fn run_zenoh_mode(
+    config: Ros2BridgeConfig,
+    messages: Arc<HashMap<String, HashMap<String, Message>>>,
+) -> eyre::Result<()> {
+    let Ros2TransportConfig::Zenoh {
+        compatibility,
+        config_uri,
+    } = &config.transport
+    else {
+        unreachable!()
+    };
+    tracing::info!(profile = ?compatibility, config_source = if config_uri.is_some() { "explicit" } else { "environment-or-default" }, "starting native ROS2 Zenoh transport");
+    let domain_id = std::env::var("ROS_DOMAIN_ID")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    let context = futures::executor::block_on(ZenohContext::open(ZenohContextOptions {
+        domain_id,
+        config_uri: config_uri
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned()),
+    }))
+    .map_err(|error| eyre!(error))?;
+    let node_name = config.node_name.as_deref().unwrap_or("dora_ros2_bridge");
+    let node = futures::executor::block_on(context.create_node(
+        &context.zid(),
+        node_name,
+        "/",
+        &config.namespace,
+        node_name,
+    ))
+    .map_err(|error| eyre!(error))?;
+    if config.service.is_some() {
+        return run_zenoh_service_mode(&config, &node, messages);
+    }
+    if config.action.is_some() {
+        return run_zenoh_action_mode(&config, &node, messages);
+    }
+    run_zenoh_topic_mode(&config, &node, messages)
+}
+
+struct ZenohTopicPublisher {
+    input: String,
+    type_info: TypeInfo<'static>,
+    publisher: NodePublisher,
+}
+
+fn run_zenoh_topic_mode(
+    config: &Ros2BridgeConfig,
+    zenoh_node: &dora_ros2_bridge::transport::zenoh::Node,
+    messages: Arc<HashMap<String, HashMap<String, Message>>>,
+) -> eyre::Result<()> {
+    let Ros2TransportConfig::Zenoh { compatibility, .. } = config.transport else {
+        unreachable!()
+    };
+    let resolver = TypeDescriptionResolver::from_ament_prefix_path();
+    let domain_id = std::env::var("ROS_DOMAIN_ID")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    let mut publishers = Vec::new();
+    let mut subscribers = Vec::new();
+    for topic in resolve_topics(config)? {
+        let (package, message_name) = parse_type_str(&topic.message_type)?;
+        let identity = resolve_message(compatibility, &package, &message_name, &resolver)?;
+        let key = DataKey::new(domain_id, &topic.topic, &identity)?;
+        let qos = topic.qos.as_ref().unwrap_or(&config.qos).to_neutral_qos();
+        let token = TopicToken {
+            name: topic.topic.clone(),
+            type_name: identity.dds_name.clone(),
+            type_hash: identity.key_hash_component(),
+            qos: ZenohQosMapping::from_ros_qos(&qos).to_string(),
+        };
+        let type_info = TypeInfo {
+            package_name: Cow::Owned(package),
+            message_name: Cow::Owned(message_name),
+            messages: messages.clone(),
+        };
+        match topic.direction {
+            Ros2Direction::Publish => {
+                let publisher = futures::executor::block_on(NodePublisher::declare(
+                    zenoh_node,
+                    key.as_str(),
+                    token,
+                    &qos,
+                ))?;
+                publishers.push(ZenohTopicPublisher {
+                    input: topic.input_port_id(),
+                    type_info,
+                    publisher,
+                });
+            }
+            Ros2Direction::Subscribe => {
+                let decode_info = type_info.clone();
+                let decoder = Arc::new(move |bytes: &[u8]| {
+                    deserialize_raw_cdr(bytes, decode_info.clone(), 64 * 1024 * 1024)
+                        .map_err(|error| PubSubError::Decode(error.to_string()))
+                });
+                let subscription = futures::executor::block_on(NodeSubscription::declare(
+                    zenoh_node,
+                    key.as_str(),
+                    token,
+                    &qos,
+                    64,
+                    64 * 1024 * 1024,
+                    decoder,
+                ))?;
+                subscribers.push((topic.output_port_id(), subscription));
+            }
+        }
+    }
+    let (mut node, dora_events) = DoraNode::init_from_env()?;
+    let (tx, rx) = flume::bounded(64);
+    for (output, subscription) in subscribers {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            futures::executor::block_on(async move {
+                while let Ok((data, _metadata)) = subscription.recv_async().await {
+                    if tx.send((output.clone(), data)).is_err() {
+                        break;
+                    }
+                }
+            })
+        });
+    }
+    drop(tx);
+    let merged = dora_events.merge_external(Box::pin(rx.into_stream()));
+    for event in futures::executor::block_on_stream(merged) {
+        match event {
+            MergedEvent::Dora(Event::Input { id, data, .. }) => {
+                for publisher in &publishers {
+                    if publisher.input == id.as_str() {
+                        let value = TypedValue {
+                            value: data.as_array(),
+                            type_info: &publisher.type_info,
+                        };
+                        let Some(cdr) = value_or_warn(
+                            serialize_raw_cdr(&value),
+                            "dropping ROS2 message that cannot be serialized",
+                        ) else {
+                            continue;
+                        };
+                        futures::executor::block_on(publisher.publisher.publish(&cdr))?;
+                    }
+                }
+            }
+            MergedEvent::Dora(Event::Stop(_)) => break,
+            MergedEvent::Dora(_) => {}
+            MergedEvent::External((output, data)) => {
+                node.send_output(output.into(), Default::default(), StructArray::from(data))?
+            }
+        }
+    }
+    Ok(())
+}
+
+fn run_zenoh_service_mode(
+    config: &Ros2BridgeConfig,
+    zenoh_node: &dora_ros2_bridge::transport::zenoh::Node,
+    messages: Arc<HashMap<String, HashMap<String, Message>>>,
+) -> eyre::Result<()> {
+    let Ros2TransportConfig::Zenoh { compatibility, .. } = config.transport else {
+        unreachable!()
+    };
+    let name = config.service.as_deref().context("service name required")?;
+    let (package, service_name) = parse_type_str(
+        config
+            .service_type
+            .as_deref()
+            .context("service_type required")?,
+    )?;
+    let identity = resolve_service(
+        compatibility,
+        &package,
+        &service_name,
+        &TypeDescriptionResolver::from_ament_prefix_path(),
+    )?;
+    let domain_id = std::env::var("ROS_DOMAIN_ID")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    let key = DataKey::new(domain_id, name, &identity)?;
+    let qos = config.qos.to_neutral_qos();
+    let token = TopicToken {
+        name: name.into(),
+        type_name: identity.dds_name.clone(),
+        type_hash: identity.key_hash_component(),
+        qos: ZenohQosMapping::from_ros_qos(&qos).to_string(),
+    };
+    let request_info = TypeInfo {
+        package_name: Cow::Owned(package.clone()),
+        message_name: Cow::Owned(format!("{service_name}_Request")),
+        messages: messages.clone(),
+    };
+    let response_info = TypeInfo {
+        package_name: Cow::Owned(package),
+        message_name: Cow::Owned(format!("{service_name}_Response")),
+        messages,
+    };
+    match config.role.as_ref().context("role required for service")? {
+        Ros2Role::Client => {
+            let client = futures::executor::block_on(NodeServiceClient::declare(
+                zenoh_node,
+                key.as_str(),
+                token,
+                MAX_PENDING_REQUESTS,
+            ))?;
+            let (mut node, events) = DoraNode::init_from_env()?;
+            for event in futures::executor::block_on_stream(events) {
+                match event {
+                    Event::Input { data, .. } => {
+                        let Some(request) = value_or_warn(
+                            serialize_raw_cdr(&TypedValue {
+                                value: data.as_array(),
+                                type_info: &request_info,
+                            }),
+                            "dropping Zenoh service request that cannot be serialized",
+                        ) else {
+                            continue;
+                        };
+                        let Some(response) = value_or_warn(
+                            futures::executor::block_on(
+                                client.call(request, SERVICE_RESPONSE_TIMEOUT),
+                            ),
+                            "Zenoh service call failed",
+                        ) else {
+                            continue;
+                        };
+                        let Some(data) = value_or_warn(
+                            deserialize_raw_cdr(&response, response_info.clone(), 64 * 1024 * 1024),
+                            "invalid Zenoh service response",
+                        ) else {
+                            continue;
+                        };
+                        node.send_output(
+                            "response".into(),
+                            Default::default(),
+                            StructArray::from(data),
+                        )?;
+                    }
+                    Event::Stop(_) => break,
+                    _ => {}
+                }
+            }
+        }
+        Ros2Role::Server => {
+            let server = Arc::new(futures::executor::block_on(NodeServiceServer::declare(
+                zenoh_node,
+                key.as_str(),
+                token,
+                MAX_PENDING_REQUESTS,
+                SERVICE_RESPONSE_TIMEOUT,
+            ))?);
+            let (mut node, events) = DoraNode::init_from_env()?;
+            let (tx, rx) = flume::bounded(MAX_PENDING_REQUESTS);
+            let receiver = server.clone();
+            std::thread::spawn(move || {
+                futures::executor::block_on(async move {
+                    while let Ok(request) = receiver.recv().await {
+                        if tx.send(request).is_err() {
+                            break;
+                        }
+                    }
+                })
+            });
+            // `request_key -> (RequestId, inserted_at)`. Bounded below (evict on
+            // SERVICE_RESPONSE_TIMEOUT + cap) so a peer streaming requests the local
+            // handler never answers cannot grow it without bound.
+            let mut pending = HashMap::new();
+            let mut oldest_insert: Option<std::time::Instant> = None;
+            let merged = events.merge_external(Box::pin(rx.into_stream()));
+            for event in futures::executor::block_on_stream(merged) {
+                match event {
+                    MergedEvent::External(request) => {
+                        let request_key = format!(
+                            "{}:{}",
+                            request.id.sequence_number,
+                            hex_gid(&request.id.client_gid)
+                        );
+                        let Some(data) = value_or_warn(
+                            deserialize_raw_cdr(
+                                &request.payload,
+                                request_info.clone(),
+                                64 * 1024 * 1024,
+                            ),
+                            "invalid Zenoh service request",
+                        ) else {
+                            if let Err(error) = futures::executor::block_on(
+                                server.reject(request.id, "invalid request payload"),
+                            ) {
+                                tracing::warn!("failed to reject Zenoh service request: {error}");
+                            }
+                            continue;
+                        };
+                        // Evict timed-out entries, then cap, mirroring the DDS service
+                        // path — the local handler may never answer some requests.
+                        let now = std::time::Instant::now();
+                        if oldest_insert
+                            .is_some_and(|t| now.duration_since(t) >= SERVICE_RESPONSE_TIMEOUT)
+                        {
+                            pending.retain(|key, (_, t)| {
+                                let keep = now.duration_since(*t) < SERVICE_RESPONSE_TIMEOUT;
+                                if !keep {
+                                    tracing::warn!(
+                                        "evicting timed-out pending service request {key}"
+                                    );
+                                }
+                                keep
+                            });
+                            oldest_insert = pending.values().map(|(_, t)| *t).min();
+                        }
+                        if pending.len() >= MAX_PENDING_REQUESTS {
+                            tracing::warn!(
+                                "pending service requests full ({MAX_PENDING_REQUESTS}), dropping request"
+                            );
+                            continue;
+                        }
+                        if oldest_insert.is_none() {
+                            oldest_insert = Some(now);
+                        }
+                        pending.insert(request_key.clone(), (request.id, now));
+                        let mut metadata = dora_message::metadata::MetadataParameters::default();
+                        metadata.insert(REQUEST_ID.into(), Parameter::String(request_key));
+                        node.send_output("request".into(), metadata, StructArray::from(data))?;
+                    }
+                    MergedEvent::Dora(Event::Input { metadata, data, .. }) => {
+                        if let Some(key) = get_string_param(&metadata.parameters, REQUEST_ID)
+                            && let Some((id, _)) = pending.remove(key)
+                        {
+                            let Some(response) = value_or_warn(
+                                serialize_raw_cdr(&TypedValue {
+                                    value: data.as_array(),
+                                    type_info: &response_info,
+                                }),
+                                "Zenoh service response cannot be serialized",
+                            ) else {
+                                if let Err(error) = futures::executor::block_on(
+                                    server.reject(id, "invalid response payload"),
+                                ) {
+                                    tracing::warn!(
+                                        "failed to reject Zenoh service request: {error}"
+                                    );
+                                }
+                                continue;
+                            };
+                            // A slow local handler can let the request expire before we
+                            // reply; a RequestExpired/RequestAbsent here must not tear
+                            // down the whole service bridge.
+                            if let Err(error) =
+                                futures::executor::block_on(server.reply(id, &response))
+                            {
+                                tracing::warn!("failed to reply to Zenoh service request: {error}");
+                            }
+                        }
+                    }
+                    MergedEvent::Dora(Event::Stop(_)) => break,
+                    MergedEvent::Dora(_) => {}
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn hex_gid(gid: &[u8; 16]) -> String {
+    gid.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn run_zenoh_action_mode(
+    config: &Ros2BridgeConfig,
+    zenoh_node: &dora_ros2_bridge::transport::zenoh::Node,
+    messages: Arc<HashMap<String, HashMap<String, Message>>>,
+) -> eyre::Result<()> {
+    let Ros2TransportConfig::Zenoh { compatibility, .. } = config.transport else {
+        unreachable!()
+    };
+    let action_name = config.action.as_deref().context("action name required")?;
+    let (package, action_type) = parse_type_str(
+        config
+            .action_type
+            .as_deref()
+            .context("action_type required")?,
+    )?;
+    let resolver = TypeDescriptionResolver::from_ament_prefix_path();
+    let identities = resolve_action(compatibility, &package, &action_type, &resolver)?;
+    let find = |suffix: &str| {
+        identities
+            .iter()
+            .find(|identity| identity.ros_name.ends_with(suffix))
+            .cloned()
+            .with_context(|| format!("missing action identity {suffix}"))
+    };
+    let cancel = resolve_service(compatibility, "action_msgs", "CancelGoal", &resolver)?;
+    let status = resolve_message(compatibility, "action_msgs", "GoalStatusArray", &resolver)?;
+    let domain = std::env::var("ROS_DOMAIN_ID")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    let endpoints = dora_ros2_bridge::transport::action::ActionEndpoints::new(
+        action_name,
+        &package,
+        &action_type,
+    );
+    let send_goal_identity = find("_SendGoal")?;
+    let get_result_identity = find("_GetResult")?;
+    let feedback_identity = find("_FeedbackMessage")?;
+    let keys = ActionKeys {
+        send_goal: DataKey::new(domain, &endpoints.send_goal.name, &send_goal_identity)?
+            .as_str()
+            .into(),
+        get_result: DataKey::new(domain, &endpoints.get_result.name, &get_result_identity)?
+            .as_str()
+            .into(),
+        cancel_goal: DataKey::new(domain, &endpoints.cancel_goal.name, &cancel)?
+            .as_str()
+            .into(),
+        feedback: DataKey::new(domain, &endpoints.feedback.name, &feedback_identity)?
+            .as_str()
+            .into(),
+        status: DataKey::new(domain, &endpoints.status.name, &status)?
+            .as_str()
+            .into(),
+    };
+    let goal_info = TypeInfo {
+        package_name: Cow::Owned(package.clone()),
+        message_name: Cow::Owned(format!("{action_type}_Goal")),
+        messages: messages.clone(),
+    };
+    let result_info = TypeInfo {
+        package_name: Cow::Owned(package.clone()),
+        message_name: Cow::Owned(format!("{action_type}_Result")),
+        messages: messages.clone(),
+    };
+    let feedback_info = TypeInfo {
+        package_name: Cow::Owned(package),
+        message_name: Cow::Owned(format!("{action_type}_Feedback")),
+        messages,
+    };
+    let qos = config.qos.to_neutral_qos();
+    let qos_string = ZenohQosMapping::from_ros_qos(&qos).to_string();
+    let token =
+        |name: &str,
+         identity: &dora_ros2_bridge::transport::zenoh::compatibility::RosTypeIdentity| {
+            TopicToken {
+                name: name.into(),
+                type_name: identity.dds_name.clone(),
+                type_hash: identity.key_hash_component(),
+                qos: qos_string.clone(),
+            }
+        };
+    let tokens = ActionTokens {
+        send_goal: token(&endpoints.send_goal.name, &send_goal_identity),
+        get_result: token(&endpoints.get_result.name, &get_result_identity),
+        cancel_goal: token(&endpoints.cancel_goal.name, &cancel),
+        feedback: token(&endpoints.feedback.name, &feedback_identity),
+        status: TopicToken {
+            qos: ZenohQosMapping::from_ros_qos(
+                &dora_ros2_bridge::transport::action::zenoh::action_status_qos(&qos),
+            )
+            .to_string(),
+            ..token(&endpoints.status.name, &status)
+        },
+    };
+    match config.role.as_ref().context("role required for action")? {
+        Ros2Role::Client => {
+            let readiness_tokens = tokens.clone();
+            let client = futures::executor::block_on(ZenohActionClient::declare(
+                zenoh_node,
+                &keys,
+                tokens,
+                &qos,
+                64 * 1024 * 1024,
+            ))?;
+            futures::executor::block_on(
+                dora_ros2_bridge::transport::action::zenoh::wait_for_server(
+                    zenoh_node.graph(),
+                    &readiness_tokens,
+                    std::time::Instant::now() + Duration::from_secs(20),
+                ),
+            )?;
+            run_zenoh_action_client(client, goal_info, result_info, feedback_info)
+        }
+        Ros2Role::Server => run_zenoh_action_server(
+            futures::executor::block_on(ZenohActionServer::declare(
+                zenoh_node, &keys, tokens, &qos,
+            ))?,
+            goal_info,
+            result_info,
+            feedback_info,
+        ),
+    }
+}
+
+fn run_zenoh_action_client(
+    client: ZenohActionClient,
+    goal_type_info: TypeInfo<'static>,
+    result_type_info: TypeInfo<'static>,
+    feedback_type_info: TypeInfo<'static>,
+) -> eyre::Result<()> {
+    use ros2_client::action::{
+        FeedbackMessage, GetResultRequest, GetResultResponse, SendGoalRequest, SendGoalResponse,
+    };
+
+    let (mut node, dora_events) = DoraNode::init_from_env()?;
+    let client = Arc::new(client);
+    let goal_limit = ConcurrentGoalLimit::new(MAX_CONCURRENT_GOALS);
+    let (tx, rx) = flume::bounded::<ActionEvent>(MAX_CONCURRENT_GOALS * 2);
+    let feedback_client = client.clone();
+    let feedback_tx = tx.clone();
+    std::thread::spawn(move || {
+        let _guard = TypeInfoGuard::deserialize(feedback_type_info);
+        futures::executor::block_on(async move {
+            while let Ok((payload, _)) = feedback_client.feedback.recv_async().await {
+                match deserialize_cdr::<FeedbackMessage<BridgeMessage>>(&payload) {
+                    Ok(message) => {
+                        if let Some(data) = message.feedback.0
+                            && feedback_tx.send(ActionEvent::Feedback(data)).is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(error) => tracing::warn!("invalid Zenoh action feedback: {error}"),
+                }
+            }
+        });
+    });
+    let merged = dora_events.merge_external(Box::pin(rx.into_stream()));
+    for event in futures::executor::block_on_stream(merged) {
+        match event {
+            MergedEvent::Dora(Event::Input { data, .. }) => {
+                let permit = match goal_limit.try_acquire() {
+                    Ok(permit) => permit,
+                    Err(error) => {
+                        tracing::warn!("{error}");
+                        continue;
+                    }
+                };
+                let goal_id = ros2_client::action::GoalId::new_random();
+                let request = {
+                    let _guard = TypeInfoGuard::serialize(goal_type_info.clone());
+                    serialize_cdr(&SendGoalRequest {
+                        goal_id,
+                        goal: BridgeMessage(Some(data.as_array().to_data())),
+                    })
+                };
+                let Some(request) = value_or_warn(
+                    request,
+                    "dropping Zenoh action goal that cannot be serialized",
+                ) else {
+                    continue;
+                };
+                let Some(response) = value_or_warn(
+                    futures::executor::block_on(
+                        client.send_goal.call(request, ACTION_GOAL_TIMEOUT),
+                    ),
+                    "Zenoh action send-goal failed",
+                ) else {
+                    continue;
+                };
+                let Some(response): Option<SendGoalResponse> = value_or_warn(
+                    deserialize_cdr(&response),
+                    "invalid Zenoh action send-goal response",
+                ) else {
+                    continue;
+                };
+                if !response.accepted {
+                    tracing::warn!("action goal was rejected by server");
+                    continue;
+                }
+                let result_client = client.clone();
+                let result_tx = tx.clone();
+                let result_info = result_type_info.clone();
+                std::thread::spawn(move || {
+                    let _permit = permit;
+                    let request = match serialize_cdr(&GetResultRequest { goal_id }) {
+                        Ok(request) => request,
+                        Err(error) => {
+                            tracing::warn!("failed to encode get-result request: {error}");
+                            return;
+                        }
+                    };
+                    let response = futures::executor::block_on(result_client.get_result.call(
+                        request,
+                        dora_ros2_bridge::transport::action::zenoh::GET_RESULT_TIMEOUT,
+                    ));
+                    let response = match response {
+                        Ok(response) => response,
+                        Err(error) => {
+                            tracing::warn!("Zenoh action result error: {error}");
+                            return;
+                        }
+                    };
+                    let _guard = TypeInfoGuard::deserialize(result_info);
+                    match deserialize_cdr::<GetResultResponse<BridgeMessage>>(&response) {
+                        Ok(response) => {
+                            if let Some(data) = response.result.0 {
+                                let _ = result_tx.send(ActionEvent::Result(data));
+                            }
+                        }
+                        Err(error) => tracing::warn!("invalid Zenoh action result: {error}"),
+                    }
+                });
+            }
+            MergedEvent::Dora(Event::Stop(_)) => break,
+            MergedEvent::Dora(_) => {}
+            MergedEvent::External(ActionEvent::Feedback(data)) => node.send_output(
+                "feedback".into(),
+                Default::default(),
+                StructArray::from(data),
+            )?,
+            MergedEvent::External(ActionEvent::Result(data)) => {
+                node.send_output("result".into(), Default::default(), StructArray::from(data))?
+            }
+        }
+    }
+    Ok(())
+}
+
+enum ZenohActionServerEvent {
+    Goal(dora_ros2_bridge::transport::zenoh::service::ServiceRequest),
+    ResultRequest(dora_ros2_bridge::transport::zenoh::service::ServiceRequest),
+    Cancel(dora_ros2_bridge::transport::zenoh::service::ServiceRequest),
+}
+
+struct ZenohServerGoal {
+    id: ros2_client::action::GoalId,
+    status: ros2_client::action::GoalStatusEnum,
+    result: Option<Vec<u8>>,
+    /// Get-result requests received before the result was produced, each waiting
+    /// for a reply. This is a queue rather than a single slot: a ROS2 action
+    /// client (or several clients) can send more than one `GetResult` for the
+    /// same goal before it finishes, and every waiter must be answered when the
+    /// result arrives. A single `Option` here silently dropped all but the last
+    /// waiter, leaving those callers to hang until their own client-side timeout.
+    result_requests: Vec<dora_ros2_bridge::transport::RequestId>,
+}
+
+/// Whether a goal has finished. Finished goals are the ones evicted when the
+/// goal table is full, and the ones a cancel request must leave alone; both
+/// decisions have to agree or a slot can be held forever.
+fn is_terminal_goal_status(status: ros2_client::action::GoalStatusEnum) -> bool {
+    use ros2_client::action::GoalStatusEnum;
+    matches!(
+        status,
+        GoalStatusEnum::Succeeded | GoalStatusEnum::Aborted | GoalStatusEnum::Canceled
+    )
+}
+
+/// Decides whether a Zenoh `SendGoal` for goal `key` is accepted, making room
+/// in `goals` first when it is full.
+///
+/// Like `rcl_action`, a goal id that is already tracked is rejected and the
+/// table is left untouched: accepting it would overwrite the live goal,
+/// dropping its queued get-result waiters and any stored result, and hand the
+/// dora handler a second `goal` for the same id. Otherwise, when the table is
+/// full, finished goals the client never polled are retired so a burst of them
+/// can't permanently reject all future work; running goals are always kept.
+fn zenoh_accept_goal(
+    goals: &mut GoalSlots<String, ZenohServerGoal>,
+    key: &str,
+    has_payload: bool,
+) -> bool {
+    if goals.contains_key(key) {
+        return false;
+    }
+    if goals.len() >= MAX_CONCURRENT_GOALS {
+        let finished: Vec<String> = goals
+            .iter()
+            .filter(|(_, goal)| is_terminal_goal_status(goal.status))
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in finished {
+            goals.remove(&k);
+        }
+    }
+    has_payload && goals.len() < MAX_CONCURRENT_GOALS
+}
+
+/// Picks the goals a Zenoh `CancelGoal` request moves to `Canceling` (a nil
+/// `requested` id means "all goals") and the matching response code.
+///
+/// Like `rcl_action`, only goals that are still executing can be canceled. A
+/// finished goal whose result the client has not polled yet keeps its terminal
+/// status: flipping it back to `Canceling` would exempt it from the eviction of
+/// finished goals, so it would hold one of the `MAX_CONCURRENT_GOALS` slots
+/// forever, and it would be reported as canceling although it already ended.
+/// A goal that is already `Canceling` is not reported as newly canceled.
+fn zenoh_cancel_targets<'a>(
+    goals: impl IntoIterator<Item = &'a ZenohServerGoal>,
+    requested: ros2_client::action::GoalId,
+) -> (
+    Vec<ros2_client::action::GoalId>,
+    ros2_client::action_msgs::CancelGoalResponseEnum,
+) {
+    use ros2_client::action_msgs::CancelGoalResponseEnum;
+
+    use ros2_client::action::GoalStatusEnum;
+
+    let mut targets = Vec::new();
+    // Status of the goal a by-id request names, when it is not cancelable.
+    let mut matched_status = None;
+    for goal in goals {
+        if !(requested.uuid.is_nil() || requested.uuid == goal.id.uuid) {
+            continue;
+        }
+        if matches!(
+            goal.status,
+            GoalStatusEnum::Accepted | GoalStatusEnum::Executing
+        ) {
+            targets.push(goal.id);
+        } else {
+            matched_status = Some(goal.status);
+        }
+    }
+    let return_code = match matched_status {
+        _ if !targets.is_empty() => CancelGoalResponseEnum::None,
+        _ if requested.uuid.is_nil() => CancelGoalResponseEnum::UnknownGoal,
+        Some(status) if is_terminal_goal_status(status) => CancelGoalResponseEnum::GoalTerminated,
+        Some(_) => CancelGoalResponseEnum::Rejected,
+        None => CancelGoalResponseEnum::UnknownGoal,
+    };
+    (targets, return_code)
+}
+
+impl ZenohServerGoal {
+    /// Queue a get-result request to answer once the result is produced.
+    fn queue_result_request(&mut self, request_id: dora_ros2_bridge::transport::RequestId) {
+        self.result_requests.push(request_id);
+    }
+
+    /// Take every queued get-result request so the caller can reply to each with
+    /// the now-available result. Draining (rather than replacing an `Option`)
+    /// guarantees no waiter is dropped.
+    fn take_result_requests(&mut self) -> Vec<dora_ros2_bridge::transport::RequestId> {
+        std::mem::take(&mut self.result_requests)
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct CancelGoalRequestWire {
+    goal_info: ros2_client::action::GoalInfo,
+}
+
+/// Map a result message's `goal_status` metadata parameter to a terminal
+/// [`GoalStatusEnum`](ros2_client::action::GoalStatusEnum) for the Zenoh action
+/// server.
+///
+/// This mirrors the DDS action server (see the `"result"` arm of
+/// `run_action_server`): a missing status means the goal succeeded, an explicit
+/// `SUCCEEDED`/`ABORTED`/`CANCELED` maps across, and any *unknown* status string
+/// defaults to `Aborted` (with a warning). The previous Zenoh code mapped
+/// everything except `ABORTED`/`CANCELED` to `Succeeded`, so a typo'd or
+/// unsupported `goal_status` was silently reported as success — masking a
+/// handler failure and diverging from the DDS path.
+fn zenoh_result_goal_status(status: Option<&str>) -> ros2_client::action::GoalStatusEnum {
+    use ros2_client::action::GoalStatusEnum;
+    match status {
+        None | Some(GOAL_STATUS_SUCCEEDED) => GoalStatusEnum::Succeeded,
+        Some(GOAL_STATUS_ABORTED) => GoalStatusEnum::Aborted,
+        Some(GOAL_STATUS_CANCELED) => GoalStatusEnum::Canceled,
+        Some(other) => {
+            tracing::warn!("unknown goal_status `{other}`, defaulting to Aborted");
+            GoalStatusEnum::Aborted
+        }
+    }
+}
+
+fn run_zenoh_action_server(
+    server: ZenohActionServer,
+    goal_type_info: TypeInfo<'static>,
+    result_type_info: TypeInfo<'static>,
+    feedback_type_info: TypeInfo<'static>,
+) -> eyre::Result<()> {
+    use ros2_client::action::{
+        CancelGoalResponse, FeedbackMessage, GetResultRequest, GetResultResponse, GoalInfo,
+        GoalStatusEnum, SendGoalRequest, SendGoalResponse,
+    };
+
+    let server = Arc::new(server);
+    let (mut node, events) = DoraNode::init_from_env()?;
+    let (tx, rx) = flume::bounded(MAX_CONCURRENT_GOALS * 4);
+    for kind in 0..3 {
+        let server = server.clone();
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            futures::executor::block_on(async move {
+                loop {
+                    let request = match kind {
+                        0 => server.send_goal.recv().await,
+                        1 => server.get_result.recv().await,
+                        _ => server.cancel_goal.recv().await,
+                    };
+                    let event = match (kind, request) {
+                        (0, Ok(request)) => ZenohActionServerEvent::Goal(request),
+                        (1, Ok(request)) => ZenohActionServerEvent::ResultRequest(request),
+                        (_, Ok(request)) => ZenohActionServerEvent::Cancel(request),
+                        (_, Err(_)) => break,
+                    };
+                    if tx.send(event).is_err() {
+                        break;
+                    }
+                }
+            });
+        });
+    }
+    drop(tx);
+    let mut goals: GoalSlots<String, ZenohServerGoal> = GoalSlots::new(MAX_CONCURRENT_GOALS);
+    let merged = events.merge_external(Box::pin(rx.into_stream()));
+    for event in futures::executor::block_on_stream(merged) {
+        match event {
+            MergedEvent::External(ZenohActionServerEvent::Goal(request)) => {
+                let decoded = {
+                    let _guard = TypeInfoGuard::deserialize(goal_type_info.clone());
+                    deserialize_cdr::<SendGoalRequest<BridgeMessage>>(&request.payload)
+                };
+                let decoded = match decoded {
+                    Ok(decoded) => decoded,
+                    Err(error) => {
+                        // `reject` can fail with RequestExpired/RequestAbsent (e.g. a
+                        // peer replaying the same forged attachment); that must not
+                        // tear down the bridge, so warn and continue like the reply
+                        // paths rather than `?`-propagating out of the loop.
+                        if let Err(reject_error) = futures::executor::block_on(
+                            server.send_goal.reject(request.id, &error.to_string()),
+                        ) {
+                            tracing::warn!(
+                                "failed to reject Zenoh send-goal request: {reject_error}"
+                            );
+                        }
+                        continue;
+                    }
+                };
+                let key = decoded.goal_id.uuid.to_string();
+                let accepted = zenoh_accept_goal(&mut goals, &key, decoded.goal.0.is_some());
+                let response = serialize_cdr(&SendGoalResponse {
+                    accepted,
+                    stamp: ros2_client::builtin_interfaces::Time::from_nanos(unix_timestamp_ns()),
+                })?;
+                if let Err(error) =
+                    futures::executor::block_on(server.send_goal.reply(request.id, &response))
+                {
+                    tracing::warn!("failed to reply to Zenoh send-goal request: {error}");
+                }
+                if accepted {
+                    let data = decoded.goal.0.expect("accepted goal has payload");
+                    goals.insert(
+                        key.clone(),
+                        ZenohServerGoal {
+                            id: decoded.goal_id,
+                            status: GoalStatusEnum::Executing,
+                            result: None,
+                            result_requests: Vec::new(),
+                        },
+                    )?;
+                    let mut metadata = dora_message::metadata::MetadataParameters::default();
+                    metadata.insert(GOAL_ID.into(), Parameter::String(key));
+                    node.send_output("goal".into(), metadata, StructArray::from(data))?;
+                    publish_zenoh_status(&server, &goals)?;
+                }
+            }
+            MergedEvent::External(ZenohActionServerEvent::ResultRequest(request)) => {
+                let Some(decoded): Option<GetResultRequest> = value_or_warn(
+                    deserialize_cdr(&request.payload),
+                    "invalid Zenoh action get-result request",
+                ) else {
+                    if let Err(error) = futures::executor::block_on(
+                        server
+                            .get_result
+                            .reject(request.id, "invalid request payload"),
+                    ) {
+                        tracing::warn!("failed to reject Zenoh get-result request: {error}");
+                    }
+                    continue;
+                };
+                let key = decoded.goal_id.uuid.to_string();
+                let delivered = match goals.get_mut(&key) {
+                    Some(goal) => match goal.result.as_ref() {
+                        Some(response) => {
+                            if let Err(error) = futures::executor::block_on(
+                                server.get_result.reply(request.id, response),
+                            ) {
+                                tracing::warn!(
+                                    "failed to reply to Zenoh get-result request: {error}"
+                                );
+                            }
+                            true
+                        }
+                        None => {
+                            goal.queue_result_request(request.id);
+                            false
+                        }
+                    },
+                    None => {
+                        if let Err(error) = futures::executor::block_on(
+                            server.get_result.reject(request.id, "unknown goal"),
+                        ) {
+                            tracing::warn!(
+                                "failed to reject unknown-goal get-result request: {error}"
+                            );
+                        }
+                        false
+                    }
+                };
+                if delivered {
+                    // The client has its result; retire the goal so completed goals
+                    // don't accumulate in the slot table or the published status.
+                    goals.remove(&key);
+                    publish_zenoh_status(&server, &goals)?;
+                }
+            }
+            MergedEvent::External(ZenohActionServerEvent::Cancel(request)) => {
+                let Some(decoded): Option<CancelGoalRequestWire> = value_or_warn(
+                    deserialize_cdr(&request.payload),
+                    "invalid Zenoh action cancel-goal request",
+                ) else {
+                    if let Err(error) = futures::executor::block_on(
+                        server
+                            .cancel_goal
+                            .reject(request.id, "invalid request payload"),
+                    ) {
+                        tracing::warn!("failed to reject Zenoh cancel-goal request: {error}");
+                    }
+                    continue;
+                };
+                let (to_cancel, return_code) = zenoh_cancel_targets(
+                    goals.iter().map(|(_, goal)| goal),
+                    decoded.goal_info.goal_id,
+                );
+                let mut canceling = Vec::with_capacity(to_cancel.len());
+                for goal_id in to_cancel {
+                    if let Some(goal) = goals.get_mut(&goal_id.uuid.to_string()) {
+                        goal.status = GoalStatusEnum::Canceling;
+                    }
+                    canceling.push(GoalInfo {
+                        goal_id,
+                        stamp: ros2_client::builtin_interfaces::Time::ZERO,
+                    });
+                }
+                let response = CancelGoalResponse {
+                    return_code,
+                    goals_canceling: canceling,
+                };
+                let payload = serialize_cdr(&response)?;
+                if let Err(error) =
+                    futures::executor::block_on(server.cancel_goal.reply(request.id, &payload))
+                {
+                    tracing::warn!("failed to reply to Zenoh cancel-goal request: {error}");
+                }
+                publish_zenoh_status(&server, &goals)?;
+            }
+            MergedEvent::Dora(Event::Input { id, metadata, data }) => {
+                let Some(goal_key) =
+                    get_string_param(&metadata.parameters, GOAL_ID).map(str::to_owned)
+                else {
+                    tracing::warn!("action server input `{id}` missing goal_id metadata");
+                    continue;
+                };
+                let Some(goal) = goals.get_mut(&goal_key) else {
+                    tracing::warn!("action input for unknown goal {goal_key}");
+                    continue;
+                };
+                match id.as_str() {
+                    "feedback" => {
+                        let payload = {
+                            let _guard = TypeInfoGuard::serialize(feedback_type_info.clone());
+                            serialize_cdr(&FeedbackMessage {
+                                goal_id: goal.id,
+                                feedback: BridgeMessage(Some(data.as_array().to_data())),
+                            })
+                        };
+                        let Some(payload) = value_or_warn(
+                            payload,
+                            "dropping Zenoh action feedback that cannot be serialized",
+                        ) else {
+                            continue;
+                        };
+                        futures::executor::block_on(server.feedback.publish(&payload))?;
+                    }
+                    "result" => {
+                        let status_param = get_string_param(&metadata.parameters, GOAL_STATUS);
+                        goal.status = zenoh_result_goal_status(status_param);
+                        let response = {
+                            let _guard = TypeInfoGuard::serialize(result_type_info.clone());
+                            serialize_cdr(&GetResultResponse {
+                                status: goal.status,
+                                result: BridgeMessage(Some(data.as_array().to_data())),
+                            })
+                        };
+                        // A result the handler sent but that cannot be encoded
+                        // still ends the goal, as Aborted with a default result,
+                        // so the client is not left waiting for one.
+                        let response = match value_or_warn(
+                            response,
+                            "Zenoh action result cannot be serialized, aborting the goal",
+                        ) {
+                            Some(response) => response,
+                            None => {
+                                goal.status = GoalStatusEnum::Aborted;
+                                let _guard = TypeInfoGuard::serialize(result_type_info.clone());
+                                serialize_cdr(&GetResultResponse {
+                                    status: goal.status,
+                                    result: default_result_message(),
+                                })?
+                            }
+                        };
+                        let waiting = goal.take_result_requests();
+                        let delivered = if waiting.is_empty() {
+                            goal.result = Some(response);
+                            false
+                        } else {
+                            // Answer every waiter, not just the most recent one.
+                            for request_id in waiting {
+                                if let Err(error) = futures::executor::block_on(
+                                    server.get_result.reply(request_id, &response),
+                                ) {
+                                    tracing::warn!(
+                                        "failed to reply to Zenoh get-result request: {error}"
+                                    );
+                                }
+                            }
+                            true
+                        };
+                        // If any get-result request was already waiting, the result
+                        // is delivered now and the goal is retired; otherwise keep it
+                        // (with the stored result) until the client polls.
+                        if delivered {
+                            goals.remove(&goal_key);
+                        }
+                        publish_zenoh_status(&server, &goals)?;
+                    }
+                    other => tracing::warn!("unexpected action server input `{other}`"),
+                }
+            }
+            MergedEvent::Dora(Event::Stop(_)) => break,
+            MergedEvent::Dora(_) => {}
+        }
+    }
+    Ok(())
+}
+
+fn publish_zenoh_status(
+    server: &ZenohActionServer,
+    goals: &GoalSlots<String, ZenohServerGoal>,
+) -> eyre::Result<()> {
+    let status = ros2_client::action_msgs::GoalStatusArray {
+        status_list: goals
+            .iter()
+            .map(|(_, goal)| ros2_client::action_msgs::GoalStatus {
+                goal_info: ros2_client::action::GoalInfo {
+                    goal_id: goal.id,
+                    stamp: ros2_client::builtin_interfaces::Time::ZERO,
+                },
+                status: goal.status,
+            })
+            .collect(),
+    };
+    futures::executor::block_on(server.status.publish(&serialize_cdr(&status)?))?;
+    Ok(())
+}
+
+fn unix_timestamp_ns() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_nanos()).ok())
+        .unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -104,9 +1271,7 @@ fn run_topic_mode(
 
         match &topic_config.direction {
             Ros2Direction::Subscribe => {
-                let output_id = topic_config.output.clone().unwrap_or_else(|| {
-                    topic_config.topic.trim_start_matches('/').replace('/', "_")
-                });
+                let output_id = topic_config.output_port_id();
                 let subscription: ros2_client::Subscription<ArrayData> = ros_node
                     .create_subscription(&ros_topic, None)
                     .context("failed to create ROS2 subscription")?;
@@ -120,9 +1285,7 @@ fn run_topic_mode(
                 ));
             }
             Ros2Direction::Publish => {
-                let input_id = topic_config.input.clone().unwrap_or_else(|| {
-                    topic_config.topic.trim_start_matches('/').replace('/', "_")
-                });
+                let input_id = topic_config.input_port_id();
                 let publisher = ros_node
                     .create_publisher::<TypedValue<'static>>(&ros_topic, None)
                     .context("failed to create ROS2 publisher")?;
@@ -240,29 +1403,44 @@ fn run_service_client(
                 metadata: _,
                 data,
             } => {
-                let array_data = data.to_data();
+                let array_data = data.as_array().to_data();
 
+                // A failed or unanswered call fails only this request, as on
+                // the Zenoh transport: one slow or absent ROS2 server must not
+                // tear down the whole bridge node.
                 // Serialize request (guard clears thread-local on drop)
                 let _guard = TypeInfoGuard::serialize(request_type_info.clone());
-                let req_id = client
-                    .send_request(BridgeMessage(Some(array_data)))
-                    .map_err(|e| eyre!("failed to send service request: {e:?}"))?;
+                let Some(req_id) = dds_call_or_warn(
+                    client
+                        .send_request(BridgeMessage(Some(array_data)))
+                        .map_err(DdsCallFailure::Write),
+                    "failed to send ROS2 service request",
+                )?
+                else {
+                    continue;
+                };
 
                 // Receive response with timeout
                 let _guard = TypeInfoGuard::deserialize(response_type_info.clone());
-                let response = futures::executor::block_on(async {
-                    let recv = client.async_receive_response(req_id);
-                    futures::pin_mut!(recv);
-                    let timeout = futures_timer::Delay::new(SERVICE_RESPONSE_TIMEOUT);
-                    match futures::future::select(recv, timeout).await {
-                        futures::future::Either::Left((result, _)) => {
-                            result.map_err(|e| eyre!("failed to receive service response: {e:?}"))
+                let Some(response) = dds_call_or_warn(
+                    futures::executor::block_on(async {
+                        let recv = client.async_receive_response(req_id);
+                        futures::pin_mut!(recv);
+                        let timeout = futures_timer::Delay::new(SERVICE_RESPONSE_TIMEOUT);
+                        match futures::future::select(recv, timeout).await {
+                            futures::future::Either::Left((result, _)) => {
+                                result.map_err(DdsCallFailure::Read)
+                            }
+                            futures::future::Either::Right(_) => {
+                                Err(DdsCallFailure::TimedOut(SERVICE_RESPONSE_TIMEOUT))
+                            }
                         }
-                        futures::future::Either::Right(_) => {
-                            eyre::bail!("service response timed out")
-                        }
-                    }
-                })?;
+                    }),
+                    "ROS2 service call failed",
+                )?
+                else {
+                    continue;
+                };
 
                 if let Some(resp_data) = response.0 {
                     node.send_output(
@@ -323,12 +1501,15 @@ fn run_service_server(
                 let rid = get_string_param(&metadata.parameters, REQUEST_ID);
                 if let Some(rid) = rid {
                     if let Some((rmw_id, _)) = pending_requests.remove(rid) {
-                        let array_data = data.to_data();
+                        let array_data = data.as_array().to_data();
                         let _ser_guard = TypeInfoGuard::serialize(response_type_info.clone());
-                        futures::executor::block_on(
-                            server.async_send_response(rmw_id, BridgeMessage(Some(array_data))),
-                        )
-                        .map_err(|e| eyre!("failed to send service response: {e:?}"))?;
+                        dds_call_or_warn(
+                            futures::executor::block_on(
+                                server.async_send_response(rmw_id, BridgeMessage(Some(array_data))),
+                            )
+                            .map_err(DdsCallFailure::Write),
+                            "failed to send ROS2 service response",
+                        )?;
                     } else {
                         tracing::warn!(
                             "response has request_id={rid} but no matching pending request"
@@ -477,7 +1658,7 @@ fn run_action_client(
 ) -> eyre::Result<()> {
     let (mut node, dora_events) = DoraNode::init_from_env()?;
     let client = Arc::new(client);
-    let in_flight = Arc::new(AtomicUsize::new(0));
+    let goal_limit = ConcurrentGoalLimit::new(MAX_CONCURRENT_GOALS);
 
     // Channel for feedback and result from background threads.
     // Bounded at 16 per concurrent goal to provide backpressure — if the main
@@ -497,37 +1678,46 @@ fn run_action_client(
                 data,
             }) => {
                 // Cap concurrent in-flight goals
-                if in_flight.load(Ordering::Relaxed) >= MAX_CONCURRENT_GOALS {
-                    tracing::warn!(
-                        "max concurrent goals ({MAX_CONCURRENT_GOALS}) reached, dropping goal"
-                    );
-                    continue;
-                }
+                let permit = match goal_limit.try_acquire() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        tracing::warn!(
+                            "max concurrent goals ({MAX_CONCURRENT_GOALS}) reached, dropping goal"
+                        );
+                        continue;
+                    }
+                };
 
-                let array_data = data.to_data();
+                let array_data = data.as_array().to_data();
 
                 // Send goal with timeout (guard clears thread-local on drop)
                 let _guard = TypeInfoGuard::serialize(goal_type_info.clone());
-                let (goal_id, send_goal_response) = futures::executor::block_on(async {
-                    let send = client.async_send_goal(BridgeMessage(Some(array_data)));
-                    futures::pin_mut!(send);
-                    let timeout = futures_timer::Delay::new(ACTION_GOAL_TIMEOUT);
-                    match futures::future::select(send, timeout).await {
-                        futures::future::Either::Left((result, _)) => {
-                            result.map_err(|e| eyre!("failed to send action goal: {e:?}"))
+                // As for service calls, a goal the server does not answer in
+                // time fails only that goal, not the whole action bridge.
+                let Some((goal_id, send_goal_response)) = dds_call_or_warn(
+                    futures::executor::block_on(async {
+                        let send = client.async_send_goal(BridgeMessage(Some(array_data)));
+                        futures::pin_mut!(send);
+                        let timeout = futures_timer::Delay::new(ACTION_GOAL_TIMEOUT);
+                        match futures::future::select(send, timeout).await {
+                            futures::future::Either::Left((result, _)) => {
+                                result.map_err(DdsCallFailure::from)
+                            }
+                            futures::future::Either::Right(_) => {
+                                Err(DdsCallFailure::TimedOut(ACTION_GOAL_TIMEOUT))
+                            }
                         }
-                        futures::future::Either::Right(_) => {
-                            eyre::bail!("action goal send timed out")
-                        }
-                    }
-                })?;
+                    }),
+                    "failed to send ROS2 action goal",
+                )?
+                else {
+                    continue;
+                };
 
                 if !send_goal_response.accepted {
                     tracing::warn!("action goal was rejected by server");
                     continue;
                 }
-
-                in_flight.fetch_add(1, Ordering::Relaxed);
 
                 // Spawn feedback reader thread
                 let feedback_tx = tx.clone();
@@ -561,8 +1751,8 @@ fn run_action_client(
                 let result_tx = tx.clone();
                 let res_type_info = result_type_info.clone();
                 let client_ref = client.clone();
-                let in_flight_ref = in_flight.clone();
                 std::thread::spawn(move || {
+                    let _permit = permit;
                     let _guard = TypeInfoGuard::deserialize(res_type_info);
                     let result = futures::executor::block_on(async {
                         let recv = client_ref.async_request_result(goal_id);
@@ -585,7 +1775,6 @@ fn run_action_client(
                     } else if let Some(Err(e)) = result {
                         tracing::warn!("action result error: {e:?}");
                     }
-                    in_flight_ref.fetch_sub(1, Ordering::Relaxed);
                 });
             }
             MergedEvent::Dora(Event::Stop(_)) => break,
@@ -636,10 +1825,10 @@ fn run_action_server(
     let server = Arc::new(server);
 
     // Map goal_id -> ExecutingGoalHandle for dispatching feedback/result
-    let mut executing_goals: HashMap<
+    let mut executing_goals: GoalSlots<
         String,
         ros2_client::action::ExecutingGoalHandle<BridgeMessage>,
-    > = HashMap::new();
+    > = GoalSlots::new(MAX_CONCURRENT_GOALS);
 
     // Channel for new goals from the background receive thread.
     // Bounded to provide backpressure: if the main loop can't keep up,
@@ -725,7 +1914,7 @@ fn run_action_server(
                     "feedback" => {
                         if let Some(handle) = executing_goals.get(&goal_id) {
                             let handle = handle.clone();
-                            let array_data = data.to_data();
+                            let array_data = data.as_array().to_data();
                             let _guard = TypeInfoGuard::serialize(feedback_type_info.clone());
                             if let Err(e) = futures::executor::block_on(
                                 server.publish_feedback(handle, BridgeMessage(Some(array_data))),
@@ -740,7 +1929,7 @@ fn run_action_server(
                     }
                     "result" => {
                         if let Some(handle) = executing_goals.remove(&goal_id) {
-                            let array_data = data.to_data();
+                            let array_data = data.as_array().to_data();
                             let status = match get_string_param(&metadata.parameters, GOAL_STATUS) {
                                 Some(s) => match s {
                                     GOAL_STATUS_SUCCEEDED => {
@@ -768,14 +1957,7 @@ fn run_action_server(
                                 status,
                                 BridgeMessage(Some(array_data)),
                             );
-                            let result = futures::executor::block_on(async {
-                                futures::pin_mut!(send_result);
-                                let timeout = futures_timer::Delay::new(ACTION_RESULT_TIMEOUT);
-                                match futures::future::select(send_result, timeout).await {
-                                    futures::future::Either::Left((r, _)) => Some(r),
-                                    futures::future::Either::Right(_) => None,
-                                }
-                            });
+                            let result = block_on_result_timeout(send_result);
                             match result {
                                 Some(Err(e)) => {
                                     tracing::warn!(
@@ -825,7 +2007,7 @@ fn run_action_server(
                         abort_executing_goal(&server, &result_type_info, handle, &goal_id);
                         continue;
                     }
-                    executing_goals.insert(goal_id, handle);
+                    executing_goals.insert(goal_id, handle)?;
                 }
             },
         }
@@ -846,11 +2028,42 @@ fn abort_executing_goal(
     let send = server.send_result_response(
         handle,
         ros2_client::action::GoalEndStatus::Aborted,
-        BridgeMessage(None),
+        default_result_message(),
     );
-    if let Err(e) = futures::executor::block_on(send) {
-        tracing::warn!("failed to send abort for goal {goal_id}: {e:?}");
+    // `send_result_response` first waits for the client's GetResult
+    // request, so bound it like the regular result path: a client that never
+    // asks must not wedge this event loop forever.
+    match block_on_result_timeout(send) {
+        Some(Err(e)) => tracing::warn!("failed to send abort for goal {goal_id}: {e:?}"),
+        None => tracing::warn!("abort result response timed out for goal {goal_id}"),
+        Some(Ok(())) => {}
     }
+}
+
+/// Block on an action-server result send, giving up after
+/// [`ACTION_RESULT_TIMEOUT`] (`None`).
+fn block_on_result_timeout<F: std::future::Future>(send: F) -> Option<F::Output> {
+    futures::executor::block_on(async {
+        futures::pin_mut!(send);
+        let timeout = futures_timer::Delay::new(ACTION_RESULT_TIMEOUT);
+        match futures::future::select(send, timeout).await {
+            futures::future::Either::Left((r, _)) => Some(r),
+            futures::future::Either::Right(_) => None,
+        }
+    })
+}
+
+/// A result message with every field at its ROS2 default, for goals the
+/// bridge ends itself (aborted) without a result from the handler.
+///
+/// It must carry a value: `BridgeMessage(None)` cannot be serialized, so an
+/// abort sent with it failed after ros2-client had already marked the goal
+/// Aborted, and the client never received any result. A one-row struct
+/// without columns serializes every member as its default.
+fn default_result_message() -> BridgeMessage {
+    BridgeMessage(Some(arrow::array::Array::into_data(
+        arrow::array::StructArray::new_empty_fields(1, None),
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -874,7 +2087,7 @@ fn run_publish_only(
                 metadata: _,
                 data,
             } => {
-                handle_publish_input(&id, &data, &publishers, messages)?;
+                handle_publish_input(&id, data.as_array(), &publishers, messages)?;
             }
             Event::Stop(_) => break,
             _ => {}
@@ -916,7 +2129,7 @@ fn run_single_subscriber(
                 metadata: _,
                 data,
             }) => {
-                handle_publish_input(&id, &data, &publishers, messages)?;
+                handle_publish_input(&id, data.as_array(), &publishers, messages)?;
             }
             MergedEvent::Dora(Event::Stop(_)) => break,
             MergedEvent::Dora(_) => {}
@@ -981,7 +2194,7 @@ fn run_multi_subscriber(
                 metadata: _,
                 data,
             }) => {
-                handle_publish_input(&id, &data, &publishers, messages)?;
+                handle_publish_input(&id, data.as_array(), &publishers, messages)?;
             }
             MergedEvent::Dora(Event::Stop(_)) => break,
             MergedEvent::Dora(_) => {}
@@ -1019,9 +2232,12 @@ fn handle_publish_input(
                 value: data,
                 type_info,
             };
-            publisher
-                .publish(typed_value)
-                .map_err(|e| eyre!("failed to publish to ROS2: {e:?}"))?;
+            dds_call_or_warn(
+                publisher
+                    .publish(typed_value)
+                    .map_err(|e| DdsCallFailure::Write(e.forget_data())),
+                "failed to publish to ROS2",
+            )?;
         }
     }
     Ok(())
@@ -1152,6 +2368,13 @@ fn parse_type_str(type_str: &str) -> eyre::Result<(String, String)> {
     Ok((pkg.to_string(), type_name.to_string()))
 }
 
+/// Flatten either topic mode into the per-topic list the bridge binds from.
+///
+/// A config from a current dora descriptor never takes the single-topic arm:
+/// the resolver rewrites `topic:` into a one-entry `topics:` list carrying the
+/// node's declared port. The arm is kept rather than rejected so this binary
+/// still runs against a resolver that predates that rewrite, but note it binds
+/// by the topic-derived id there, not by the declared port.
 fn resolve_topics(config: &Ros2BridgeConfig) -> eyre::Result<Vec<Ros2TopicConfig>> {
     match (&config.topic, &config.topics) {
         (Some(topic), None) => {
@@ -1173,61 +2396,417 @@ fn resolve_topics(config: &Ros2BridgeConfig) -> eyre::Result<Vec<Ros2TopicConfig
     }
 }
 
-trait ToRustddsQos {
-    fn to_rustdds_qos(&self) -> rustdds::QosPolicies;
-}
-
-impl ToRustddsQos for Ros2QosConfig {
+trait ToNeutralQos {
+    fn to_neutral_qos(&self) -> Ros2Qos;
     fn to_rustdds_qos(&self) -> rustdds::QosPolicies {
-        let mut builder = rustdds::QosPolicyBuilder::new();
-
-        let durability = match self.durability.as_deref() {
-            Some("transient_local") => rustdds::policy::Durability::TransientLocal,
-            _ => rustdds::policy::Durability::Volatile,
-        };
-        builder = builder.durability(durability);
-
-        if self.reliable {
-            let max_blocking = self
-                .max_blocking_time
-                .map(ros2_client::ros2::Duration::from_frac_seconds)
-                .unwrap_or(ros2_client::ros2::Duration::from_millis(100));
-            builder = builder.reliability(rustdds::policy::Reliability::Reliable {
-                max_blocking_time: max_blocking,
-            });
-        } else {
-            builder = builder.reliability(rustdds::policy::Reliability::BestEffort);
-        }
-
-        if self.keep_all {
-            builder = builder.history(rustdds::policy::History::KeepAll);
-        } else {
-            let depth = self.keep_last.unwrap_or(1);
-            builder = builder.history(rustdds::policy::History::KeepLast {
-                depth: depth.max(1),
-            });
-        }
-
-        let liveliness = match self.liveliness.as_deref() {
-            Some("manual_by_participant") => rustdds::policy::Liveliness::ManualByParticipant {
-                lease_duration: lease_duration_from_secs(self.lease_duration),
-            },
-            Some("manual_by_topic") => rustdds::policy::Liveliness::ManualByTopic {
-                lease_duration: lease_duration_from_secs(self.lease_duration),
-            },
-            _ => rustdds::policy::Liveliness::Automatic {
-                lease_duration: lease_duration_from_secs(self.lease_duration),
-            },
-        };
-        builder = builder.liveliness(liveliness);
-
-        builder.build()
+        dora_ros2_bridge::transport::dds::to_rustdds_qos(&self.to_neutral_qos())
     }
 }
 
-fn lease_duration_from_secs(secs: Option<f64>) -> ros2_client::ros2::Duration {
-    match secs {
-        Some(s) => ros2_client::ros2::Duration::from_frac_seconds(s),
-        None => ros2_client::ros2::Duration::INFINITE,
+impl ToNeutralQos for Ros2QosConfig {
+    fn to_neutral_qos(&self) -> Ros2Qos {
+        let lease_duration = self.lease_duration.map(Duration::from_secs_f64);
+        Ros2Qos {
+            reliability: if self.reliable {
+                Reliability::Reliable {
+                    max_blocking_time: self
+                        .max_blocking_time
+                        .map(Duration::from_secs_f64)
+                        .unwrap_or(Duration::from_millis(100)),
+                }
+            } else {
+                Reliability::BestEffort
+            },
+            durability: if self.durability.as_deref() == Some("transient_local") {
+                Durability::TransientLocal
+            } else {
+                Durability::Volatile
+            },
+            history: if self.keep_all {
+                History::KeepAll
+            } else {
+                History::KeepLast {
+                    depth: self.keep_last.unwrap_or(1).max(1),
+                }
+            },
+            liveliness: match self.liveliness.as_deref() {
+                Some("manual_by_participant") => Liveliness::ManualByParticipant { lease_duration },
+                Some("manual_by_topic") => Liveliness::ManualByTopic { lease_duration },
+                _ => Liveliness::Automatic { lease_duration },
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod dds_call_failure_tests {
+    use super::{DdsCallFailure, dds_call_or_warn};
+    use dora_ros2_bridge::rustdds::dds::result::{ReadError, WriteError};
+    use std::time::Duration;
+
+    #[test]
+    fn a_slow_or_unreachable_peer_fails_only_the_call() {
+        let recoverable = [
+            DdsCallFailure::TimedOut(Duration::from_secs(30)),
+            DdsCallFailure::Write(WriteError::WouldBlock { data: () }),
+            DdsCallFailure::Write(WriteError::Io(std::io::Error::other("unreachable"))),
+            DdsCallFailure::Read(ReadError::Deserialization {
+                reason: "bad response".into(),
+            }),
+            // One message whose values cannot be encoded (#3795), e.g. a
+            // null nested-message row; the next message may be fine.
+            DdsCallFailure::Write(WriteError::Serialization {
+                reason: "null nested-message row".into(),
+                data: (),
+            }),
+        ];
+        for failure in recoverable {
+            assert!(!failure.is_fatal(), "{failure:?} must fail only the call");
+            assert!(matches!(
+                dds_call_or_warn::<()>(Err(failure), "test"),
+                Ok(None)
+            ));
+        }
+    }
+
+    #[test]
+    fn a_broken_participant_ends_the_bridge() {
+        let fatal = [
+            DdsCallFailure::Write(WriteError::Poisoned {
+                reason: "rtps thread panicked".into(),
+                data: (),
+            }),
+            DdsCallFailure::Write(WriteError::Internal {
+                reason: "bug".into(),
+            }),
+            DdsCallFailure::Read(ReadError::Poisoned {
+                reason: "rtps thread panicked".into(),
+            }),
+        ];
+        for failure in fatal {
+            assert!(failure.is_fatal(), "{failure:?} must end the bridge");
+            assert!(dds_call_or_warn::<()>(Err(failure), "test").is_err());
+        }
+    }
+
+    #[test]
+    fn a_successful_call_passes_its_value_through() {
+        assert_eq!(dds_call_or_warn(Ok(7), "test").unwrap(), Some(7));
+    }
+}
+
+#[cfg(test)]
+mod peer_failure_tests {
+    use super::value_or_warn;
+
+    #[test]
+    fn malformed_peer_value_is_dropped_without_poisoning_the_next_value() {
+        let malformed: eyre::Result<u32> = Err(eyre::eyre!("malformed"));
+        assert!(value_or_warn(malformed, "test").is_none());
+        let valid: eyre::Result<u32> = Ok(42);
+        assert_eq!(value_or_warn(valid, "test"), Some(42));
+    }
+}
+
+#[cfg(test)]
+mod zenoh_cancel_tests {
+    use super::ros2_client::action::{GoalId, GoalStatusEnum};
+    use super::ros2_client::action_msgs::CancelGoalResponseEnum;
+    use super::{ZenohServerGoal, zenoh_cancel_targets};
+
+    fn goal(status: GoalStatusEnum) -> ZenohServerGoal {
+        ZenohServerGoal {
+            id: GoalId::new_random(),
+            status,
+            result: None,
+            result_requests: Vec::new(),
+        }
+    }
+
+    fn nil() -> GoalId {
+        let mut id = GoalId::new_random();
+        id.uuid = Default::default();
+        id
+    }
+
+    #[test]
+    fn cancel_all_skips_finished_goals() {
+        let running = goal(GoalStatusEnum::Executing);
+        let finished = [
+            goal(GoalStatusEnum::Succeeded),
+            goal(GoalStatusEnum::Aborted),
+            goal(GoalStatusEnum::Canceled),
+        ];
+        let (targets, code) =
+            zenoh_cancel_targets(std::iter::once(&running).chain(&finished), nil());
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].uuid, running.id.uuid);
+        assert_eq!(code, CancelGoalResponseEnum::None);
+    }
+
+    #[test]
+    fn cancelling_a_finished_goal_reports_goal_terminated() {
+        let finished = goal(GoalStatusEnum::Succeeded);
+        let (targets, code) = zenoh_cancel_targets([&finished], finished.id);
+        assert!(targets.is_empty());
+        assert_eq!(code, CancelGoalResponseEnum::GoalTerminated);
+    }
+
+    #[test]
+    fn cancelling_a_running_goal_by_id() {
+        let running = goal(GoalStatusEnum::Executing);
+        let other = goal(GoalStatusEnum::Executing);
+        let (targets, code) = zenoh_cancel_targets([&running, &other], running.id);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].uuid, running.id.uuid);
+        assert_eq!(code, CancelGoalResponseEnum::None);
+    }
+
+    #[test]
+    fn a_goal_that_is_already_canceling_is_not_canceled_again() {
+        let canceling = goal(GoalStatusEnum::Canceling);
+        let running = goal(GoalStatusEnum::Executing);
+        let (targets, code) = zenoh_cancel_targets([&canceling, &running], nil());
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].uuid, running.id.uuid);
+        assert_eq!(code, CancelGoalResponseEnum::None);
+
+        let (targets, code) = zenoh_cancel_targets([&canceling], canceling.id);
+        assert!(targets.is_empty());
+        assert_eq!(code, CancelGoalResponseEnum::Rejected);
+    }
+
+    #[test]
+    fn unknown_or_empty_cancel_reports_unknown_goal() {
+        let running = goal(GoalStatusEnum::Executing);
+        let (targets, code) = zenoh_cancel_targets([&running], GoalId::new_random());
+        assert!(targets.is_empty());
+        assert_eq!(code, CancelGoalResponseEnum::UnknownGoal);
+
+        let finished = goal(GoalStatusEnum::Succeeded);
+        let (targets, code) = zenoh_cancel_targets([&finished], nil());
+        assert!(targets.is_empty());
+        assert_eq!(code, CancelGoalResponseEnum::UnknownGoal);
+    }
+}
+
+#[cfg(test)]
+mod zenoh_accept_goal_tests {
+    use super::ros2_client::action::{GoalId, GoalStatusEnum};
+    use super::{GoalSlots, MAX_CONCURRENT_GOALS, ZenohServerGoal, zenoh_accept_goal};
+
+    fn insert(goals: &mut GoalSlots<String, ZenohServerGoal>, status: GoalStatusEnum) -> String {
+        let id = GoalId::new_random();
+        let key = id.uuid.to_string();
+        goals
+            .insert(
+                key.clone(),
+                ZenohServerGoal {
+                    id,
+                    status,
+                    result: Some(vec![1, 2, 3]),
+                    result_requests: Vec::new(),
+                },
+            )
+            .unwrap();
+        key
+    }
+
+    #[test]
+    fn a_new_goal_is_accepted() {
+        let mut goals = GoalSlots::new(MAX_CONCURRENT_GOALS);
+        assert!(zenoh_accept_goal(&mut goals, "new", true));
+        assert!(!zenoh_accept_goal(&mut goals, "no-payload", false));
+    }
+
+    #[test]
+    fn a_reused_goal_id_is_rejected_and_the_live_goal_is_kept() {
+        let mut goals = GoalSlots::new(MAX_CONCURRENT_GOALS);
+        let live = insert(&mut goals, GoalStatusEnum::Executing);
+        assert!(!zenoh_accept_goal(&mut goals, &live, true));
+        assert!(matches!(
+            goals.get(&live).map(|g| g.status),
+            Some(GoalStatusEnum::Executing)
+        ));
+    }
+
+    #[test]
+    fn a_reused_id_of_a_finished_goal_is_rejected_even_when_the_table_is_full() {
+        let mut goals = GoalSlots::new(MAX_CONCURRENT_GOALS);
+        let finished = insert(&mut goals, GoalStatusEnum::Succeeded);
+        while goals.len() < MAX_CONCURRENT_GOALS {
+            insert(&mut goals, GoalStatusEnum::Executing);
+        }
+        assert!(!zenoh_accept_goal(&mut goals, &finished, true));
+        // The finished goal and its stored result must survive: the
+        // duplicate must not evict the very goal it collides with.
+        assert_eq!(
+            goals.get(&finished).and_then(|g| g.result.clone()),
+            Some(vec![1, 2, 3])
+        );
+    }
+
+    #[test]
+    fn a_full_table_retires_finished_goals_to_make_room() {
+        let mut goals = GoalSlots::new(MAX_CONCURRENT_GOALS);
+        let finished = insert(&mut goals, GoalStatusEnum::Aborted);
+        while goals.len() < MAX_CONCURRENT_GOALS {
+            insert(&mut goals, GoalStatusEnum::Executing);
+        }
+        assert!(zenoh_accept_goal(&mut goals, "new", true));
+        assert!(!goals.contains_key(&finished));
+    }
+
+    #[test]
+    fn a_table_full_of_running_goals_rejects() {
+        let mut goals = GoalSlots::new(MAX_CONCURRENT_GOALS);
+        while goals.len() < MAX_CONCURRENT_GOALS {
+            insert(&mut goals, GoalStatusEnum::Executing);
+        }
+        assert!(!zenoh_accept_goal(&mut goals, "new", true));
+        assert_eq!(goals.len(), MAX_CONCURRENT_GOALS);
+    }
+}
+
+#[cfg(test)]
+mod zenoh_goal_status_tests {
+    use super::ros2_client::action::GoalStatusEnum;
+    use super::zenoh_result_goal_status;
+
+    #[test]
+    fn missing_status_is_success() {
+        assert!(matches!(
+            zenoh_result_goal_status(None),
+            GoalStatusEnum::Succeeded
+        ));
+    }
+
+    #[test]
+    fn explicit_statuses_map_across() {
+        assert!(matches!(
+            zenoh_result_goal_status(Some("succeeded")),
+            GoalStatusEnum::Succeeded
+        ));
+        assert!(matches!(
+            zenoh_result_goal_status(Some("aborted")),
+            GoalStatusEnum::Aborted
+        ));
+        assert!(matches!(
+            zenoh_result_goal_status(Some("canceled")),
+            GoalStatusEnum::Canceled
+        ));
+    }
+
+    // The original bug: an unknown status string was silently reported as
+    // `Succeeded`, masking a handler failure. It must now default to `Aborted`,
+    // matching the DDS action server.
+    #[test]
+    fn unknown_status_defaults_to_aborted_not_succeeded() {
+        assert!(matches!(
+            zenoh_result_goal_status(Some("typo-failed")),
+            GoalStatusEnum::Aborted
+        ));
+        assert!(matches!(
+            zenoh_result_goal_status(Some("")),
+            GoalStatusEnum::Aborted
+        ));
+    }
+}
+
+#[cfg(test)]
+mod zenoh_goal_result_request_tests {
+    use super::ZenohServerGoal;
+    use super::ros2_client::action::{GoalId, GoalStatusEnum};
+    use dora_ros2_bridge::transport::RequestId;
+
+    fn request_id(sequence_number: i64) -> RequestId {
+        RequestId {
+            sequence_number,
+            client_gid: [0u8; 16],
+        }
+    }
+
+    fn goal() -> ZenohServerGoal {
+        ZenohServerGoal {
+            id: GoalId::new_random(),
+            status: GoalStatusEnum::Executing,
+            result: None,
+            result_requests: Vec::new(),
+        }
+    }
+
+    // Regression test for the orphaned-waiter bug: several get-result requests
+    // that arrive before the result is produced must all be retained and
+    // answered. The previous single-`Option` slot overwrote earlier waiters, so
+    // only the most recent request was ever replied to; the rest hung.
+    #[test]
+    fn multiple_pending_requests_are_all_retained_and_drained_in_order() {
+        let mut goal = goal();
+        goal.queue_result_request(request_id(1));
+        goal.queue_result_request(request_id(2));
+        goal.queue_result_request(request_id(3));
+
+        let drained = goal.take_result_requests();
+        assert_eq!(
+            drained,
+            vec![request_id(1), request_id(2), request_id(3)],
+            "every waiting get-result request must be answered, in arrival order"
+        );
+
+        // Draining leaves the queue empty so the goal can be retired.
+        assert!(
+            goal.take_result_requests().is_empty(),
+            "the queue must be empty after draining"
+        );
+    }
+
+    #[test]
+    fn no_pending_requests_drains_to_empty() {
+        let mut goal = goal();
+        assert!(goal.take_result_requests().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod abort_result_tests {
+    use super::*;
+    use dora_ros2_bridge_msg_gen::types::{
+        Member, MemberType,
+        primitives::{BasicType, NestableType},
+    };
+    use std::borrow::Cow;
+
+    fn result_type_info() -> TypeInfo<'static> {
+        let message = Message {
+            package: "test_pkg".to_string(),
+            name: "R".to_string(),
+            members: vec![Member {
+                name: "code".to_string(),
+                r#type: MemberType::NestableType(NestableType::BasicType(BasicType::I32)),
+                default: None,
+            }],
+            constants: vec![],
+        };
+        let mut package = HashMap::new();
+        package.insert("R".to_string(), message);
+        let mut messages = HashMap::new();
+        messages.insert("test_pkg".to_string(), package);
+        TypeInfo {
+            package_name: Cow::Borrowed("test_pkg"),
+            message_name: Cow::Borrowed("R"),
+            messages: Arc::new(messages),
+        }
+    }
+
+    /// The abort payload must serialize: it used to be `BridgeMessage(None)`,
+    /// which always fails, so the aborted goal's client never got a result.
+    #[test]
+    fn abort_result_payload_serializes_with_defaults() {
+        let _guard = TypeInfoGuard::serialize(result_type_info());
+        assert!(serialize_cdr(&BridgeMessage(None)).is_err());
+
+        let payload = serialize_cdr(&default_result_message()).expect("abort payload");
+        // CDR encapsulation header, then the defaulted `int32 code`.
+        assert_eq!(&payload[4..], &[0, 0, 0, 0]);
     }
 }

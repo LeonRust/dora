@@ -5,9 +5,8 @@ use std::{
 
 use dora_node_api::{
     DoraNode, Event, IntoArrow,
-    arrow::array::{Array, NullArray},
+    arrow_v59::array::{Array, NullArray},
     dora_core::config::DataId,
-    flume,
     integration_testing::{
         self, IntegrationTestInput, TestingOptions,
         integration_testing_format::{IncomingEvent, TimedIncomingEvent},
@@ -97,7 +96,7 @@ fn test_sample_output() -> eyre::Result<()> {
         IntegrationTestInput::new("node_id".parse().unwrap(), events),
     );
 
-    let (tx, rx) = flume::unbounded();
+    let (tx, mut rx) = dora_node_api::integration_testing::output_channel();
     let testing_output = dora_node_api::integration_testing::TestingOutput::ToChannel(tx);
     let (mut node, mut events) =
         DoraNode::init_testing(inputs, testing_output, Default::default())?;
@@ -113,7 +112,7 @@ fn test_sample_output() -> eyre::Result<()> {
         match event {
             Event::Input { id, metadata, data } => match id.as_str() {
                 "tick" => {
-                    assert_eq!(data.to_data(), NullArray::new(0).to_data());
+                    assert_eq!(data.as_array().to_data(), NullArray::new(0).to_data());
                     node.send_output(output.clone(), metadata.parameters, i.into_arrow())?;
                 }
                 other => panic!("unexpected input `{other}`"),
@@ -128,7 +127,7 @@ fn test_sample_output() -> eyre::Result<()> {
     std::mem::drop(node);
     std::mem::drop(events);
 
-    let outputs = rx.try_iter().collect::<Vec<_>>();
+    let outputs = dora_node_api::integration_testing::drain_outputs(&mut rx);
     let expected: Vec<serde_json::Map<_, _>> = [
         serde_json::json!({
             "id": "i",

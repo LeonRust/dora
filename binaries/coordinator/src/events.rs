@@ -29,6 +29,18 @@ pub enum Event {
     Control(ControlEvent),
     Daemon(DaemonRequest),
     DaemonHeartbeatInterval,
+    /// A daemon reported the zenoh endpoint it bound, for the coordinator to
+    /// hand to daemons registering later.
+    DaemonZenohEndpoint {
+        daemon_id: DaemonId,
+        /// Connection-instance ID stamped at registration, checked the same way
+        /// `DaemonExit` checks it (#2392): a report from a superseded
+        /// connection must not overwrite the endpoint of the connection that
+        /// replaced it, which for a restarted daemon is a different port.
+        connection_id: Uuid,
+        /// `Some` confirms the advertised endpoint, `None` withdraws it.
+        endpoint: Option<String>,
+    },
     CtrlC,
     Log(LogMessage),
     DaemonExit {
@@ -80,15 +92,6 @@ pub enum Event {
         node_id: NodeId,
         clean_stop: bool,
     },
-    /// Internal event scheduled by the coordinator a fixed grace period
-    /// after a `DaemonNodeStopped` to drop the stopped-node entry from
-    /// `node_metrics`, so `dora node list` eventually stops showing
-    /// zombie entries. The grace period gives operators time to see the
-    /// `Stopped` status before the row disappears.
-    NodeMetricsExpire {
-        dataflow_id: Uuid,
-        node_id: NodeId,
-    },
 }
 
 impl Event {
@@ -108,6 +111,7 @@ impl Event {
             Event::Control(_) => "Control",
             Event::Daemon(_) => "Daemon",
             Event::DaemonHeartbeatInterval => "DaemonHeartbeatInterval",
+            Event::DaemonZenohEndpoint { .. } => "DaemonZenohEndpoint",
             Event::CtrlC => "CtrlC",
             Event::Log(_) => "Log",
             Event::DaemonExit { .. } => "DaemonExit",
@@ -118,7 +122,6 @@ impl Event {
             Event::DaemonStatusReport { .. } => "DaemonStatusReport",
             Event::DaemonStateCatchUpAck { .. } => "DaemonStateCatchUpAck",
             Event::DaemonNodeStopped { .. } => "DaemonNodeStopped",
-            Event::NodeMetricsExpire { .. } => "NodeMetricsExpire",
         }
     }
 }

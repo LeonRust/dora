@@ -14,7 +14,8 @@ eyre = { workspace = true }
 semver = { workspace = true }
 serde = { workspace = true }
 serde_yaml = { workspace = true }
-toml = "0.9"
+tracing = { workspace = true }
+toml = "1.1"
 dirs = "6"
 
 [dev-dependencies]

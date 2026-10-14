@@ -1,4 +1,4 @@
-use std::{ptr::NonNull, sync::Arc, time::SystemTime};
+use std::{collections::HashMap, ptr::NonNull, sync::Arc, time::SystemTime};
 
 use arrow::{buffer::OffsetBuffer, datatypes::Field};
 use clap::Args;
@@ -6,12 +6,15 @@ use colored::Colorize;
 use dora_message::{
     common::Timestamped,
     daemon_to_daemon::InterDaemonEvent,
-    metadata::{ArrowTypeInfo, BufferOffset, Parameter},
+    metadata::{Parameter, strip_internal_parameters},
 };
-use eyre::eyre;
+use eyre::{Context, eyre};
 
 use crate::{
-    command::{Executable, default_tracing, topic::selector::TopicSelector},
+    command::{
+        Executable, default_tracing,
+        topic::selector::{TopicSelector, public_topic_output_id},
+    },
     common::CoordinatorOptions,
     formatting::OutputFormat,
 };
@@ -24,7 +27,7 @@ use crate::{
 /// Topic inspection requires debug mode on the dataflow:
 ///
 /// ```yaml
-/// _unstable_debug:
+/// debug:
 ///   enable_debug_inspection: true
 /// ```
 ///
@@ -46,6 +49,9 @@ pub struct Echo {
     selector: TopicSelector,
 
     /// Output format
+    ///
+    /// `json` emits JSON Lines (one object per decoded message);
+    /// diagnostics go to stderr.
     #[clap(long, value_name = "FORMAT", default_value_t = OutputFormat::Table)]
     pub format: OutputFormat,
 
@@ -77,6 +83,31 @@ impl Executable for Echo {
     }
 }
 
+/// Compute the `recv_timeout` for one iteration of the echo loop, or `None`
+/// when the `--duration` window has elapsed and the loop should stop.
+///
+/// Taking the already-computed `elapsed` (rather than an absolute deadline)
+/// keeps the caller off `Instant + Duration`, which overflows and panics for a
+/// large-but-valid `--duration`. A remaining wait is capped at `hint` so the
+/// loop still wakes periodically to show the "enable debug inspection" hint.
+fn echo_recv_timeout(
+    duration: Option<std::time::Duration>,
+    elapsed: std::time::Duration,
+    hint: std::time::Duration,
+) -> Option<std::time::Duration> {
+    match duration {
+        Some(d) => {
+            let remaining = d.saturating_sub(elapsed);
+            if remaining.is_zero() {
+                None
+            } else {
+                Some(remaining.min(hint))
+            }
+        }
+        None => Some(hint),
+    }
+}
+
 fn inspect(
     coordinator: CoordinatorOptions,
     selector: TopicSelector,
@@ -85,7 +116,10 @@ fn inspect(
     duration: Option<u64>,
 ) -> eyre::Result<()> {
     let session = coordinator.connect()?;
-    let (dataflow_id, topics) = selector.resolve(&session)?;
+    let (dataflow_id, topics, descriptor) = selector.resolve_with_descriptor(&session)?;
+    // Frames report the daemon's wire output id; label them with the public id
+    // the user typed and `topic list`/`info` display (dora-rs/dora#2893).
+    let nodes: HashMap<_, _> = descriptor.nodes.iter().map(|n| (&n.id, n)).collect();
 
     let ws_topics: Vec<_> = topics
         .iter()
@@ -99,7 +133,13 @@ fn inspect(
     let mut hint_shown = false;
     let mut buf = Vec::with_capacity(1024);
     let mut emitted: u64 = 0;
-    let deadline = duration.map(|s| std::time::Instant::now() + std::time::Duration::from_secs(s));
+    // Track the run window as a start instant plus `elapsed()` rather than an
+    // absolute `Instant::now() + Duration::from_secs(seconds)`: `--duration` is
+    // bounded only from below (`range(1..)`), so a large-but-valid `u64` would
+    // make `Instant + Duration` overflow the monotonic clock and panic. See
+    // `echo_recv_timeout`, and the sibling `topic hz` sampler.
+    let start = std::time::Instant::now();
+    let duration = duration.map(std::time::Duration::from_secs);
     loop {
         // Stop conditions: --count reached or --duration elapsed.
         if let Some(max) = count
@@ -107,27 +147,21 @@ fn inspect(
         {
             break;
         }
-        let recv_timeout = match deadline {
-            Some(d) => {
-                let remaining = d.saturating_duration_since(std::time::Instant::now());
-                if remaining.is_zero() {
-                    break;
-                }
-                remaining.min(HINT_TIMEOUT)
-            }
-            None => HINT_TIMEOUT,
+        let recv_timeout = match echo_recv_timeout(duration, start.elapsed(), HINT_TIMEOUT) {
+            Some(timeout) => timeout,
+            None => break,
         };
         let result = match data_rx.recv_timeout(recv_timeout) {
             Ok(result) => result,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                if let Some(d) = deadline
-                    && std::time::Instant::now() >= d
+                if let Some(d) = duration
+                    && start.elapsed() >= d
                 {
                     break;
                 }
                 if !hint_shown {
                     eprintln!(
-                        "{}: no topic data received during the wait window. Ensure `_unstable_debug.enable_debug_inspection: true` is enabled on the dataflow.",
+                        "{}: no topic data received during the wait window. Ensure `debug.enable_debug_inspection: true` is enabled on the dataflow.",
                         "hint".yellow().bold(),
                     );
                     hint_shown = true;
@@ -155,7 +189,7 @@ fn inspect(
 
         match event.inner {
             InterDaemonEvent::Output {
-                metadata,
+                mut metadata,
                 data,
                 node_id,
                 output_id,
@@ -163,15 +197,20 @@ fn inspect(
             } => {
                 use std::fmt::Write;
 
-                let output_name = format!("{node_id}/{output_id}");
+                // The daemon stamps every debug frame with its on-wire size for
+                // `dora topic info`; it is not part of the node's metadata.
+                strip_internal_parameters(&mut metadata.parameters);
 
-                let timestamp = SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis();
+                let display_output = nodes
+                    .get(&node_id)
+                    .map(|node| public_topic_output_id(node, &output_id))
+                    .unwrap_or_else(|| output_id.clone());
+                let output_name = format!("{node_id}/{display_output}");
 
                 let data_str = if let Some(data) = data {
-                    match decode_and_render(data, &metadata.type_info, &mut buf) {
+                    // Every data-plane payload is a self-describing Arrow IPC
+                    // stream; decode and render it (zero-copy when aligned).
+                    match decode_and_render(data, &mut buf) {
                         // `render_array_json` guarantees the `{"":` prefix and
                         // `}\n` suffix, so this slice cannot go out of bounds.
                         Ok(()) => std::str::from_utf8(&buf[4..buf.len() - 2]).ok(),
@@ -226,6 +265,20 @@ fn inspect(
                         println!("{output}");
                     }
                     OutputFormat::Json => {
+                        // Computed only on the JSON path: the default `table`
+                        // format discards this, so a high-rate topic should not
+                        // pay a `SystemTime::now()` syscall per frame for a value
+                        // it never emits.
+                        //
+                        // `duration_since(UNIX_EPOCH)` errors when the wall clock
+                        // is set before 1970 (e.g. an embedded target booting
+                        // with an unset RTC before NTP sync). Fall back to a zero
+                        // timestamp rather than panicking a live `dora topic
+                        // echo`, mirroring the daemon's `current_millis()` helper.
+                        let timestamp = SystemTime::now()
+                            .duration_since(SystemTime::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis();
                         println!(
                             r#"{{"timestamp":{},"name":{},"data":{},"metadata":{}}}"#,
                             timestamp,
@@ -242,31 +295,32 @@ fn inspect(
             } => {
                 eprintln!("Output {node_id}/{output_id} closed");
             }
+            // `InterDaemonEvent` is `#[non_exhaustive]`: skip events this build predates.
+            _ => {}
         }
     }
 
     Ok(())
 }
 
-/// Reconstruct the Arrow array from a raw payload and render it into `buf`.
+/// Decode the self-describing Arrow IPC payload and render it into `buf`.
 fn decode_and_render(
     data: dora_message::aligned_vec::AVec<u8, dora_message::aligned_vec::ConstAlign<128>>,
-    type_info: &ArrowTypeInfo,
     buf: &mut Vec<u8>,
 ) -> eyre::Result<()> {
     let ptr =
         NonNull::new(data.as_ptr() as *mut u8).ok_or_else(|| eyre!("payload pointer is null"))?;
     let len = data.len();
     let buffer = unsafe { arrow::buffer::Buffer::from_custom_allocation(ptr, len, Arc::new(data)) };
-    let array = buffer_into_arrow_array(&buffer, type_info)?;
+    let array = decode_arrow_ipc_zero_copy(buffer)?;
     render_array_json(array, buf)
 }
 
 /// Render a decoded Arrow array into `buf` as `{"":[...]}\n`.
 ///
-/// Both the payload and `type_info` are peer-controlled, and the Arrow JSON
-/// writer does not support every Arrow type (e.g. `Float16`), so every step
-/// must surface an error instead of panicking the CLI mid-stream.
+/// The payload is peer-controlled, and the Arrow JSON writer does not support
+/// every Arrow type (e.g. `Float16`), so every step must surface an error
+/// instead of panicking the CLI mid-stream.
 ///
 /// On success, `buf` is guaranteed to start with `{"":` and end with `}\n`,
 /// so callers can slice off those delimiters to obtain the bare JSON value.
@@ -297,109 +351,119 @@ fn render_array_json(array: arrow::array::ArrayData, buf: &mut Vec<u8>) -> eyre:
     Ok(())
 }
 
-fn buffer_into_arrow_array(
-    raw_buffer: &arrow::buffer::Buffer,
-    type_info: &ArrowTypeInfo,
+/// Decode an Arrow IPC stream from an Arrow [`Buffer`](arrow::buffer::Buffer)
+/// without copying the body buffers when the input is aligned.
+///
+/// Mirrors `dora_node_api::arrow_utils::decode_arrow_ipc_zero_copy`: the data
+/// plane is Arrow-IPC-only, so `dora topic echo` decodes the same self-describing
+/// stream every node receives. The default `require_alignment = false` decoder
+/// realigns under-aligned input rather than erroring.
+///
+/// Like that decoder, this rejects a multi-batch stream and trailing bytes
+/// after the end-of-stream marker rather than silently returning only the first
+/// batch — `dora topic echo` must not misrepresent a malformed payload as a
+/// clean single value.
+fn decode_arrow_ipc_zero_copy(
+    mut buffer: arrow::buffer::Buffer,
 ) -> eyre::Result<arrow::array::ArrayData> {
-    // A zero-footprint array (e.g. `NullArray::new(n)`) serializes to an empty
-    // payload but still carries a meaningful `type_info.len`. Reconstructing via
-    // `ArrayData::new_empty` would discard that length and silently truncate the
-    // array to 0; the general path below honors it (dora-rs/dora#2083).
-    let mut buffers = Vec::new();
-    for BufferOffset { offset, len } in &type_info.buffer_offsets {
-        if *len == 0 {
-            // Slicing a zero-length buffer out of an empty payload can yield an
-            // under-aligned pointer that `try_new` rejects; use a freshly
-            // aligned empty buffer instead (dora-rs/dora#2083).
-            buffers.push(arrow::buffer::MutableBuffer::new(0).into());
-            continue;
+    use arrow::ipc::reader::StreamDecoder;
+
+    let mut decoder = StreamDecoder::new();
+    let mut batch = None;
+    while !buffer.is_empty() {
+        let before = buffer.len();
+        let decoded = match decoder.decode(&mut buffer) {
+            Ok(decoded) => decoded,
+            Err(e) => {
+                // `decode` consumes the end-of-stream marker and then errors on
+                // any byte after it, so once we already hold the batch a decode
+                // error means the stream carried trailing bytes after a complete
+                // single-batch stream. Reject them explicitly rather than
+                // truncating to the first batch (matching the node-api decoder).
+                let context = if batch.is_some() {
+                    "unexpected trailing bytes after the record batch in IPC stream"
+                } else {
+                    "failed to decode Arrow IPC stream"
+                };
+                return Err::<arrow::array::ArrayData, _>(e).context(context);
+            }
+        };
+        match decoded {
+            Some(b) => {
+                // A second batch means the stream is malformed; reject it rather
+                // than silently dropping everything after the first batch.
+                if batch.replace(b).is_some() {
+                    return Err(eyre!(
+                        "expected exactly one record batch in IPC stream, but found more than one"
+                    ));
+                }
+            }
+            // No batch and no progress: a crafted/truncated payload. Stop so the
+            // loop cannot spin forever on a partial/corrupt stream.
+            None if buffer.len() == before => break,
+            // Progress without a batch: the schema message before the batch, or
+            // the end-of-stream marker after it. Keep going; the loop ends when
+            // the buffer is drained.
+            None => {}
         }
-        // `type_info` is peer-controlled, so validate the offset before slicing.
-        // `checked_add` guards against an `offset`/`len` that would overflow
-        // `usize` and bypass the bounds check; both prevent a panic inside
-        // `slice_with_length` on a malformed event (dora-rs/dora#2083).
-        let end = offset
-            .checked_add(*len)
-            .ok_or_else(|| eyre!("buffer offset overflow: offset={offset}, len={len}"))?;
-        if end > raw_buffer.len() {
-            return Err(eyre!(
-                "buffer offset out of bounds: offset={offset}, len={len}, buffer_len={}",
-                raw_buffer.len()
-            ));
-        }
-        buffers.push(raw_buffer.slice_with_length(*offset, *len));
     }
 
-    let mut child_data = Vec::new();
-    for child_type_info in &type_info.child_data {
-        child_data.push(buffer_into_arrow_array(raw_buffer, child_type_info)?)
+    let batch = batch.ok_or_else(|| eyre!("Arrow IPC stream contained no record batches"))?;
+    if batch.num_columns() != 1 {
+        return Err(eyre!(
+            "expected 1 column in IPC record batch, got {}",
+            batch.num_columns()
+        ));
     }
-
-    arrow::array::ArrayData::try_new(
-        type_info.data_type.clone(),
-        type_info.len,
-        type_info
-            .validity
-            .clone()
-            .map(arrow::buffer::Buffer::from_vec),
-        type_info.offset,
-        buffers,
-        child_data,
-    )
-    .map_err(|e| eyre!("Error creating Arrow array: {e}"))
+    Ok(batch.column(0).to_data())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Array, NullArray};
+    use arrow::array::{Array, Int32Array, NullArray, StringArray};
 
-    fn type_info(
-        data_type: arrow::datatypes::DataType,
-        buffer_offsets: Vec<BufferOffset>,
-    ) -> ArrowTypeInfo {
-        ArrowTypeInfo {
-            data_type,
-            len: 0,
-            null_count: 0,
-            validity: None,
-            offset: 0,
-            buffer_offsets,
-            child_data: vec![],
-            field_names: None,
-            schema_hash: None,
+    /// Encode an array as a single-column IPC stream (matching the wire format),
+    /// then decode it back via the echo path.
+    fn encode_ipc(array: &dyn Array) -> Vec<u8> {
+        use arrow::datatypes::{Field, Schema};
+        use arrow::ipc::writer::StreamWriter;
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "data",
+            array.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![arrow::array::make_array(array.to_data())],
+        )
+        .unwrap();
+        let mut buf = Vec::new();
+        {
+            let mut writer = StreamWriter::try_new(&mut buf, &schema).unwrap();
+            writer.write(&batch).unwrap();
+            writer.finish().unwrap();
         }
+        buf
     }
 
     #[test]
-    fn empty_payload_preserves_nullarray_length() {
-        // dora-rs/dora#2083: a `NullArray::new(n)` has an empty footprint but a
-        // non-zero length that must survive `dora topic echo`'s decode.
-        let mut info = type_info(arrow::datatypes::DataType::Null, vec![]);
-        info.len = 5;
-        let decoded =
-            buffer_into_arrow_array(&arrow::buffer::Buffer::from(Vec::<u8>::new()), &info).unwrap();
-        assert_eq!(decoded.len(), 5);
-        assert_eq!(decoded.data_type(), &arrow::datatypes::DataType::Null);
-        assert_eq!(NullArray::from(decoded).len(), 5);
+    fn ipc_roundtrip_primitive() {
+        let array = Int32Array::from(vec![10, 20, 30]);
+        let encoded = encode_ipc(&array);
+        let decoded = decode_arrow_ipc_zero_copy(arrow::buffer::Buffer::from_vec(encoded)).unwrap();
+        assert_eq!(decoded, array.to_data());
     }
 
     #[test]
-    fn malformed_offset_is_rejected_not_panicked() {
-        // dora-rs/dora#2083: `type_info` is peer-controlled. An empty payload
-        // with `offset = usize::MAX` would overflow `offset + len` and bypass the
-        // bounds check, panicking inside `slice_with_length`. It must surface as
-        // an error instead.
-        let info = type_info(
-            arrow::datatypes::DataType::UInt8,
-            vec![BufferOffset {
-                offset: usize::MAX,
-                len: 1,
-            }],
-        );
-        let err = buffer_into_arrow_array(&arrow::buffer::Buffer::from(Vec::<u8>::new()), &info)
-            .unwrap_err();
-        assert!(err.to_string().contains("overflow"), "got: {err}");
+    fn ipc_roundtrip_string() {
+        let array = StringArray::from(vec![Some("a"), None, Some("ccc")]);
+        let encoded = encode_ipc(&array);
+        let decoded = decode_arrow_ipc_zero_copy(arrow::buffer::Buffer::from_vec(encoded)).unwrap();
+        assert_eq!(decoded, array.to_data());
     }
 
     #[test]
@@ -432,7 +496,7 @@ mod tests {
 
     #[test]
     fn oversized_array_length_is_rejected_not_panicked() {
-        // `type_info.len` is peer-controlled and a `NullArray` carries it
+        // `array.len()` is peer-controlled and a `NullArray` carries it
         // without any backing buffers. A length above `i32::MAX` used to wrap
         // negative in the `as` cast and panic inside `OffsetBuffer::new`.
         let array = NullArray::new(i32::MAX as usize + 1).into_data();
@@ -442,15 +506,89 @@ mod tests {
     }
 
     #[test]
-    fn out_of_bounds_offset_is_rejected() {
-        // A non-overflowing but out-of-range offset must also be reported, not
-        // panic in `slice_with_length`.
-        let info = type_info(
-            arrow::datatypes::DataType::UInt8,
-            vec![BufferOffset { offset: 0, len: 8 }],
-        );
+    fn invalid_stream_is_rejected_not_panicked() {
         let err =
-            buffer_into_arrow_array(&arrow::buffer::Buffer::from(vec![0u8; 4]), &info).unwrap_err();
-        assert!(err.to_string().contains("out of bounds"), "got: {err}");
+            decode_arrow_ipc_zero_copy(arrow::buffer::Buffer::from_vec(vec![0u8; 16])).unwrap_err();
+        assert!(!err.to_string().is_empty());
+    }
+
+    /// Encode the same single-column batch twice into one stream, to exercise
+    /// the multi-batch rejection.
+    fn encode_two_batch_ipc(array: &dyn Array) -> Vec<u8> {
+        use arrow::datatypes::{Field, Schema};
+        use arrow::ipc::writer::StreamWriter;
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "data",
+            array.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![arrow::array::make_array(array.to_data())],
+        )
+        .unwrap();
+        let mut buf = Vec::new();
+        {
+            let mut writer = StreamWriter::try_new(&mut buf, &schema).unwrap();
+            writer.write(&batch).unwrap();
+            writer.write(&batch).unwrap();
+            writer.finish().unwrap();
+        }
+        buf
+    }
+
+    /// A multi-batch stream must be rejected rather than silently truncated to
+    /// its first batch — otherwise `dora topic echo` would render a malformed
+    /// payload as a clean single value.
+    #[test]
+    fn multi_batch_stream_is_rejected() {
+        let array = Int32Array::from(vec![1, 2, 3]);
+        let encoded = encode_two_batch_ipc(&array);
+        let err = decode_arrow_ipc_zero_copy(arrow::buffer::Buffer::from_vec(encoded)).unwrap_err();
+        assert!(err.to_string().contains("more than one"), "got: {err}");
+    }
+
+    /// A valid single-batch stream with extra bytes after its end-of-stream
+    /// marker must be rejected too, matching the node-api decoder.
+    #[test]
+    fn trailing_bytes_are_rejected() {
+        let array = Int32Array::from(vec![1, 2, 3]);
+        let mut encoded = encode_ipc(&array);
+        encoded.extend_from_slice(&[0u8; 16]);
+        let err = decode_arrow_ipc_zero_copy(arrow::buffer::Buffer::from_vec(encoded)).unwrap_err();
+        assert!(err.to_string().contains("trailing bytes"), "got: {err}");
+    }
+
+    #[test]
+    fn echo_recv_timeout_does_not_panic_on_oversized_duration() {
+        use std::time::Duration;
+        let hint = Duration::from_secs(5);
+
+        // No `--duration`: always wait a hint-length window.
+        assert_eq!(echo_recv_timeout(None, Duration::ZERO, hint), Some(hint));
+
+        // A huge-but-valid `--duration` (10^19 s) must not panic: previously the
+        // loop formed `Instant::now() + Duration::from_secs(seconds)`, which
+        // overflowed the monotonic clock. The remaining wait is capped at `hint`.
+        let huge = Duration::from_secs(10_000_000_000_000_000_000);
+        assert_eq!(
+            echo_recv_timeout(Some(huge), Duration::from_secs(1), hint),
+            Some(hint),
+        );
+
+        // Once the window has elapsed, the loop is told to stop (`None`).
+        assert_eq!(
+            echo_recv_timeout(Some(Duration::from_secs(2)), Duration::from_secs(2), hint),
+            None,
+        );
+
+        // A remaining window shorter than the hint is returned as-is.
+        assert_eq!(
+            echo_recv_timeout(Some(Duration::from_secs(3)), Duration::from_secs(1), hint),
+            Some(Duration::from_secs(2)),
+        );
     }
 }

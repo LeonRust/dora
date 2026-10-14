@@ -1,29 +1,34 @@
 use dora_message::{
     daemon_to_node::DaemonReply,
+    dynamic_node::DynamicNodeConfigReply,
     node_to_daemon::{DaemonRequest, Timestamped},
 };
-use eyre::{Context, eyre};
+use eyre::Context;
 use std::{
     io::{Read, Write},
     net::TcpStream,
 };
 
-enum Serializer {
-    Bincode,
-    SerdeJson,
+/// The configuration reply is JSON and may carry additive bootstrap fields
+/// that the ordinary (binary-compatible) `DaemonReply` deliberately omits.
+pub(super) fn request_dynamic_node_config(
+    connection: &mut TcpStream,
+    request: &Timestamped<DaemonRequest>,
+) -> eyre::Result<DynamicNodeConfigReply> {
+    send_message(connection, request)?;
+    receive_reply(connection, |raw| Ok(serde_json::from_slice(raw)?))
 }
+
 pub fn request(
     connection: &mut TcpStream,
     request: &Timestamped<DaemonRequest>,
 ) -> eyre::Result<DaemonReply> {
     send_message(connection, request)?;
-    if request.inner.expects_tcp_bincode_reply() {
-        receive_reply(connection, Serializer::Bincode)
-            .and_then(|reply| reply.ok_or_else(|| eyre!("server disconnected unexpectedly")))
+    if request.inner.expects_tcp_binary_reply() {
+        receive_reply(connection, |raw| dora_message::decode(raw))
     // Use serde json for message with variable length
     } else if request.inner.expects_tcp_json_reply() {
-        receive_reply(connection, Serializer::SerdeJson)
-            .and_then(|reply| reply.ok_or_else(|| eyre!("server disconnected unexpectedly")))
+        receive_reply(connection, |raw| Ok(serde_json::from_slice(raw)?))
     } else {
         Ok(DaemonReply::Empty)
     }
@@ -33,21 +38,22 @@ fn send_message(
     connection: &mut TcpStream,
     message: &Timestamped<DaemonRequest>,
 ) -> eyre::Result<()> {
-    let serialized = bincode::serialize(&message).wrap_err("failed to serialize DaemonRequest")?;
+    let serialized = dora_message::encode_presized(message, message.inner.encode_size_hint())
+        .wrap_err("failed to serialize DaemonRequest")?;
     tcp_send(connection, &serialized).wrap_err("failed to send DaemonRequest")?;
     Ok(())
 }
 
-fn receive_reply(
+fn receive_reply<T>(
     connection: &mut TcpStream,
-    serializer: Serializer,
-) -> eyre::Result<Option<DaemonReply>> {
+    decode: impl FnOnce(&[u8]) -> eyre::Result<T>,
+) -> eyre::Result<T> {
     let raw =
         match tcp_receive(connection) {
             Ok(raw) => raw,
             Err(err) => match err.kind() {
                 std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionAborted => {
-                    return Ok(None);
+                    eyre::bail!("server disconnected unexpectedly");
                 }
                 other => return Err(err).with_context(|| {
                     format!(
@@ -56,15 +62,14 @@ fn receive_reply(
                 }),
             },
         };
-    match serializer {
-        Serializer::Bincode => bincode::deserialize(&raw)
-            .wrap_err("failed to deserialize DaemonReply")
-            .map(Some),
-        Serializer::SerdeJson => serde_json::from_slice(&raw)
-            .wrap_err("failed to deserialize DaemonReply")
-            .map(Some),
-    }
+    decode(&raw).wrap_err("failed to deserialize DaemonReply")
 }
+
+/// Payload size (excluding the 8-byte header) at or below which `tcp_send`
+/// coalesces the header and body into one buffer. Chosen to cover normal
+/// control messages and small data outputs while keeping the extra copy
+/// trivial; larger payloads are written header-then-body without copying.
+const COALESCE_THRESHOLD: usize = 16 * 1024;
 
 fn tcp_send(connection: &mut (impl Write + Unpin), message: &[u8]) -> std::io::Result<()> {
     if message.len() > dora_message::MAX_MESSAGE_BYTES {
@@ -78,8 +83,28 @@ fn tcp_send(connection: &mut (impl Write + Unpin), message: &[u8]) -> std::io::R
         ));
     }
     let len_raw = (message.len() as u64).to_le_bytes();
-    connection.write_all(&len_raw)?;
-    connection.write_all(message)?;
+    // For a small message, concatenate the 8-byte length header and the payload
+    // into a single buffer and write it in one call. The connection has
+    // `TCP_NODELAY` enabled (see `daemon_connection::connect`), so writing the
+    // header separately would flush it as its own tiny TCP segment before the
+    // body — an extra syscall and a runt segment on every request.
+    //
+    // Above the threshold we skip the coalescing copy and write the header and
+    // body separately: this control channel also carries `SendMessage`/pinned-
+    // memory payloads up to `MAX_MESSAGE_BYTES` (64 MiB) whenever an output
+    // takes the daemon path instead of direct zenoh, and copying tens of MiB to
+    // avoid one header segment is the wrong trade — for a large body the runt
+    // header segment is negligible anyway. The wire format (8-byte LE length
+    // prefix + body) is identical on both paths.
+    if message.len() <= COALESCE_THRESHOLD {
+        let mut buf = Vec::with_capacity(8 + message.len());
+        buf.extend_from_slice(&len_raw);
+        buf.extend_from_slice(message);
+        connection.write_all(&buf)?;
+    } else {
+        connection.write_all(&len_raw)?;
+        connection.write_all(message)?;
+    }
     connection.flush()?;
     Ok(())
 }
@@ -135,6 +160,19 @@ mod tests {
         tcp_send(&mut wire, &[]).expect("send empty");
         let got = tcp_receive(&mut Cursor::new(wire)).expect("receive empty");
         assert!(got.is_empty());
+    }
+
+    #[test]
+    fn large_payload_roundtrips_uncoalesced() {
+        // A payload above COALESCE_THRESHOLD takes the header-then-body write
+        // path (no coalescing copy). The wire layout must be identical: an
+        // 8-byte length prefix followed by the body.
+        let payload = vec![0xCD_u8; super::COALESCE_THRESHOLD + 1];
+        let mut wire = Vec::new();
+        tcp_send(&mut wire, &payload).expect("send large");
+        assert_eq!(wire.len(), 8 + payload.len());
+        let got = tcp_receive(&mut Cursor::new(wire)).expect("receive large");
+        assert_eq!(got, payload);
     }
 
     #[test]
