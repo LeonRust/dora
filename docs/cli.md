@@ -225,7 +225,7 @@ nodes:
   - id: runtime-node
     operators:
       - id: preprocessor
-        shared-library: ../../target/debug/libpreprocess
+        shared-library: ../../target/debug/preprocess
         inputs:
           raw: sensor/data
         outputs:
@@ -603,6 +603,64 @@ larger than the raw bytes.
 The output is written to a temporary file next to the destination and renamed
 into place only once the export completes, so a failed export never leaves a
 truncated file where a readable one used to be.
+
+#### `dora recording diff`
+
+Compare two `.drec` recordings output by output, for golden-file regression
+tests: record a known-good run once, then check that a later run still produces
+the same messages.
+
+```
+dora recording diff <OLD> <NEW>
+```
+
+| Argument | Description |
+|----------|-------------|
+| `<OLD>` | The recording to compare against, e.g. one of a known-good run |
+| `<NEW>` | The recording to check |
+
+For every `node/output`, both recordings must hold the same number of messages,
+and the n-th message of one must carry exactly the same data as the n-th
+message of the other. Things that change on every run are ignored: the start
+time, the dataflow id, message timestamps, and how the messages of different
+outputs interleave.
+
+```bash
+dora record dataflow.yml -o golden.drec   # once, on a known-good run
+dora record dataflow.yml -o new.drec      # after a change
+dora recording diff golden.drec new.drec
+```
+
+For each output that differs it prints a line saying how: only in one
+recording, a different message count, or how many of the messages both
+recordings have differ and the first one (an output can get both of the last
+two lines). When nothing differs it prints `Recordings match: ...`.
+
+A recording that was not finished cleanly (a crash, or a second Ctrl-C in
+`dora record --proxy`) has no footer and may be missing its last messages; it
+is still compared, with a warning on stderr.
+
+| Exit status | Meaning |
+|-------------|---------|
+| `0` | The recordings match |
+| `1` | The recordings differ |
+| `2` | Error, e.g. a file that is missing, is not a recording, or has a record that does not decode |
+
+Limits:
+
+- `metadata.parameters` is **not** compared. Services and actions put a fresh
+  `request_id`/`goal_id` there on every run. So a change that is only in the
+  parameters, such as an action result's `goal_status` or an image's
+  `width`/`height`, is not found.
+- The recorded Arrow payload bytes are compared exactly, with no tolerance for
+  floating-point values. The same values encoded differently, e.g. by a dora
+  version whose recorder writes the Arrow stream another way, count as
+  different.
+- A record that does not decode is an error, not skipped as in
+  `dora recording export`, because a skipped message could hide a difference.
+- Only what was recorded is compared. Messages the record node dropped or
+  skipped as too large are not in the recording; `dora record` reports them
+  when the run ends.
 
 ---
 
@@ -1330,7 +1388,10 @@ and where to add it; automated PR-opening against the official `node-index`
 lands with the index bootstrap.
 
 `search`/`info`/`outdated`/`update` accept `--offline` to use only the cached index.
-Indexes are configured in `~/.config/dora/hub.toml`; a namespace resolves
+Indexes are configured in `hub.toml` in the platform config directory
+(`$XDG_CONFIG_HOME/dora`, by default `~/.config/dora`, on Linux;
+`~/Library/Application Support/dora` on macOS;
+`%APPDATA%\dora` on Windows; or `DORA_HUB_CONFIG`); a namespace resolves
 against exactly one index (see the plan §7.3). `hub:` nodes in a dataflow are
 resolved by `dora build` — there is deliberately no `dora hub install` (hub
 packages are resolved per-dataflow, cargo-style).
@@ -1446,7 +1507,7 @@ This section is for developers who want to understand the framework internals, e
           │  ┌─────┐  ┌─────┐    │     │  ┌──────┐  ┌───────┐  │
           │  │Node1│  │Node2│    │     │  │Node3 │  │Node4  │  │
           │  └──┬──┘  └──┬──┘    │     │  └──┬───┘  └───┬───┘  │
-          │     │shmem    │shmem  │     │     │shmem      │shmem │
+          │     │tcp      │tcp    │     │     │tcp        │tcp   │
           │     └────┬────┘       │     │     └─────┬─────┘      │
           └──────────┼────────────┘     └───────────┼────────────┘
                      │                              │
@@ -1454,14 +1515,16 @@ This section is for developers who want to understand the framework internals, e
                               (cross-machine)
 ```
 
+Nodes talk to their daemon over TCP. Payloads of 4 KiB or more normally go directly between nodes over Zenoh shared memory, without passing through the daemon.
+
 ### Protocol Layers
 
 | Layer | Transport | Format | Use |
 |-------|-----------|--------|-----|
 | CLI <-> Coordinator | WebSocket | JSON (ControlRequest/Reply) | Commands, log streaming |
 | Coordinator <-> Daemon | WebSocket | JSON (DaemonCoordinatorEvent) | Node lifecycle, metrics |
-| Daemon <-> Node (small) | TCP / Unix socket | Custom binary | Control messages, small data |
-| Daemon <-> Node (large) | Shared memory | Zero-copy Arrow | Data messages > 4KB |
+| Daemon <-> Node | TCP (loopback) | postcard, length-prefixed | Control requests and events; outputs relayed through the daemon |
+| Node <-> Node | Zenoh (shared memory for payloads >= 4 KiB) | Arrow IPC + metadata attachment | Direct data path, bypasses the daemon |
 | Daemon <-> Daemon | Zenoh pub/sub | Arrow + metadata | Cross-machine data routing |
 
 ### Coordinator Internals
@@ -1517,15 +1580,16 @@ The daemon manages node processes on a single machine:
 Per Node:
   1. Build (if build command specified)
   2. Spawn process with DORA_NODE_CONFIG env var
-  3. Node registers via TCP/shmem handshake
+  3. Node connects to its per-node TCP listener and registers
   4. Route inputs/outputs between nodes
   5. Collect metrics (CPU, memory, I/O)
   6. Handle restart policy on exit
   7. Forward logs to coordinator
 
 Communication:
-  - Shared memory for messages > 4KB (zero-copy)
-  - TCP for control messages and small data
+  - Zenoh shared memory directly between nodes for payloads >= 4 KiB (zero-copy)
+  - Zenoh (heap buffer) directly between nodes for smaller payloads
+  - TCP between daemon and node for control messages and outputs relayed through the daemon
   - flume channels for internal event routing
 ```
 
@@ -1584,14 +1648,15 @@ Dora uses a **Unified Hybrid Logical Clock** (UHLC) for distributed causality. E
 
 ### Zero-Copy Shared Memory
 
-For large messages (> 4KB), the daemon uses shared memory regions:
+For large messages (>= 4 KiB), nodes use Zenoh shared memory (SHM):
 
-1. Sender node requests a shared memory slot from daemon
-2. Daemon allocates a region and returns the ID
-3. Sender writes Arrow data directly into shared memory
-4. Daemon notifies receiver node of the region ID
-5. Receiver reads directly from shared memory (zero-copy)
-6. Receiver sends a drop token when done
+1. The sender allocates a buffer from its Zenoh SHM pool (if the pool is full, the payload is relayed through the daemon instead)
+2. The sender writes the Arrow IPC payload into it and publishes it on Zenoh, with the metadata as an attachment
+3. A receiver on the same machine gets a reference to the same SHM mapping
+4. The receiver wraps it as an Arrow buffer and reads it directly (zero-copy)
+5. The buffer is released when the receiver drops that Arrow buffer
+
+This is the *direct path*: the daemon is not involved in the transfer and only receives an `OutputSent` notification. Outputs that cannot use it (for example one with a consumer that declares `queue_policy: backpressure`) are relayed through the daemon over TCP instead.
 
 This achieves 10-17x lower latency than ROS2 for large payloads.
 

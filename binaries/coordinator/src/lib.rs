@@ -125,7 +125,6 @@ mod spawn_build;
 mod state;
 #[cfg(test)]
 mod tests;
-mod timeout_streak;
 mod topic_debug;
 mod topic_subscriber;
 mod topology;
@@ -150,7 +149,7 @@ pub(crate) use ready_barrier::{
 };
 pub(crate) use spawn_build::{
     MAX_BUFFERED_LOG_MESSAGES, buffer_log_message, cap_dataflow_results, check_build_timeouts,
-    check_spawn_timeouts, finalize_build, handle_dataflow_spawn_result,
+    check_spawn_timeouts, fail_pending_spawn, finalize_build, handle_dataflow_spawn_result,
 };
 pub(crate) use topic_debug::{
     close_topic_subscribers_on_finish, live_topic_subscriptions,
@@ -186,7 +185,8 @@ pub async fn start(
 /// Like [`start`] but allows enabling token authentication.
 ///
 /// When `auth` is `true`, the coordinator generates a random token on startup,
-/// writes it to `~/.config/dora/.dora-token`, and requires all clients to
+/// writes it to `.dora-token` in the working directory and in the user config
+/// directory (see [`dora_message::auth::write_token`]), and requires all clients to
 /// present it via the `Authorization: Bearer <token>` header.
 pub async fn start_with_auth(
     bind: SocketAddr,
@@ -360,7 +360,18 @@ pub(crate) struct Coordinator {
     pub(crate) finished_builds: IndexMap<BuildId, CachedResult>,
     pub(crate) running_dataflows: HashMap<DataflowId, RunningDataflow>,
     pub(crate) pending_restarts: HashMap<DataflowId, PendingRestart>,
+    /// Launch contexts of dataflows removed from `running_dataflows` by an
+    /// orphan reclaim, restored when a daemon reconnects and re-reports them
+    /// (see [`state::ReclaimedLaunches`]).
+    pub(crate) reclaimed_launches: state::ReclaimedLaunches,
     pub(crate) dataflow_results: IndexMap<DataflowId, BTreeMap<DaemonId, DataflowDaemonResult>>,
+    /// Finish reports from daemons that reconnected for a dataflow the orphan
+    /// reclaim left `Recovering`. Parked here rather than in `dataflow_results`
+    /// until they cover every node the record assigns: readers treat any
+    /// `dataflow_results` entry as a finished dataflow, so a partial report
+    /// there would make `dora list` / `stop` / `clean` act on a dataflow that is
+    /// still recovering. See `Coordinator::record_resent_finish_report`.
+    pub(crate) resent_finish_reports: HashMap<DataflowId, BTreeMap<DaemonId, DataflowDaemonResult>>,
     pub(crate) archived_dataflows: IndexMap<DataflowId, ArchivedDataflow>,
     pub(crate) daemon_connections: DaemonConnections,
     pub(crate) clock: Arc<HLC>,
@@ -466,7 +477,9 @@ async fn start_inner(
         finished_builds: IndexMap::new(),
         running_dataflows: HashMap::new(),
         pending_restarts: HashMap::new(),
+        reclaimed_launches: HashMap::new(),
         dataflow_results: IndexMap::new(),
+        resent_finish_reports: HashMap::new(),
         archived_dataflows: IndexMap::new(),
         daemon_connections: DaemonConnections::default(),
         clock,
